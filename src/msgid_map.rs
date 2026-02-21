@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cat_file::BlobRead;
 
@@ -19,6 +19,7 @@ pub enum MsgIdEntry {
 /// `git cat-file --batch` process on cache miss.
 pub struct MsgIdMap {
     cache: HashMap<String, MsgIdEntry>,
+    dirty: HashSet<String>,
     cat: Option<Box<dyn BlobRead>>,
     /// Number of note lookups via cat-file (for profiling).
     pub note_lookups: u64,
@@ -28,14 +29,16 @@ impl MsgIdMap {
     pub fn new(cat: Option<Box<dyn BlobRead>>) -> Self {
         Self {
             cache: HashMap::new(),
+            dirty: HashSet::new(),
             cat,
             note_lookups: 0,
         }
     }
 
-    /// Insert or update an entry.
+    /// Insert or update an entry, marking it dirty.
     pub fn insert(&mut self, message_id: &str, entry: MsgIdEntry) {
         self.cache.insert(message_id.to_string(), entry);
+        self.dirty.insert(message_id.to_string());
     }
 
     /// Register a Message-ID as Known, returning its previous state.
@@ -49,8 +52,23 @@ impl MsgIdMap {
             let entry = self.lookup_note(message_id);
             self.cache.insert(message_id.to_string(), entry);
         }
-        self.cache
-            .insert(message_id.to_string(), MsgIdEntry::Known(date_key))
+        let old = self
+            .cache
+            .insert(message_id.to_string(), MsgIdEntry::Known(date_key));
+        self.dirty.insert(message_id.to_string());
+        old
+    }
+
+    /// Iterate over all dirty entries (message_id, entry).
+    pub fn dirty_entries(&self) -> impl Iterator<Item = (&str, &MsgIdEntry)> {
+        self.dirty
+            .iter()
+            .filter_map(|id| self.cache.get(id).map(|entry| (id.as_str(), entry)))
+    }
+
+    /// Clear the dirty set (call after flushing to fast-import).
+    pub fn clear_dirty(&mut self) {
+        self.dirty.clear();
     }
 
     /// Look up a Message-ID, falling back to git notes on cache miss.
@@ -249,12 +267,36 @@ mod tests {
     }
 
     #[test]
+    fn test_dirty_tracking() {
+        let mut map = MsgIdMap::new(None);
+        map.insert(
+            "a@example.com",
+            MsgIdEntry::Known("2025/01/01/00-00-00".into()),
+        );
+        map.insert(
+            "b@example.com",
+            MsgIdEntry::Known("2025/01/02/00-00-00".into()),
+        );
+
+        let dirty: Vec<&str> = map.dirty_entries().map(|(id, _)| id).collect();
+        assert_eq!(dirty.len(), 2);
+
+        map.clear_dirty();
+        assert_eq!(map.dirty_entries().count(), 0);
+
+        // Cache miss (tombstone) is not dirty — it's just a cache fill
+        let _ = map.get("unknown@example.com");
+        assert_eq!(map.dirty_entries().count(), 0);
+    }
+
+    #[test]
     fn test_insert_known_returns_old_wanted_by() {
         let mut map = MsgIdMap::new(None);
         map.insert(
             "root@example.com",
             MsgIdEntry::WantedBy(vec!["2025/02/10/00-00-00".into()]),
         );
+        map.clear_dirty();
 
         let old = map.insert_known("root@example.com", "2025/02/12/04-10-17".into());
         assert_eq!(
@@ -267,6 +309,7 @@ mod tests {
             map.get("root@example.com"),
             &MsgIdEntry::Known("2025/02/12/04-10-17".to_string()),
         );
+        assert!(map.dirty_entries().any(|(id, _)| id == "root@example.com"));
     }
 
     #[test]
@@ -274,6 +317,7 @@ mod tests {
         let mut map = MsgIdMap::new(None);
         // First time seeing this message-id (notes lookup will fail -> Tombstone)
         let old = map.insert_known("new@example.com", "2025/01/01/00-00-00".into());
+        // Tombstone from cache-miss lookup
         assert_eq!(old, Some(MsgIdEntry::Tombstone));
     }
 }
