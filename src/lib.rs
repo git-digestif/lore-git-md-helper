@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mail_parser::MimeHeaders;
 
+pub mod datekey;
 pub mod git_util;
 
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
