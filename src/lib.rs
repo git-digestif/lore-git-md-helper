@@ -8,6 +8,7 @@ pub mod lore_link;
 pub mod msgid_map;
 pub mod symlink;
 pub mod thread;
+pub mod thread_file;
 
 pub mod fast_import;
 
