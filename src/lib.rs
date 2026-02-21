@@ -136,6 +136,19 @@ fn is_quote_line(line: &str) -> bool {
     line.trim_start().starts_with('>')
 }
 
+/// Could this line be part of a headerless diff?
+/// Matches the standard diff line prefixes: ` `, `+`, or `-`.
+fn is_possible_diff_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    !bytes.is_empty() && matches!(bytes[0], b' ' | b'+' | b'-')
+}
+
+/// Dead-giveaway pattern: a diff change prefix (`+` or `-`) followed by a tab.
+fn has_diff_tab_signal(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'+' | b'-') && bytes[1] == b'\t'
+}
+
 fn is_indented(line: &str) -> bool {
     !line.is_empty() && (line.starts_with(' ') || line.starts_with('\t'))
 }
@@ -274,6 +287,13 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             i += consume_quote(lines, i, &mut blocks);
             continue;
         }
+        {
+            let n = consume_headerless_diff(lines, i, &mut blocks);
+            if n > 0 {
+                i += n;
+                continue;
+            }
+        }
         if is_indented(line) {
             i += consume_indented(lines, i, &mut blocks);
             continue;
@@ -288,6 +308,60 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
     }
 
     blocks
+}
+
+/// Try to consume a headerless diff block — a diff hunk quoted without its
+/// `@@`/`---`/`+++` headers.  We recognise it by the "dead giveaway" of a
+/// diff change prefix (`+` or `-`) immediately followed by a tab character.
+///
+/// All non-empty lines in the block must look like diff lines (start with
+/// ` `, `+`, or `-`).  At least two non-empty lines must be present, with
+/// at least one `+` or `-` change line among them.
+/// Returns 0 when the block does not look like a headerless diff.
+fn consume_headerless_diff(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let mut count = 0;
+    let mut consecutive_empty = 0;
+    let mut has_tab_signal = false;
+    let mut has_change = false;
+    let mut non_empty_count = 0usize;
+
+    for &line in &lines[start..] {
+        if line.is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty >= 2 {
+                break;
+            }
+            count += 1;
+            continue;
+        }
+        consecutive_empty = 0;
+
+        if !is_possible_diff_line(line) {
+            break;
+        }
+
+        non_empty_count += 1;
+        let bytes = line.as_bytes();
+        if matches!(bytes[0], b'+' | b'-') {
+            has_change = true;
+        }
+        if has_diff_tab_signal(line) {
+            has_tab_signal = true;
+        }
+
+        count += 1;
+    }
+
+    if !has_tab_signal || !has_change || non_empty_count < 2 {
+        return 0;
+    }
+
+    let collected: Vec<String> = lines[start..start + count]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+    blocks.push(Block::Diff(collected));
+    count
 }
 
 fn consume_snip(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
@@ -859,6 +933,46 @@ mod tests {
         assert!(
             result.contains("rename to new.c"),
             "Should contain rename to"
+        );
+    }
+
+    #[test]
+    fn test_headerless_diff_with_tabs() {
+        // Simulates a quoted diff hunk without @@ headers — the tab after
+        // the diff-line prefix (+/-/ ) is the "dead giveaway".
+        // Real emails use ">  \t" (two spaces: quote separator + diff context).
+        let body = "Reviewer wrote:\n\
+                     \n\
+                     >  \tgrep \"usage\" expect\n\
+                     > +\ttest_must_fail git merge 2>err &&\n\
+                     > +\ttest_cmp expect err\n\
+                     >  \t}\n\
+                     \n\
+                     Looks good.\n";
+        let email = create_test_email("Review", body);
+        let result = parse_and_convert(&email);
+
+        let diff_count = result.matches("```diff").count();
+        assert_eq!(
+            diff_count, 1,
+            "Tab-signaled lines should form one diff block"
+        );
+        // Context lines must be inside the fence, not orphaned outside it
+        assert!(
+            result.contains("> ```diff\n>  \tgrep"),
+            "Context line before changes should be inside diff fence"
+        );
+        assert!(
+            result.contains(">  \t}\n> ```"),
+            "Context line after changes should be inside diff fence"
+        );
+        assert!(
+            result.contains("+\ttest_must_fail"),
+            "Should contain added line"
+        );
+        assert!(
+            result.contains("Looks good."),
+            "Should have prose after quote"
         );
     }
 }
