@@ -118,6 +118,18 @@ fn is_diff_continuation(line: &str) -> bool {
         || line.starts_with('+')
         || line.starts_with('-')
         || line.starts_with(' ')
+        || line.starts_with("new file mode")
+        || line.starts_with("old mode")
+        || line.starts_with("new mode")
+        || line.starts_with("deleted file mode")
+        || line.starts_with("similarity index")
+        || line.starts_with("dissimilarity index")
+        || line.starts_with("rename from")
+        || line.starts_with("rename to")
+        || line.starts_with("copy from")
+        || line.starts_with("copy to")
+        || line.starts_with("Binary files")
+        || line.starts_with("GIT binary patch")
 }
 
 fn is_quote_line(line: &str) -> bool {
@@ -790,6 +802,63 @@ mod tests {
         assert!(
             result.contains("Regular paragraph."),
             "Should have final text"
+        );
+    }
+
+    #[test]
+    fn test_diff_with_extended_headers() {
+        let body = concat!(
+            "New file patch:\n",
+            "\n",
+            "diff --git a/newfile.sh b/newfile.sh\n",
+            "new file mode 100755\n",
+            "index 0000000..abc1234\n",
+            "--- /dev/null\n",
+            "+++ b/newfile.sh\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+#!/bin/sh\n",
+            "+echo hello\n",
+        );
+        let email = create_test_email("New file patch", body);
+        let result = parse_and_convert(&email);
+
+        let diff_count = result.matches("```diff").count();
+        assert_eq!(diff_count, 1, "Should have exactly one diff block");
+        assert!(
+            result.contains("new file mode 100755"),
+            "Should contain new file mode"
+        );
+        assert!(result.contains("+echo hello"), "Should contain added line");
+    }
+
+    #[test]
+    fn test_diff_with_rename() {
+        let body = concat!(
+            "diff --git a/old.c b/new.c\n",
+            "similarity index 95%\n",
+            "rename from old.c\n",
+            "rename to new.c\n",
+            "index abc1234..def5678\n",
+            "--- a/old.c\n",
+            "+++ b/new.c\n",
+            "@@ -1,3 +1,4 @@\n",
+            " int main() {\n",
+            "+    setup();\n",
+            "     return 0;\n",
+            " }\n",
+        );
+        let email = create_test_email("Rename patch", body);
+        let result = parse_and_convert(&email);
+
+        let diff_count = result.matches("```diff").count();
+        assert_eq!(diff_count, 1, "Should have exactly one diff block");
+        assert!(
+            result.contains("rename from old.c"),
+            "Should contain rename from"
+        );
+        assert!(
+            result.contains("rename to new.c"),
+            "Should contain rename to"
         );
     }
 }
