@@ -85,6 +85,24 @@ tooling), that is open for discussion.
 - The output should be maximally useful to language models: clear structure,
   meaningful front matter, no ambiguous formatting.
 
+## Commit Hygiene
+
+The maintainer has a strong preference for a clean, reviewable commit
+history.  Every commit must be a single logical change — never lump a
+bug fix, a refactor, and a new feature into one commit.
+
+- **One purpose per commit.**  A bug fix is one commit; adding a test for
+  it may be the same commit or a separate one, but an unrelated feature
+  must not be squashed in.
+- **Prefer smaller commits.**  When changes are well-separated they are
+  naturally small, which makes review easier and keeps bisectability.
+- **Commit messages** should have an informative first line, a blank line,
+  then a body wrapped at 72 columns explaining *why* (not just *what*).
+- **Trailers**: `Assisted-by: Claude Opus 4.6` (or whichever model) and
+  `Signed-off-by:` with the identity from `git var GIT_COMMITTER_IDENT`.
+- Do **not** include a `Co-authored-by: Copilot <…>` trailer — the
+  `Assisted-by` trailer already conveys the information.
+
 ## Building and Testing
 
 ```sh
