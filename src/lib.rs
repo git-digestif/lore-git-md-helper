@@ -4,6 +4,7 @@ use mail_parser::MimeHeaders;
 pub mod cat_file;
 pub mod datekey;
 pub mod git_util;
+pub mod msgid_map;
 
 pub mod fast_import;
 
