@@ -92,12 +92,14 @@ cargo build
 cargo test
 ```
 
-There are unit tests in `src/main.rs` covering diff detection, nested
+There are unit tests in `src/lib.rs` covering diff detection, nested
 quoting, snip/snap markers, indented blocks, ASCII art, and mixed content.
 Run them before and after any change.
 
 ## Key Files
 
-- `src/main.rs` — the entire implementation (CLI + converter + tests)
+- `src/lib.rs` — converter library (block parser + renderer + tests)
+- `src/bin/mbox2md.rs` — CLI entry point for mbox-to-markdown conversion
+- `src/bin/msgid-notes.rs` — tool to map Message-IDs → blob OIDs via Git notes
 - `Cargo.toml` — dependencies and project metadata
 - `sample4.md` — example converter output (a real Git mailing list patch)
