@@ -165,6 +165,34 @@ fn strip_one_quote_level(line: &str) -> &str {
     }
 }
 
+fn is_list(lines: &[&str]) -> bool {
+    let mut iter = lines.iter().filter(|l| !l.trim().is_empty());
+    let first = match iter.next() {
+        Some(line) => line.trim_start(),
+        None => return false,
+    };
+    let marker = if first.starts_with("- ") {
+        '-'
+    } else if first.starts_with("* ") {
+        '*'
+    } else {
+        return false;
+    };
+    let mut expected_indent = None;
+    for line in iter {
+        if line.trim_start().starts_with(marker) {
+            continue;
+        }
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = &line[..indent_len];
+        let expected = expected_indent.get_or_insert(indent);
+        if indent != *expected {
+            return false;
+        }
+    }
+    true
+}
+
 fn should_fence_code_block(lines: &[String]) -> bool {
     let non_empty: Vec<&str> = lines
         .iter()
@@ -364,7 +392,7 @@ fn consume_indented(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> us
         .filter(|l| !l.trim().is_empty())
         .collect();
 
-    if non_empty.len() >= 2 {
+    if non_empty.len() >= 2 && !is_list(&non_empty) {
         blocks.push(Block::Code(collected));
     } else {
         for line in &collected {
@@ -720,6 +748,24 @@ mod tests {
             "Should contain ASCII art line"
         );
         assert!(result.contains("> ```"), "Should close fence");
+    }
+
+    #[test]
+    fn test_indented_list_not_fenced() {
+        let body = concat!(
+            "Changes:\n",
+            "\n",
+            " - first item\n",
+            " - second item\n",
+            " - third item\n",
+            "\n",
+            "End.\n",
+        );
+        let email = create_test_email("List test", body);
+        let result = parse_and_convert(&email);
+
+        assert!(!result.contains("```"), "Lists should NOT be fenced");
+        assert!(result.contains("- first item"), "Should contain list items");
     }
 
     #[test]
