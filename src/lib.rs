@@ -84,6 +84,7 @@ enum Block {
     Blank,
     Prose(Vec<String>),
     Diff(Vec<String>),
+    Code(Vec<String>),
     Quote(Vec<Block>),
 }
 
@@ -94,6 +95,11 @@ fn format_body_content(text: &str) -> String {
 }
 
 // --- Line-level predicates ---------------------------------------------------
+
+fn is_snip_start(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == "-- snip --" || trimmed == "-- snipsnap --"
+}
 
 fn is_diff_start(line: &str) -> bool {
     line.starts_with("diff --git")
@@ -140,6 +146,10 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             i += 1;
             continue;
         }
+        if is_snip_start(line) {
+            i += consume_snip(lines, i, &mut blocks);
+            continue;
+        }
         if is_diff_start(line) {
             i += consume_diff(lines, i, &mut blocks);
             continue;
@@ -154,6 +164,28 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
     }
 
     blocks
+}
+
+fn consume_snip(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let first = lines[start].trim();
+
+    if first == "-- snipsnap --" {
+        let code: Vec<String> = lines[start + 1..].iter().map(|l| l.to_string()).collect();
+        blocks.push(Block::Code(code));
+        return lines.len() - start;
+    }
+
+    // -- snip -- ... -- snap --
+    let mut code = Vec::new();
+    for (j, &line) in lines[start + 1..].iter().enumerate() {
+        if line.trim() == "-- snap --" {
+            blocks.push(Block::Code(code));
+            return j + 2;
+        }
+        code.push(line.to_string());
+    }
+    blocks.push(Block::Code(code));
+    lines.len() - start
 }
 
 fn consume_diff(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
@@ -234,6 +266,14 @@ fn render_blocks(blocks: &[Block]) -> String {
             }
             Block::Diff(lines) => {
                 out.push_str("```diff\n");
+                for line in lines {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str("```\n\n");
+            }
+            Block::Code(lines) => {
+                out.push_str("```\n");
                 for line in lines {
                     out.push_str(line);
                     out.push('\n');
@@ -400,5 +440,80 @@ mod tests {
             "Should have single-level quote"
         );
         assert!(result.contains("My response."), "Should have unquoted text");
+    }
+
+    #[test]
+    fn test_snip_snap_markers() {
+        let body = concat!(
+            "Check this output:\n",
+            "\n",
+            "-- snip --\n",
+            "some code\n",
+            "  indented\n",
+            "    more\n",
+            "-- snap --\n",
+            "\n",
+            "And that's it.\n",
+        );
+        let email = create_test_email("Code snippet", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("```\n"), "Should have code fence");
+        assert!(
+            result.contains("some code"),
+            "Should contain snipped content"
+        );
+        assert!(result.contains("  indented"), "Should preserve indentation");
+        assert!(
+            result.contains("And that's it."),
+            "Should have text after snap"
+        );
+    }
+
+    #[test]
+    fn test_snipsnap_marker() {
+        let body = concat!(
+            "Everything below is code:\n",
+            "\n",
+            "-- snipsnap --\n",
+            "line 1\n",
+            "line 2\n",
+            "line 3\n",
+        );
+        let email = create_test_email("Rest is code", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("```\n"), "Should have code fence");
+        assert!(result.contains("line 1"), "Should contain all lines");
+        assert!(result.contains("line 3"), "Should fence to end");
+    }
+
+    #[test]
+    fn test_quoted_snipsnap() {
+        let body = concat!(
+            "Regular text.\n",
+            "\n",
+            "> Someone said:\n",
+            "> -- snipsnap --\n",
+            "> quoted code\n",
+            "> more code\n",
+            "\n",
+            "My reply continues.\n",
+        );
+        let email = create_test_email("Quoted code", body);
+        let result = parse_and_convert(&email);
+
+        assert!(
+            result.contains("> ```\n"),
+            "Should have fenced code in quote"
+        );
+        assert!(
+            result.contains("> quoted code"),
+            "Should contain quoted code"
+        );
+        assert!(
+            result.contains("My reply continues."),
+            "Should have text after quote"
+        );
     }
 }
