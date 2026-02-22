@@ -84,6 +84,7 @@ enum Block {
     Blank,
     Prose(Vec<String>),
     Diff(Vec<String>),
+    Quote(Vec<Block>),
 }
 
 fn format_body_content(text: &str) -> String {
@@ -113,6 +114,18 @@ fn is_diff_continuation(line: &str) -> bool {
         || line.starts_with(' ')
 }
 
+fn is_quote_line(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+fn strip_one_quote_level(line: &str) -> &str {
+    let s = line.trim_start();
+    match s.strip_prefix('>') {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => line,
+    }
+}
+
 // --- Block grouping ----------------------------------------------------------
 
 fn parse_blocks(lines: &[&str]) -> Vec<Block> {
@@ -129,6 +142,10 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
         }
         if is_diff_start(line) {
             i += consume_diff(lines, i, &mut blocks);
+            continue;
+        }
+        if is_quote_line(line) {
+            i += consume_quote(lines, i, &mut blocks);
             continue;
         }
 
@@ -166,6 +183,42 @@ fn consume_diff(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize 
     count
 }
 
+fn consume_quote(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let mut raw: Vec<&str> = Vec::new();
+    let mut count = 0;
+
+    for (j, &line) in lines[start..].iter().enumerate() {
+        if is_quote_line(line) {
+            raw.push(line);
+            count = j + 1;
+        } else if line.trim().is_empty() {
+            // Absorb blank only if another quoted line follows
+            let rest = &lines[start + j + 1..];
+            let has_more_quotes = rest
+                .iter()
+                .take_while(|l| l.trim().is_empty() || is_quote_line(l))
+                .any(|l| is_quote_line(l));
+            if has_more_quotes {
+                raw.push(line);
+                count = j + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Strip one > level and recursively parse
+    let stripped: Vec<String> = raw
+        .iter()
+        .map(|l| strip_one_quote_level(l).to_string())
+        .collect();
+    let refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
+    blocks.push(Block::Quote(parse_blocks(&refs)));
+    count
+}
+
 // --- Rendering ---------------------------------------------------------------
 
 fn render_blocks(blocks: &[Block]) -> String {
@@ -186,6 +239,19 @@ fn render_blocks(blocks: &[Block]) -> String {
                     out.push('\n');
                 }
                 out.push_str("```\n\n");
+            }
+            Block::Quote(inner) => {
+                let rendered = render_blocks(inner);
+                for line in rendered.lines() {
+                    if line.is_empty() {
+                        out.push_str(">\n");
+                    } else {
+                        out.push_str("> ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                out.push('\n');
             }
         }
     }
@@ -301,5 +367,38 @@ mod tests {
         assert!(result.contains("```diff\n"), "Should have diff fence");
         let diff_count = result.matches("```diff").count();
         assert_eq!(diff_count, 1, "Should have exactly one diff block");
+    }
+
+    #[test]
+    fn test_nested_quotes() {
+        let body = concat!(
+            "I disagree.\n",
+            "\n",
+            "> Alice wrote:\n",
+            "> > Bob said:\n",
+            "> > > Original message\n",
+            "> >\n",
+            "> > Bob's reply\n",
+            ">\n",
+            "> Alice's reply\n",
+            "\n",
+            "My response.\n",
+        );
+        let email = create_test_email("Re: Discussion", body);
+        let result = parse_and_convert(&email);
+
+        assert!(
+            result.contains("> > > Original message"),
+            "Should have triple-nested quote"
+        );
+        assert!(
+            result.contains("> > Bob's reply"),
+            "Should have double-nested quote"
+        );
+        assert!(
+            result.contains("> Alice's reply"),
+            "Should have single-level quote"
+        );
+        assert!(result.contains("My response."), "Should have unquoted text");
     }
 }
