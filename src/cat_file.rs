@@ -70,6 +70,16 @@ impl CatFile {
         }
 
         let size: usize = header.rsplit_once(' ')?.1.parse().ok()?;
+        if size > 20 * 1024 * 1024 {
+            eprintln!("WARN: skipping oversized object {spec} ({size} bytes)");
+            // Drain the content so the stream stays synchronized.
+            std::io::copy(
+                &mut self.stdout.by_ref().take(size as u64 + 1),
+                &mut std::io::sink(),
+            )
+            .expect("cat-file drain desync");
+            return None;
+        }
         let mut buf = vec![0u8; size];
         self.stdout
             .read_exact(&mut buf)
