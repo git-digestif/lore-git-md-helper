@@ -83,6 +83,7 @@ fn extract_body(message: &mail_parser::Message) -> Result<String> {
 enum Block {
     Blank,
     Prose(Vec<String>),
+    Diff(Vec<String>),
 }
 
 fn format_body_content(text: &str) -> String {
@@ -91,19 +92,81 @@ fn format_body_content(text: &str) -> String {
     render_blocks(&blocks)
 }
 
+// --- Line-level predicates ---------------------------------------------------
+
+fn is_diff_start(line: &str) -> bool {
+    line.starts_with("diff --git")
+        || line.starts_with("diff --cc")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("@@")
+}
+
+fn is_diff_continuation(line: &str) -> bool {
+    line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("@@ ")
+        || line.starts_with('+')
+        || line.starts_with('-')
+        || line.starts_with(' ')
+}
+
+// --- Block grouping ----------------------------------------------------------
+
 fn parse_blocks(lines: &[&str]) -> Vec<Block> {
     let mut blocks = Vec::new();
+    let mut i = 0;
 
-    for line in lines {
+    while i < lines.len() {
+        let line = lines[i];
+
         if line.trim().is_empty() {
             blocks.push(Block::Blank);
-        } else {
-            blocks.push(Block::Prose(vec![line.to_string()]));
+            i += 1;
+            continue;
         }
+        if is_diff_start(line) {
+            i += consume_diff(lines, i, &mut blocks);
+            continue;
+        }
+
+        blocks.push(Block::Prose(vec![line.to_string()]));
+        i += 1;
     }
 
     blocks
 }
+
+fn consume_diff(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let mut collected = Vec::new();
+    let mut count = 0;
+    let mut consecutive_empty = 0;
+
+    for &line in &lines[start..] {
+        if line.is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty >= 2 {
+                break;
+            }
+            collected.push(line.to_string());
+            count += 1;
+            continue;
+        }
+        consecutive_empty = 0;
+        if !is_diff_continuation(line) {
+            break;
+        }
+        collected.push(line.to_string());
+        count += 1;
+    }
+
+    blocks.push(Block::Diff(collected));
+    count
+}
+
+// --- Rendering ---------------------------------------------------------------
 
 fn render_blocks(blocks: &[Block]) -> String {
     let mut out = String::new();
@@ -115,6 +178,14 @@ fn render_blocks(blocks: &[Block]) -> String {
                     out.push_str(line);
                     out.push('\n');
                 }
+            }
+            Block::Diff(lines) => {
+                out.push_str("```diff\n");
+                for line in lines {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str("```\n\n");
             }
         }
     }
@@ -185,5 +256,50 @@ mod tests {
             "Should have To in table"
         );
         assert!(result.contains("| **Date** |"), "Should have Date in table");
+    }
+
+    #[test]
+    fn test_diff_detection() {
+        let body = concat!(
+            "Here's a patch:\n",
+            "\n",
+            "diff --git a/file.c b/file.c\n",
+            "index abc123..def456 100644\n",
+            "--- a/file.c\n",
+            "+++ b/file.c\n",
+            "@@ -1,3 +1,4 @@\n",
+            " int main() {\n",
+            "+    printf(\"hello\");\n",
+            "     return 0;\n",
+            " }\n",
+        );
+        let email = create_test_email("Patch submission", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("```diff\n"), "Should have diff fence");
+        assert!(result.contains("diff --git"), "Should contain diff header");
+        assert!(result.contains("+    printf("), "Should contain added line");
+    }
+
+    #[test]
+    fn test_diff_with_empty_lines() {
+        let body = concat!(
+            "Patch with empty lines:\n",
+            "\n",
+            "diff --git a/test.sh b/test.sh\n",
+            "--- a/test.sh\n",
+            "+++ b/test.sh\n",
+            "@@ -1,5 +1,6 @@\n",
+            " line1\n",
+            "\n",
+            "+newline\n",
+            " line2\n",
+        );
+        let email = create_test_email("Patch with blanks", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("```diff\n"), "Should have diff fence");
+        let diff_count = result.matches("```diff").count();
+        assert_eq!(diff_count, 1, "Should have exactly one diff block");
     }
 }
