@@ -106,7 +106,7 @@ fn is_diff_start(line: &str) -> bool {
         || line.starts_with("diff --cc")
         || line.starts_with("--- ")
         || line.starts_with("+++ ")
-        || line.starts_with("@@")
+        || line.starts_with("@@ ")
 }
 
 fn is_diff_continuation(line: &str) -> bool {
@@ -280,8 +280,13 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             continue;
         }
         if is_diff_start(line) {
-            i += consume_diff(lines, i, &mut blocks);
-            continue;
+            let n = consume_diff(lines, i, &mut blocks);
+            if n > 0 {
+                i += n;
+                continue;
+            }
+            // Not a real diff start (no continuation lines followed);
+            // fall through to prose below.
         }
         if is_quote_line(line) {
             i += consume_quote(lines, i, &mut blocks);
@@ -409,7 +414,9 @@ fn consume_diff(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize 
         count += 1;
     }
 
-    blocks.push(Block::Diff(collected));
+    if count > 0 {
+        blocks.push(Block::Diff(collected));
+    }
     count
 }
 
@@ -973,6 +980,23 @@ mod tests {
         assert!(
             result.contains("Looks good."),
             "Should have prose after quote"
+        );
+    }
+
+    #[test]
+    fn test_false_diff_start_no_hang() {
+        // "@@ something" looks like a diff hunk header to is_diff_start
+        // but has no continuation lines.  This must not cause an infinite loop.
+        let body = " \treturn 0;\n\
+                     }\n\
+                     \n\
+                     ---\n\
+                     @@ something\n";
+        let email = create_test_email("patch trailer", body);
+        let result = parse_and_convert(&email);
+        assert!(
+            result.contains("@@ something"),
+            "marker should appear in output"
         );
     }
 }
