@@ -124,12 +124,88 @@ fn is_quote_line(line: &str) -> bool {
     line.trim_start().starts_with('>')
 }
 
+fn is_indented(line: &str) -> bool {
+    !line.is_empty() && (line.starts_with(' ') || line.starts_with('\t'))
+}
+
+fn is_code_start(line: &str) -> bool {
+    match line.trim_start().chars().next() {
+        Some(c) => !c.is_alphanumeric() && !"-.,:;!?\"'()[]{}".contains(c),
+        None => false,
+    }
+}
+
+fn is_code_like(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with("if ")
+        || trimmed.starts_with("for ")
+        || trimmed.starts_with("while ")
+        || trimmed.starts_with("function ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("class ")
+        || trimmed.contains("->")
+        || trimmed.contains("=>")
+        || trimmed.contains("::")
+    {
+        return true;
+    }
+    let special = trimmed
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count();
+    let total = trimmed.len();
+    total > 0 && special * 100 / total > 30
+}
+
 fn strip_one_quote_level(line: &str) -> &str {
     let s = line.trim_start();
     match s.strip_prefix('>') {
         Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
         None => line,
     }
+}
+
+fn should_fence_code_block(lines: &[String]) -> bool {
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if non_empty.len() < 2 {
+        return false;
+    }
+
+    let first_chars: Vec<char> = non_empty
+        .iter()
+        .filter_map(|l| l.trim_start().chars().next())
+        .collect();
+    if first_chars.len() >= 2 {
+        let first = first_chars[0];
+        if !first.is_alphanumeric() {
+            let matching = first_chars.iter().filter(|&&c| c == first).count();
+            if matching * 100 / first_chars.len() > 50 {
+                return true;
+            }
+        }
+    }
+
+    // Box-drawing characters
+    if lines.iter().any(|l| {
+        l.contains('│')
+            || l.contains('─')
+            || l.contains('┌')
+            || l.contains('└')
+            || l.contains('├')
+            || l.contains('┤')
+    }) {
+        return true;
+    }
+
+    let indented = non_empty
+        .iter()
+        .filter(|l| l.starts_with("    ") || l.starts_with('\t'))
+        .count();
+    indented * 100 / non_empty.len() > 60
 }
 
 // --- Block grouping ----------------------------------------------------------
@@ -156,6 +232,14 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
         }
         if is_quote_line(line) {
             i += consume_quote(lines, i, &mut blocks);
+            continue;
+        }
+        if is_indented(line) {
+            i += consume_indented(lines, i, &mut blocks);
+            continue;
+        }
+        if is_code_start(line) {
+            i += try_consume_code(lines, i, &mut blocks);
             continue;
         }
 
@@ -249,6 +333,82 @@ fn consume_quote(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize
     let refs: Vec<&str> = stripped.iter().map(|s| s.as_str()).collect();
     blocks.push(Block::Quote(parse_blocks(&refs)));
     count
+}
+
+fn consume_indented(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let mut collected: Vec<String> = Vec::new();
+    let mut count = 0;
+    let mut consecutive_empty = 0;
+
+    for &line in &lines[start..] {
+        if line.is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty >= 2 {
+                break;
+            }
+            collected.push(line.to_string());
+            count += 1;
+            continue;
+        }
+        consecutive_empty = 0;
+        if !is_indented(line) {
+            break;
+        }
+        collected.push(line.to_string());
+        count += 1;
+    }
+
+    let non_empty: Vec<&str> = collected
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if non_empty.len() >= 2 {
+        blocks.push(Block::Code(collected));
+    } else {
+        for line in &collected {
+            if line.is_empty() {
+                blocks.push(Block::Blank);
+            } else {
+                blocks.push(Block::Prose(vec![line.clone()]));
+            }
+        }
+    }
+    count
+}
+
+fn try_consume_code(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+    let mut collected: Vec<String> = Vec::new();
+    let mut count = 0;
+    let mut consecutive_empty = 0;
+
+    for &line in &lines[start..] {
+        if line.trim().is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty >= 2 {
+                break;
+            }
+            collected.push(line.to_string());
+            count += 1;
+        } else {
+            consecutive_empty = 0;
+            collected.push(line.to_string());
+            count += 1;
+            if !is_code_like(line) && count > 3 {
+                break;
+            }
+        }
+    }
+
+    if should_fence_code_block(&collected) {
+        blocks.push(Block::Code(collected));
+        count
+    } else {
+        // Only emit first line as prose; let caller re-evaluate the rest
+        blocks.push(Block::Prose(vec![lines[start].to_string()]));
+        1
+    }
 }
 
 // --- Rendering ---------------------------------------------------------------
@@ -514,6 +674,76 @@ mod tests {
         assert!(
             result.contains("My reply continues."),
             "Should have text after quote"
+        );
+    }
+
+    #[test]
+    fn test_indented_block() {
+        let body = concat!(
+            "Command output:\n",
+            "\n",
+            " $ git status\n",
+            " On branch main\n",
+            " nothing to commit\n",
+            "\n",
+            "Done.\n",
+        );
+        let email = create_test_email("Command output", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("```\n"), "Should have code fence");
+        assert!(result.contains(" $ git status"), "Should contain command");
+        assert!(result.contains(" On branch main"), "Should contain output");
+        assert!(result.contains("Done."), "Should have text after block");
+    }
+
+    #[test]
+    fn test_ascii_art_in_quotes() {
+        let body = concat!(
+            "Here's the diagram:\n",
+            "\n",
+            ">    A---B---C\n",
+            ">         \\\n",
+            ">          D---E\n",
+            "\n",
+            "Makes sense?\n",
+        );
+        let email = create_test_email("ASCII diagram", body);
+        let result = parse_and_convert(&email);
+
+        assert!(
+            result.contains("> ```\n"),
+            "Should have fenced code in quote"
+        );
+        assert!(
+            result.contains(">    A---B---C"),
+            "Should contain ASCII art line"
+        );
+        assert!(result.contains("> ```"), "Should close fence");
+    }
+
+    #[test]
+    fn test_mixed_content() {
+        let body = concat!(
+            "Some text.\n",
+            "\n",
+            " $ command\n",
+            " output\n",
+            "\n",
+            "> Quote\n",
+            "> more quote\n",
+            "\n",
+            "Regular paragraph.\n",
+        );
+        let email = create_test_email("Mixed content", body);
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("Some text."), "Should have regular text");
+        assert!(result.contains("```\n"), "Should have fenced code");
+        assert!(result.contains("> Quote"), "Should have quotes");
+        assert!(
+            result.contains("Regular paragraph."),
+            "Should have final text"
         );
     }
 }
