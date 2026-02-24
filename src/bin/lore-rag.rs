@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use lore_git_md_helper::{rag_db, rag_ingest, rag_query};
+use lore_git_md_helper::{ai_backend::BackendArgs, rag_db, rag_ingest, rag_query};
 
 /// RAG over the Git mailing list archive.
 #[derive(Parser)]
@@ -10,7 +10,7 @@ use lore_git_md_helper::{rag_db, rag_ingest, rag_query};
 enum Cli {
     /// Index markdown email file(s) into the database.
     Ingest(IngestArgs),
-    /// Query the database and print the augmented prompt.
+    /// Query the database and answer using an AI backend.
     Query(QueryArgs),
 }
 
@@ -46,12 +46,20 @@ struct QueryArgs {
     #[arg(long, default_value_t = 1200)]
     max_excerpt: usize,
 
+    /// Print the assembled prompt instead of sending it to a model.
+    #[arg(long)]
+    print_prompt: bool,
+
+    #[command(flatten)]
+    backend: BackendArgs,
+
     /// The question to answer.
     #[arg(required = true)]
     question: Vec<String>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Ingest(args) => {
             let conn = rag_db::open(args.db.to_str().unwrap())?;
@@ -90,7 +98,18 @@ fn main() -> Result<()> {
             }
 
             let prompt = rag_query::build_prompt(&question, &results, args.max_excerpt);
-            println!("{prompt}");
+
+            if args.print_prompt {
+                println!("{prompt}");
+                return Ok(());
+            }
+
+            let backend = args.backend.resolve()?;
+
+            let system = "You are answering questions about the Git version-control \
+                          project based on emails from the git@vger.kernel.org mailing list.";
+            let answer = backend.chat(system, &prompt).await?;
+            println!("{answer}");
         }
     }
     Ok(())
