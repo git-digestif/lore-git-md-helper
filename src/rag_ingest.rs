@@ -44,21 +44,33 @@ pub fn ingest_str(conn: &Connection, path: &str, blob_sha: &str, src: &str) -> R
 ///
 /// Compares the tree at `git_ref` against what is already in the
 /// database (via blob SHAs) and only processes changed or new files.
-/// Returns the number of emails upserted.
+/// `on_scan` is called during the initial tree scan with `(count, path)`
+/// for each entry; `on_progress` during blob processing with
+/// `(done, total)`.  Returns the number of emails upserted.
 pub fn ingest_repo(
     conn: &Connection,
     repo: &str,
     git_ref: &str,
+    on_scan: impl FnMut(usize, &str),
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<usize> {
+    use std::time::Instant;
+
     let current = resolve_ref(repo, git_ref).context(format!("failed to resolve {git_ref}"))?;
     if rag_db::get_state(conn, "last_commit").as_deref() == Some(&current) {
         return Ok(0);
     }
 
-    let tree = ls_tree(repo, git_ref)?;
+    let t = Instant::now();
+    let tree = ls_tree(repo, git_ref, on_scan)?;
+    eprintln!(
+        "\rscanned {} emails in {:.1}s, loading database...",
+        tree.len(),
+        t.elapsed().as_secs_f64(),
+    );
 
-    // Load existing path→blob_sha from DB
+    // Load existing path->blob_sha from DB
+    let t = Instant::now();
     let mut existing: HashMap<String, String> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT path, blob_sha FROM emails")?;
@@ -84,8 +96,17 @@ pub fn ingest_repo(
         .map(|p| p.as_str())
         .collect();
 
+    eprintln!(
+        "loaded {} existing in {:.1}s; {} to upsert, {} to delete",
+        existing.len(),
+        t.elapsed().as_secs_f64(),
+        to_upsert.len(),
+        to_delete.len(),
+    );
+
     // Delete removed paths
     if !to_delete.is_empty() {
+        let t = Instant::now();
         let placeholders: String = to_delete.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!("DELETE FROM emails WHERE path IN ({placeholders})");
         let params: Vec<&dyn rusqlite::types::ToSql> = to_delete
@@ -93,6 +114,11 @@ pub fn ingest_repo(
             .map(|s| s as &dyn rusqlite::types::ToSql)
             .collect();
         conn.execute(&sql, params.as_slice())?;
+        eprintln!(
+            "deleted {} in {:.1}s",
+            to_delete.len(),
+            t.elapsed().as_secs_f64()
+        );
     }
 
     let total = to_upsert.len();
@@ -102,6 +128,7 @@ pub fn ingest_repo(
     }
 
     // Fetch and ingest via CatFile
+    let t = Instant::now();
     let mut cat = CatFile::new(repo)?;
     let mut failed = 0usize;
     for (i, &(path, sha)) in to_upsert.iter().enumerate() {
@@ -114,6 +141,10 @@ pub fn ingest_repo(
         }
         on_progress(i + 1, total);
     }
+    eprintln!(
+        "processed {total} emails in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
 
     if failed > 0 {
         anyhow::bail!(
@@ -124,8 +155,11 @@ pub fn ingest_repo(
 
     rag_db::set_state(conn, "last_commit", &current)?;
 
-    // Optimize the FTS index
+    // Optimize the FTS index (can take a while on large tables)
+    let t = Instant::now();
+    eprintln!("optimizing search index...");
     conn.execute("INSERT INTO emails_fts(emails_fts) VALUES ('optimize')", [])?;
+    eprintln!("optimized in {:.1}s", t.elapsed().as_secs_f64());
 
     Ok(total)
 }
@@ -158,7 +192,7 @@ mod tests {
         .unwrap();
         fi.finish().unwrap();
 
-        let count = ingest_repo(&conn, &repo, "refs/heads/main", |_, _| {}).unwrap();
+        let count = ingest_repo(&conn, &repo, "refs/heads/main", |_, _| {}, |_, _| {}).unwrap();
         assert_eq!(count, 1);
 
         // Verify the email was inserted
@@ -168,7 +202,7 @@ mod tests {
         assert_eq!(n, 1);
 
         // Second run should be a no-op (same commit)
-        let count2 = ingest_repo(&conn, &repo, "refs/heads/main", |_, _| {}).unwrap();
+        let count2 = ingest_repo(&conn, &repo, "refs/heads/main", |_, _| {}, |_, _| {}).unwrap();
         assert_eq!(count2, 0);
 
         drop(dir);

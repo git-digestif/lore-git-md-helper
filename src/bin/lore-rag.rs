@@ -64,12 +64,34 @@ async fn main() -> Result<()> {
         Cli::Ingest(args) => {
             let conn = rag_db::open(args.db.to_str().unwrap())?;
             if let Some(repo) = &args.repo {
+                let mut last_scan_print = std::time::Instant::now();
+                let start = std::time::Instant::now();
+                let mut last_print = start;
                 let n = rag_ingest::ingest_repo(
                     &conn,
                     repo.to_str().unwrap(),
                     &args.git_ref,
+                    |count, path| {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_scan_print).as_millis() < 250 {
+                            return;
+                        }
+                        last_scan_print = now;
+                        let date = &path[..path.len().min(10)];
+                        eprint!("\rscanning: {count} emails ({date})   ");
+                    },
                     |done, total| {
-                        eprint!("\r{done}/{total}");
+                        let now = std::time::Instant::now();
+                        if done < total && now.duration_since(last_print).as_millis() < 250 {
+                            return;
+                        }
+                        last_print = now;
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let rate = done as f64 / elapsed;
+                        let remaining = (total - done) as f64 / rate;
+                        let mins = remaining as u64 / 60;
+                        let secs = remaining as u64 % 60;
+                        eprint!("\r{done}/{total}  {rate:.0} emails/s  ETA {mins}m{secs:02}s   ");
                     },
                 )?;
                 eprintln!();
