@@ -20,6 +20,7 @@ pub mod fast_import;
 pub mod rag_db;
 pub mod rag_ingest;
 pub mod rag_parse;
+pub mod rag_query;
 
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     let mut md = String::new();
