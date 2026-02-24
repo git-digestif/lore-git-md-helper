@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_API_URL: &str = "https://models.inference.ai.azure.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
 
+const DEFAULT_COPILOT_CLI: &str = "npx -y @github/copilot";
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -16,6 +18,11 @@ pub enum Backend {
         api_url: String,
         model: String,
         token: Option<String>,
+    },
+    /// Shell out to a Copilot-CLI-compatible command.
+    CopilotCli {
+        command: String,
+        model: Option<String>,
     },
 }
 
@@ -39,6 +46,13 @@ impl Backend {
         })
     }
 
+    pub fn copilot_cli(command: Option<String>, model: Option<String>) -> Self {
+        Self::CopilotCli {
+            command: command.unwrap_or_else(|| DEFAULT_COPILOT_CLI.to_string()),
+            model,
+        }
+    }
+
     /// Send a system + user message pair and return the assistant reply.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         match self {
@@ -47,6 +61,9 @@ impl Backend {
                 model,
                 token,
             } => chat_api(api_url, model, token.as_deref(), system, user).await,
+            Backend::CopilotCli { command, model } => {
+                chat_cli(command, model.as_deref(), system, user).await
+            }
         }
     }
 }
@@ -113,4 +130,46 @@ async fn chat_api(
         .next()
         .map(|c| c.message.content)
         .context("no choices in API response")
+}
+async fn chat_cli(command: &str, model: Option<&str>, system: &str, user: &str) -> Result<String> {
+    use std::io::Write;
+    use tokio::process::Command;
+
+    anyhow::ensure!(!command.is_empty(), "empty copilot-cli command");
+
+    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
+    writeln!(tmp, "{system}\n\n---\n\n{user}")?;
+    tmp.flush()?;
+    let path = tmp.path().to_string_lossy().to_string();
+
+    // Build the full shell command line so that quoted paths and
+    // arguments in `command` are handled by the shell, not by naive
+    // whitespace splitting.
+    let mut shell_line = command.to_string();
+    shell_line.push_str(&format!(
+        " -p @{path} -s --no-custom-instructions --allow-all-tools"
+    ));
+    if let Some(m) = model {
+        shell_line.push_str(&format!(" --model '{}'", m.replace('\'', "'\\''")));
+    }
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", &shell_line]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &shell_line]);
+        c
+    };
+
+    let output = cmd.output().await.context("failed to run copilot CLI")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("copilot CLI exited with {}: {stderr}", output.status);
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("copilot CLI output is not valid UTF-8")?
+        .trim()
+        .to_string())
 }
