@@ -10,6 +10,8 @@ const DEFAULT_API_URL: &str = "https://models.inference.ai.azure.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
 
 const DEFAULT_COPILOT_CLI: &str = "npx -y @github/copilot";
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 
 /// An AI chat backend.
 pub enum Backend {
@@ -24,6 +26,8 @@ pub enum Backend {
         command: String,
         model: Option<String>,
     },
+    /// Local Ollama instance (OpenAI-compatible API, no auth).
+    Ollama { api_url: String, model: String },
 }
 
 impl Backend {
@@ -53,6 +57,13 @@ impl Backend {
         }
     }
 
+    pub fn ollama(url: Option<String>, model: Option<String>) -> Self {
+        Self::Ollama {
+            api_url: url.unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string()),
+            model: model.unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
+        }
+    }
+
     /// Send a system + user message pair and return the assistant reply.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         match self {
@@ -63,6 +74,9 @@ impl Backend {
             } => chat_api(api_url, model, token.as_deref(), system, user).await,
             Backend::CopilotCli { command, model } => {
                 chat_cli(command, model.as_deref(), system, user).await
+            }
+            Backend::Ollama { api_url, model } => {
+                chat_api(api_url, model, None, system, user).await
             }
         }
     }
@@ -131,6 +145,7 @@ async fn chat_api(
         .map(|c| c.message.content)
         .context("no choices in API response")
 }
+
 async fn chat_cli(command: &str, model: Option<&str>, system: &str, user: &str) -> Result<String> {
     use std::io::Write;
     use tokio::process::Command;
