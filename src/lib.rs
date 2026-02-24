@@ -18,6 +18,7 @@ pub mod ai_backend;
 pub mod fast_import;
 
 pub mod rag_db;
+pub mod rag_git;
 pub mod rag_ingest;
 pub mod rag_parse;
 pub mod rag_query;
