@@ -20,8 +20,15 @@ struct IngestArgs {
     #[arg(long, default_value = "lore-git.db")]
     db: PathBuf,
 
-    /// Markdown file(s) to ingest.
-    #[arg(required = true)]
+    /// Git repository to ingest from (alternative to listing files).
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Git ref to ingest (used with --repo).
+    #[arg(long, default_value = "HEAD")]
+    git_ref: String,
+
+    /// Markdown file(s) to ingest (alternative to --repo).
     files: Vec<PathBuf>,
 }
 
@@ -48,9 +55,28 @@ fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Ingest(args) => {
             let conn = rag_db::open(args.db.to_str().unwrap())?;
-            for path in &args.files {
-                rag_ingest::ingest_file(&conn, path)?;
-                eprintln!("indexed: {}", path.display());
+            if let Some(repo) = &args.repo {
+                let n = rag_ingest::ingest_repo(
+                    &conn,
+                    repo.to_str().unwrap(),
+                    &args.git_ref,
+                    |done, total| {
+                        eprint!("\r{done}/{total}");
+                    },
+                )?;
+                eprintln!();
+                if n == 0 {
+                    eprintln!("already up to date");
+                } else {
+                    eprintln!("indexed {n} emails");
+                }
+            } else if args.files.is_empty() {
+                anyhow::bail!("provide --repo or one or more files");
+            } else {
+                for path in &args.files {
+                    rag_ingest::ingest_file(&conn, path)?;
+                    eprintln!("indexed: {}", path.display());
+                }
             }
         }
         Cli::Query(args) => {
