@@ -17,6 +17,11 @@ const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
 
+/// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
+fn retry_backoff_secs(attempt: u32) -> u64 {
+    std::cmp::min(10u64 << (attempt - 1), 120)
+}
+
 /// Tracks rate limit state reported by the API via `x-ratelimit-*` headers.
 pub struct RateLimitState {
     pub remaining_requests: Option<u64>,
@@ -240,16 +245,34 @@ async fn chat_api(
             },
         ],
     };
-    let mut builder = client.post(&url).json(&req);
-    if let Some(t) = token {
-        builder = builder.bearer_auth(t);
-    }
-    let response = builder
-        .send()
-        .await
-        .context("API request failed")?
-        .error_for_status()
-        .context("API returned error status")?;
+
+    let max_retries: u32 = 5;
+    let mut attempt = 0;
+    let response = loop {
+        let mut builder = client.post(&url).json(&req);
+        if let Some(t) = token {
+            builder = builder.bearer_auth(t);
+        }
+        let resp = builder.send().await.context("API request failed")?;
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            attempt += 1;
+            if attempt > max_retries {
+                anyhow::bail!("API returned 429 Too Many Requests after {max_retries} retries");
+            }
+            let backoff = retry_backoff_secs(attempt);
+            eprintln!(
+                "[retry] 429 Too Many Requests (attempt {attempt}/{max_retries}), \
+                 sleeping {backoff}s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            continue;
+        }
+
+        break resp
+            .error_for_status()
+            .context("API returned error status")?;
+    };
 
     // Update rate limit state from response headers when available.
     if let Some(rl) = rate_limits {
