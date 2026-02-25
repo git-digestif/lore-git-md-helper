@@ -12,6 +12,8 @@ const DEFAULT_MODEL: &str = "gpt-4o";
 const DEFAULT_COPILOT_CLI: &str = "npx -y @github/copilot";
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
+const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
+const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
 
 /// An AI chat backend.
 pub enum Backend {
@@ -28,6 +30,8 @@ pub enum Backend {
     },
     /// Local Ollama instance (OpenAI-compatible API, no auth).
     Ollama { api_url: String, model: String },
+    /// GitHub Models (models.github.ai) — OpenAI-compatible, separate from Copilot.
+    GitHubModels { model: String, token: String },
 }
 
 impl Backend {
@@ -64,6 +68,13 @@ impl Backend {
         }
     }
 
+    pub fn github_models(token: String, model: Option<String>) -> Self {
+        Self::GitHubModels {
+            model: model.unwrap_or_else(|| DEFAULT_GITHUB_MODELS_MODEL.to_string()),
+            token,
+        }
+    }
+
     /// Send a system + user message pair and return the assistant reply.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         match self {
@@ -78,6 +89,9 @@ impl Backend {
             Backend::Ollama { api_url, model } => {
                 chat_api(api_url, model, None, system, user).await
             }
+            Backend::GitHubModels { model, token } => {
+                chat_api(GITHUB_MODELS_URL, model, Some(token.as_str()), system, user).await
+            }
         }
     }
 }
@@ -85,7 +99,7 @@ impl Backend {
 /// Shared CLI arguments for backend selection.
 ///
 /// Embed in any clap `Args` struct with `#[command(flatten)]` to get
-/// `--copilot-cli`, `--ollama`, and `--model` flags.
+/// `--copilot-cli`, `--ollama`, `--github-models`, and `--model` flags.
 #[derive(clap::Args, Clone, Debug)]
 #[command(group = clap::ArgGroup::new("backend-choice").multiple(false))]
 pub struct BackendArgs {
@@ -98,6 +112,11 @@ pub struct BackendArgs {
     /// (default: http://localhost:11434/v1).
     #[arg(long, value_name = "OLLAMA_URL", num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub ollama: Option<String>,
+
+    /// Use GitHub Models (models.github.ai). Requires GITHUB_TOKEN env var
+    /// with the `models` scope.
+    #[arg(long, group = "backend-choice")]
+    pub github_models: bool,
 
     /// Model to use (applies to all backends).
     #[arg(long)]
@@ -113,6 +132,10 @@ impl BackendArgs {
         } else if let Some(url) = self.ollama {
             let url = if url.is_empty() { None } else { Some(url) };
             Ok(Backend::ollama(url, self.model))
+        } else if self.github_models {
+            let token = std::env::var("GITHUB_TOKEN")
+                .context("GITHUB_TOKEN must be set for --github-models (needs `models` scope)")?;
+            Ok(Backend::github_models(token, self.model))
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
