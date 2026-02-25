@@ -16,6 +16,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
+const DEFAULT_AZURE_MODEL: &str = "DeepSeek-V3-0324";
 const MAX_RETRY_WAIT_SECS: u64 = 300;
 
 /// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
@@ -28,6 +29,16 @@ pub struct RateLimitState {
     pub remaining_requests: Option<u64>,
     pub remaining_tokens: Option<u64>,
     pub last_updated: Instant,
+}
+
+/// How to authenticate with an API endpoint.
+pub enum ApiAuth<'a> {
+    /// Bearer token in the Authorization header.
+    Bearer(&'a str),
+    /// API key in a custom header (e.g. Azure OpenAI uses `api-key`).
+    ApiKey(&'a str),
+    /// No authentication required.
+    None,
 }
 
 /// An AI chat backend.
@@ -50,6 +61,12 @@ pub enum Backend {
         model: String,
         token: String,
         rate_limits: Mutex<RateLimitState>,
+    },
+    /// Azure OpenAI Service — uses `api-key` header for authentication.
+    AzureOpenAI {
+        api_url: String,
+        model: String,
+        api_key: String,
     },
 }
 
@@ -99,6 +116,14 @@ impl Backend {
         }
     }
 
+    pub fn azure_openai(api_url: String, model: Option<String>, api_key: String) -> Self {
+        Self::AzureOpenAI {
+            api_url,
+            model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
+            api_key,
+        }
+    }
+
     /// Send a system + user message pair and return the assistant reply.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         match self {
@@ -106,12 +131,18 @@ impl Backend {
                 api_url,
                 model,
                 token,
-            } => chat_api(api_url, model, token.as_deref(), system, user, None).await,
+            } => {
+                let auth = match token.as_deref() {
+                    Some(t) => ApiAuth::Bearer(t),
+                    None => ApiAuth::None,
+                };
+                chat_api(api_url, model, &auth, system, user, None).await
+            }
             Backend::CopilotCli { command, model } => {
                 chat_cli(command, model.as_deref(), system, user).await
             }
             Backend::Ollama { api_url, model } => {
-                chat_api(api_url, model, None, system, user, None).await
+                chat_api(api_url, model, &ApiAuth::None, system, user, None).await
             }
             Backend::GitHubModels {
                 model,
@@ -121,10 +152,25 @@ impl Backend {
                 chat_api(
                     GITHUB_MODELS_URL,
                     model,
-                    Some(token.as_str()),
+                    &ApiAuth::Bearer(token),
                     system,
                     user,
                     Some(rate_limits),
+                )
+                .await
+            }
+            Backend::AzureOpenAI {
+                api_url,
+                model,
+                api_key,
+            } => {
+                chat_api(
+                    api_url,
+                    model,
+                    &ApiAuth::ApiKey(api_key),
+                    system,
+                    user,
+                    None,
                 )
                 .await
             }
@@ -135,7 +181,8 @@ impl Backend {
 /// Shared CLI arguments for backend selection.
 ///
 /// Embed in any clap `Args` struct with `#[command(flatten)]` to get
-/// `--copilot-cli`, `--ollama`, `--github-models`, and `--model` flags.
+/// `--copilot-cli`, `--ollama`, `--github-models`, `--azure-openai`,
+/// and `--model` flags.
 #[derive(clap::Args, Clone, Debug)]
 #[command(group = clap::ArgGroup::new("backend-choice").multiple(false))]
 pub struct BackendArgs {
@@ -153,6 +200,14 @@ pub struct BackendArgs {
     /// with the `models` scope.
     #[arg(long, group = "backend-choice")]
     pub github_models: bool,
+
+    /// Use Azure OpenAI Service. Optionally pass the endpoint URL
+    /// (falls back to AZURE_OPENAI_ENDPOINT env var).
+    /// Reads the API key from AZURE_OPENAI_API_KEY.
+    /// Model defaults to DeepSeek-V3-0324; override via --model or
+    /// AZURE_OPENAI_MODEL env var.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
+    pub azure_openai: Option<String>,
 
     /// Model to use (applies to all backends).
     #[arg(long)]
@@ -172,6 +227,20 @@ impl BackendArgs {
             let token = std::env::var("GITHUB_TOKEN")
                 .context("GITHUB_TOKEN must be set for --github-models (needs `models` scope)")?;
             Ok(Backend::github_models(token, self.model))
+        } else if let Some(url) = self.azure_openai {
+            let api_url = if url.is_empty() {
+                std::env::var("AZURE_OPENAI_ENDPOINT").context(
+                    "AZURE_OPENAI_ENDPOINT must be set (or pass the URL to --azure-openai)",
+                )?
+            } else {
+                url
+            };
+            let api_key = std::env::var("AZURE_OPENAI_API_KEY")
+                .context("AZURE_OPENAI_API_KEY must be set for --azure-openai")?;
+            let model = self
+                .model
+                .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
+            Ok(Backend::azure_openai(api_url, model, api_key))
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
@@ -209,7 +278,7 @@ struct ChatChoice {
 async fn chat_api(
     api_url: &str,
     model: &str,
-    token: Option<&str>,
+    auth: &ApiAuth<'_>,
     system: &str,
     user: &str,
     rate_limits: Option<&Mutex<RateLimitState>>,
@@ -232,7 +301,12 @@ async fn chat_api(
     }
 
     let client = reqwest::Client::new();
-    let url = format!("{}/chat/completions", api_url.trim_end_matches('/'));
+    let base = api_url.trim_end_matches('/');
+    let url = if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    };
     let req = ChatRequest {
         model: model.to_string(),
         messages: vec![
@@ -251,8 +325,14 @@ async fn chat_api(
     let mut attempt = 0;
     loop {
         let mut builder = client.post(&url).json(&req);
-        if let Some(t) = token {
-            builder = builder.bearer_auth(t);
+        match auth {
+            ApiAuth::Bearer(t) => {
+                builder = builder.bearer_auth(t);
+            }
+            ApiAuth::ApiKey(k) => {
+                builder = builder.header("api-key", *k);
+            }
+            ApiAuth::None => {}
         }
         let resp = builder.send().await.context("API request failed")?;
 
