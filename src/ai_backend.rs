@@ -5,6 +5,8 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use std::time::Instant;
 
 const DEFAULT_API_URL: &str = "https://models.inference.ai.azure.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
@@ -14,6 +16,13 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
+
+/// Tracks rate limit state reported by the API via `x-ratelimit-*` headers.
+pub struct RateLimitState {
+    pub remaining_requests: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    pub last_updated: Instant,
+}
 
 /// An AI chat backend.
 pub enum Backend {
@@ -31,7 +40,11 @@ pub enum Backend {
     /// Local Ollama instance (OpenAI-compatible API, no auth).
     Ollama { api_url: String, model: String },
     /// GitHub Models (models.github.ai) — OpenAI-compatible, separate from Copilot.
-    GitHubModels { model: String, token: String },
+    GitHubModels {
+        model: String,
+        token: String,
+        rate_limits: Mutex<RateLimitState>,
+    },
 }
 
 impl Backend {
@@ -72,6 +85,11 @@ impl Backend {
         Self::GitHubModels {
             model: model.unwrap_or_else(|| DEFAULT_GITHUB_MODELS_MODEL.to_string()),
             token,
+            rate_limits: Mutex::new(RateLimitState {
+                remaining_requests: None,
+                remaining_tokens: None,
+                last_updated: Instant::now(),
+            }),
         }
     }
 
@@ -82,15 +100,27 @@ impl Backend {
                 api_url,
                 model,
                 token,
-            } => chat_api(api_url, model, token.as_deref(), system, user).await,
+            } => chat_api(api_url, model, token.as_deref(), system, user, None).await,
             Backend::CopilotCli { command, model } => {
                 chat_cli(command, model.as_deref(), system, user).await
             }
             Backend::Ollama { api_url, model } => {
-                chat_api(api_url, model, None, system, user).await
+                chat_api(api_url, model, None, system, user, None).await
             }
-            Backend::GitHubModels { model, token } => {
-                chat_api(GITHUB_MODELS_URL, model, Some(token.as_str()), system, user).await
+            Backend::GitHubModels {
+                model,
+                token,
+                rate_limits,
+            } => {
+                chat_api(
+                    GITHUB_MODELS_URL,
+                    model,
+                    Some(token.as_str()),
+                    system,
+                    user,
+                    Some(rate_limits),
+                )
+                .await
             }
         }
     }
@@ -176,7 +206,25 @@ async fn chat_api(
     token: Option<&str>,
     system: &str,
     user: &str,
+    rate_limits: Option<&Mutex<RateLimitState>>,
 ) -> Result<String> {
+    // Preemptive rate limit back-off: if we know we are running low on
+    // requests and the information is recent (within the last 60 s), sleep
+    // briefly to avoid hammering the API.
+    if let Some(rl) = rate_limits {
+        let sleep_needed = {
+            let state = rl.lock().expect("rate limit lock poisoned");
+            state
+                .remaining_requests
+                .is_some_and(|rem| rem <= 5 && state.last_updated.elapsed().as_secs() < 60)
+        };
+        if sleep_needed {
+            let wait = std::time::Duration::from_secs(15);
+            eprintln!("[rate-limit] running low on requests — sleeping {wait:?}");
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", api_url.trim_end_matches('/'));
     let req = ChatRequest {
@@ -196,12 +244,36 @@ async fn chat_api(
     if let Some(t) = token {
         builder = builder.bearer_auth(t);
     }
-    let resp: ChatResponse = builder
+    let response = builder
         .send()
         .await
         .context("API request failed")?
         .error_for_status()
-        .context("API returned error status")?
+        .context("API returned error status")?;
+
+    // Update rate limit state from response headers when available.
+    if let Some(rl) = rate_limits {
+        let mut state = rl.lock().expect("rate limit lock poisoned");
+        if let Some(v) = response.headers().get("x-ratelimit-remaining-requests")
+            && let Ok(s) = v.to_str()
+            && let Ok(n) = s.parse::<u64>()
+        {
+            state.remaining_requests = Some(n);
+        }
+        if let Some(v) = response.headers().get("x-ratelimit-remaining-tokens")
+            && let Ok(s) = v.to_str()
+            && let Ok(n) = s.parse::<u64>()
+        {
+            state.remaining_tokens = Some(n);
+        }
+        state.last_updated = Instant::now();
+        eprintln!(
+            "[rate-limit] remaining: requests={:?}, tokens={:?}",
+            state.remaining_requests, state.remaining_tokens
+        );
+    }
+
+    let resp: ChatResponse = response
         .json()
         .await
         .context("failed to parse API response")?;
