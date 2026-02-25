@@ -249,7 +249,7 @@ async fn chat_api(
 
     let max_retries: u32 = 5;
     let mut attempt = 0;
-    let response = loop {
+    loop {
         let mut builder = client.post(&url).json(&req);
         if let Some(t) = token {
             builder = builder.bearer_auth(t);
@@ -289,42 +289,70 @@ async fn chat_api(
             continue;
         }
 
-        break resp
+        let response = resp
             .error_for_status()
             .context("API returned error status")?;
-    };
 
-    // Update rate limit state from response headers when available.
-    if let Some(rl) = rate_limits {
-        let mut state = rl.lock().expect("rate limit lock poisoned");
-        if let Some(v) = response.headers().get("x-ratelimit-remaining-requests")
-            && let Ok(s) = v.to_str()
-            && let Ok(n) = s.parse::<u64>()
-        {
-            state.remaining_requests = Some(n);
+        // Update rate limit state from response headers when available.
+        if let Some(rl) = rate_limits {
+            let mut state = rl.lock().expect("rate limit lock poisoned");
+            if let Some(v) = response.headers().get("x-ratelimit-remaining-requests")
+                && let Ok(s) = v.to_str()
+                && let Ok(n) = s.parse::<u64>()
+            {
+                state.remaining_requests = Some(n);
+            }
+            if let Some(v) = response.headers().get("x-ratelimit-remaining-tokens")
+                && let Ok(s) = v.to_str()
+                && let Ok(n) = s.parse::<u64>()
+            {
+                state.remaining_tokens = Some(n);
+            }
+            state.last_updated = Instant::now();
+            eprintln!(
+                "[rate-limit] remaining: requests={:?}, tokens={:?}",
+                state.remaining_requests, state.remaining_tokens
+            );
         }
-        if let Some(v) = response.headers().get("x-ratelimit-remaining-tokens")
-            && let Ok(s) = v.to_str()
-            && let Ok(n) = s.parse::<u64>()
-        {
-            state.remaining_tokens = Some(n);
+
+        let body = response
+            .text()
+            .await
+            .context("failed to read API response body")?;
+        let parsed: ChatResponse = serde_json::from_str(&body).with_context(|| {
+            format!(
+                "failed to parse API response: {}",
+                &body[..body.len().min(200)]
+            )
+        })?;
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .context("no choices in API response")?;
+
+        if content.trim().is_empty() {
+            attempt += 1;
+            if attempt > max_retries {
+                anyhow::bail!(
+                    "API returned empty content after {max_retries} retries; \
+                     last response body: {}",
+                    &body[..body.len().min(500)]
+                );
+            }
+            let backoff = retry_backoff_secs(attempt);
+            eprintln!(
+                "[retry] empty response (attempt {attempt}/{max_retries}), \
+                 body snippet: {}; sleeping {backoff}s",
+                &body[..body.len().min(200)]
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            continue;
         }
-        state.last_updated = Instant::now();
-        eprintln!(
-            "[rate-limit] remaining: requests={:?}, tokens={:?}",
-            state.remaining_requests, state.remaining_tokens
-        );
+
+        break Ok(content);
     }
-
-    let resp: ChatResponse = response
-        .json()
-        .await
-        .context("failed to parse API response")?;
-    resp.choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .context("no choices in API response")
 }
 
 async fn chat_cli(command: &str, model: Option<&str>, system: &str, user: &str) -> Result<String> {
