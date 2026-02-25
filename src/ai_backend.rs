@@ -16,6 +16,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
+const MAX_RETRY_WAIT_SECS: u64 = 300;
 
 /// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
 fn retry_backoff_secs(attempt: u32) -> u64 {
@@ -260,7 +261,26 @@ async fn chat_api(
             if attempt > max_retries {
                 anyhow::bail!("API returned 429 Too Many Requests after {max_retries} retries");
             }
-            let backoff = retry_backoff_secs(attempt);
+            // Prefer the server's retry-after header when present.
+            let backoff = if let Some(ra) = resp.headers().get("retry-after") {
+                if let Ok(s) = ra.to_str() {
+                    if let Ok(secs) = s.parse::<u64>() {
+                        if secs > MAX_RETRY_WAIT_SECS {
+                            anyhow::bail!(
+                                "API returned retry-after of {secs}s which exceeds \
+                                 the {MAX_RETRY_WAIT_SECS}s cap -- giving up"
+                            );
+                        }
+                        secs
+                    } else {
+                        retry_backoff_secs(attempt)
+                    }
+                } else {
+                    retry_backoff_secs(attempt)
+                }
+            } else {
+                retry_backoff_secs(attempt)
+            };
             eprintln!(
                 "[retry] 429 Too Many Requests (attempt {attempt}/{max_retries}), \
                  sleeping {backoff}s"
