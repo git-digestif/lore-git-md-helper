@@ -82,6 +82,49 @@ impl Backend {
     }
 }
 
+/// Shared CLI arguments for backend selection.
+///
+/// Embed in any clap `Args` struct with `#[command(flatten)]` to get
+/// `--copilot-cli`, `--ollama`, and `--model` flags.
+#[derive(clap::Args, Clone, Debug)]
+#[command(group = clap::ArgGroup::new("backend-choice").multiple(false))]
+pub struct BackendArgs {
+    /// Use GitHub Copilot CLI instead of the API.
+    /// Optionally specify a custom command (default: "npx -y @github/copilot").
+    #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
+    pub copilot_cli: Option<String>,
+
+    /// Use a local Ollama instance. Optionally specify the URL
+    /// (default: http://localhost:11434/v1).
+    #[arg(long, value_name = "OLLAMA_URL", num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
+    pub ollama: Option<String>,
+
+    /// Model to use (applies to all backends).
+    #[arg(long)]
+    pub model: Option<String>,
+}
+
+impl BackendArgs {
+    /// Resolve these CLI flags into a concrete `Backend`.
+    pub fn resolve(self) -> Result<Backend> {
+        if let Some(cmd) = self.copilot_cli {
+            let cmd = if cmd.is_empty() { None } else { Some(cmd) };
+            Ok(Backend::copilot_cli(cmd, self.model))
+        } else if let Some(url) = self.ollama {
+            let url = if url.is_empty() { None } else { Some(url) };
+            Ok(Backend::ollama(url, self.model))
+        } else {
+            let mut b = Backend::api_from_env()?;
+            if let Backend::Api { ref mut model, .. } = b
+                && let Some(m) = self.model
+            {
+                *model = m;
+            }
+            Ok(b)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
