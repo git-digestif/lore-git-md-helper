@@ -47,19 +47,35 @@ This repository is tackling the problem in stages:
 
 ## Current State
 
-The project is in early development. Only stage 1 is partially implemented:
-a Rust CLI (`mbox2md`) that reads a single `.eml` or `.mbox` file and writes
-a Markdown file. The converter handles:
+Stage 1 (Mbox → Markdown) is implemented: `mbox2md` reads `.eml`/`.mbox`
+files and writes Markdown preserving semantic structure.
 
-- Email headers rendered as a Markdown table (From, To, Date, Message-ID)
-- Nested email quoting (`>`, `> >`, `> > >`, …) preserved as Markdown
-  blockquotes
-- Inline diffs detected and wrapped in ` ```diff ` fenced code blocks
-- `-- snip --` / `-- snap --` / `-- snipsnap --` markers converted to
-  fenced code blocks (including inside quoted regions)
-- ASCII art and indented command output fenced as code blocks
-- Indented list items recognized and left unfenced
-- HTML email bodies converted to plain text via `html2text`
+A **RAG subsystem** provides local retrieval-augmented Q&A over the
+converted Markdown corpus. It includes:
+
+- `rag_db`: SQLite schema with FTS5 virtual table for full-text search
+- `rag_parse`: regex-based extraction of subject, author, date,
+  message-id, and body from the Markdown format
+- `rag_ingest`: file-based and git-backed ingestion into the database,
+  with incremental ingest via stored commit state; uses `diff-tree`
+  for fast incremental change detection and defers FTS5 optimization
+  until enough rows have accumulated
+- `rag_query`: FTS5/BM25 retrieval with prompt assembly and Message-ID
+  citations
+- `rag_git`: `ls_tree` for full tree enumeration and `diff_tree` for
+  incremental change detection between commits
+- `lore-rag` binary: CLI with `ingest` and `query` subcommands
+
+An **AI backend** module (`ai_backend`) provides a shared abstraction
+over multiple LLM backends: OpenAI-compatible API, GitHub Copilot CLI,
+Ollama, GitHub Models, and Azure OpenAI. It includes retry logic with
+exponential backoff for 429 rate limits, 400 Bad Request, and 5xx
+server errors, retry-after header support with a cap, and empty
+response detection. API errors are propagated as hard failures rather
+than producing error markers in the output.
+
+A `msgid-notes` tool maps Message-IDs to blob OIDs via Git notes
+(stage 3 groundwork).
 
 ## Technology
 
@@ -68,11 +84,28 @@ Rust (edition 2024), using:
 - `html2text` for HTML → plain text fallback
 - `clap` for CLI argument parsing
 - `anyhow` for error handling
+- `rusqlite` (bundled, with FTS5) for the RAG database
+- `regex` for Markdown field extraction
+- `reqwest` + `tokio` for HTTP-based AI backends
+- `serde` / `serde_json` for API request/response serialization
 
 Rust was chosen for robustness, type safety, and raw text-parsing speed.
 This is a pragmatic choice, not a firm commitment — if a different language
 proves better suited for later stages (e.g., tighter integration with AI
 tooling), that is open for discussion.
+
+## Cargo.lock Discipline
+
+`Cargo.lock` must be committed alongside every `Cargo.toml` change so
+that each commit in the history builds reproducibly. During interactive
+rebases that change the base, the lockfile can drift. To fix this, add
+`exec` steps in the rebase todo after each commit that modifies
+`Cargo.toml`:
+
+    exec cargo generate-lockfile && git add Cargo.lock && git commit --amend --no-edit
+
+Note: `&&` is correct here because `exec` lines run in the system
+shell, not PowerShell.
 
 ## Conventions
 
@@ -118,6 +151,15 @@ Run them before and after any change.
 
 - `src/lib.rs` — converter library (block parser + renderer + tests)
 - `src/bin/mbox2md.rs` — CLI entry point for mbox-to-markdown conversion
+- `src/bin/lore-rag.rs` — CLI for RAG ingest and query
 - `src/bin/msgid-notes.rs` — tool to map Message-IDs → blob OIDs via Git notes
+- `src/bin/test-prompt.rs` — smoke-test binary for AI backends
+- `src/ai_backend.rs` — shared AI backend abstraction (API, Copilot CLI,
+  Ollama, GitHub Models, Azure OpenAI)
+- `src/rag_db.rs` — SQLite schema with FTS5 for the RAG email index
+- `src/rag_parse.rs` — Markdown email field extraction
+- `src/rag_ingest.rs` — file-based and git-backed ingestion
+- `src/rag_query.rs` — FTS5 retrieval and prompt building
+- `src/rag_git.rs` — `ls_tree` and `diff_tree` for git-backed ingestion
 - `Cargo.toml` — dependencies and project metadata
 - `sample4.md` — example converter output (a real Git mailing list patch)
