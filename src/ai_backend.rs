@@ -126,6 +126,16 @@ impl Backend {
 
     /// Send a system + user message pair and return the assistant reply.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        self.chat_with_options(system, user, None).await
+    }
+
+    /// Like `chat`, but with optional temperature override.
+    pub async fn chat_with_options(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: Option<f32>,
+    ) -> Result<String> {
         match self {
             Backend::Api {
                 api_url,
@@ -136,13 +146,22 @@ impl Backend {
                     Some(t) => ApiAuth::Bearer(t),
                     None => ApiAuth::None,
                 };
-                chat_api(api_url, model, &auth, system, user, None).await
+                chat_api(api_url, model, &auth, system, user, None, temperature).await
             }
             Backend::CopilotCli { command, model } => {
                 chat_cli(command, model.as_deref(), system, user).await
             }
             Backend::Ollama { api_url, model } => {
-                chat_api(api_url, model, &ApiAuth::None, system, user, None).await
+                chat_api(
+                    api_url,
+                    model,
+                    &ApiAuth::None,
+                    system,
+                    user,
+                    None,
+                    temperature,
+                )
+                .await
             }
             Backend::GitHubModels {
                 model,
@@ -156,6 +175,7 @@ impl Backend {
                     system,
                     user,
                     Some(rate_limits),
+                    temperature,
                 )
                 .await
             }
@@ -171,6 +191,7 @@ impl Backend {
                     system,
                     user,
                     None,
+                    temperature,
                 )
                 .await
             }
@@ -257,6 +278,8 @@ impl BackendArgs {
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -282,6 +305,7 @@ async fn chat_api(
     system: &str,
     user: &str,
     rate_limits: Option<&Mutex<RateLimitState>>,
+    temperature: Option<f32>,
 ) -> Result<String> {
     // Preemptive rate limit back-off: if we know we are running low on
     // requests and the information is recent (within the last 60 s), sleep
@@ -319,6 +343,7 @@ async fn chat_api(
                 content: user.to_string(),
             },
         ],
+        temperature,
     };
 
     let max_retries: u32 = 5;

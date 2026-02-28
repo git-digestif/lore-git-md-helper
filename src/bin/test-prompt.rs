@@ -12,6 +12,10 @@ struct Args {
     #[arg(long, short)]
     system: Option<String>,
 
+    /// Temperature (0.0–2.0)
+    #[arg(long, short)]
+    temperature: Option<f32>,
+
     #[command(flatten)]
     backend: BackendArgs,
 }
@@ -36,7 +40,13 @@ async fn main() -> Result<()> {
     };
     let prompt = read_arg(&args.prompt)?;
 
-    let reply = backend.chat(&system, &prompt).await?;
+    let reply = if let Some(temp) = args.temperature {
+        backend
+            .chat_with_options(&system, &prompt, Some(temp))
+            .await?
+    } else {
+        backend.chat(&system, &prompt).await?
+    };
     println!("{reply}");
     Ok(())
 }
