@@ -19,6 +19,7 @@ pub mod ai_backend;
 pub mod date_util;
 pub mod digestive;
 pub mod fast_import;
+pub mod periodic_digest;
 pub mod summarize;
 
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
