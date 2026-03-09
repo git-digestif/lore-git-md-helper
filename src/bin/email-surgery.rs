@@ -222,7 +222,33 @@ fn do_remove(repo: &str, git_ref: &str, dk: &str) -> Result<()> {
 }
 
 fn do_move(repo: &str, git_ref: &str, old_dk: &str, new_dk: &str) -> Result<()> {
+    if old_dk == new_dk {
+        bail!("source and target datekey are the same: {old_dk}");
+    }
+
     let mut cat = CatFile::new(repo).context("failed to start cat-file")?;
+
+    // Resolve the target datekey, appending -1, -2, … if it collides
+    // with an existing email (same logic as datekey::resolve_key).
+    let new_dk = {
+        let spec = format!("{git_ref}:{new_dk}.md");
+        if cat.get_str(&spec).is_none() {
+            new_dk.to_string()
+        } else {
+            let mut resolved = None;
+            for i in 1u32.. {
+                let candidate = format!("{new_dk}-{i}");
+                let spec = format!("{git_ref}:{candidate}.md");
+                if cat.get_str(&spec).is_none() {
+                    resolved = Some(candidate);
+                    break;
+                }
+            }
+            let dk = resolved.unwrap();
+            eprintln!("Target {new_dk} already exists, using {dk}");
+            dk
+        }
+    };
 
     // Load thread tree
     let (root_dk, mut tree) = thread_file::load_from_repo(&mut cat, git_ref, old_dk)
@@ -268,7 +294,7 @@ fn do_move(repo: &str, git_ref: &str, old_dk: &str, new_dk: &str) -> Result<()> 
                     .lines()
                     .map(|line| {
                         if line.starts_with("**Thread**: ") {
-                            line.replace(old_dk, new_dk)
+                            line.replace(old_dk, &new_dk)
                         } else {
                             line.to_string()
                         }
@@ -284,7 +310,7 @@ fn do_move(repo: &str, git_ref: &str, old_dk: &str, new_dk: &str) -> Result<()> 
     }
 
     // Rename in the thread tree
-    tree.rename(old_dk, new_dk);
+    tree.rename(old_dk, &new_dk);
 
     let new_root_dk = if is_root {
         new_dk.to_string()
@@ -344,7 +370,7 @@ fn do_move(repo: &str, git_ref: &str, old_dk: &str, new_dk: &str) -> Result<()> 
         // the format used by emit_notes_update / format_note_value.
         notes.commit(
             &format!("email-surgery: update note for {old_dk} to {new_dk}"),
-            &[(&path, new_dk)],
+            &[(&path, new_dk.as_str())],
         )?;
     }
 
@@ -900,5 +926,108 @@ mod tests {
                 "  - 2020/02/04/00-00-00 [Child B](../04/00-00-00.md) *Dave*\n",
             ),
         );
+    }
+
+    #[test]
+    fn test_move_collision_avoidance() {
+        let dir = init_bare_repo();
+        // Seed two standalone emails: one at the target datekey, one to move
+        let repo = dir.path().to_str().unwrap().to_string();
+        let mut fi = FastImport::new(&repo, "refs/heads/main").unwrap();
+
+        let mut tree1 = lore_git_md_helper::thread_file::ThreadTree::new();
+        tree1.insert("2006/01/04/16-17-29", None, "Existing email", "Alice");
+
+        let mut tree2 = lore_git_md_helper::thread_file::ThreadTree::new();
+        tree2.insert("1999/12/10/23-00-00", None, "Misdated email", "Bob");
+
+        fi.commit_with_symlinks(
+            "seed",
+            &[
+                (
+                    "2006/01/04/16-17-29.md",
+                    &email_md(
+                        "Existing email",
+                        "Alice",
+                        "existing@example.com",
+                        "2006/01/04/16-17-29",
+                    ),
+                ),
+                (
+                    "2006/01/04/16-17-29.thread.md",
+                    &tree1.render("2006/01/04/16-17-29"),
+                ),
+                (
+                    "1999/12/10/23-00-00.md",
+                    &email_md(
+                        "Misdated email",
+                        "Bob",
+                        "misdated@example.com",
+                        "1999/12/10/23-00-00",
+                    ),
+                ),
+                (
+                    "1999/12/10/23-00-00.thread.md",
+                    &tree2.render("1999/12/10/23-00-00"),
+                ),
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let mut notes = fi.sibling("refs/notes/msgid");
+        notes
+            .commit(
+                "seed notes",
+                &[
+                    (
+                        &note_path_for("existing@example.com"),
+                        "2006/01/04/16-17-29",
+                    ),
+                    (
+                        &note_path_for("misdated@example.com"),
+                        "1999/12/10/23-00-00",
+                    ),
+                ],
+            )
+            .unwrap();
+
+        fi.finish().unwrap();
+
+        // Move the misdated email to a datekey that is already taken
+        do_move(
+            &repo,
+            "refs/heads/main",
+            "1999/12/10/23-00-00",
+            "2006/01/04/16-17-29",
+        )
+        .unwrap();
+
+        // The original email at the target datekey should be untouched
+        assert!(file_exists(
+            &repo,
+            "refs/heads/main",
+            "2006/01/04/16-17-29.md"
+        ));
+        let existing = read_file(&repo, "refs/heads/main", "2006/01/04/16-17-29.md").unwrap();
+        assert!(
+            existing.contains("Existing email"),
+            "original email should be untouched"
+        );
+
+        // The moved email should land at the -1 suffix
+        assert!(file_exists(
+            &repo,
+            "refs/heads/main",
+            "2006/01/04/16-17-29-1.md"
+        ));
+        let moved = read_file(&repo, "refs/heads/main", "2006/01/04/16-17-29-1.md").unwrap();
+        assert!(moved.contains("Misdated email"), "moved email at -1 suffix");
+
+        // Note updated to the -1 suffix
+        let note_path = note_path_for("misdated@example.com");
+        let note = read_file(&repo, "refs/notes/msgid", &note_path).unwrap();
+        assert_eq!(note, "2006/01/04/16-17-29-1");
     }
 }
