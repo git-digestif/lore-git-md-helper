@@ -2,6 +2,7 @@ use anyhow::Result;
 use mail_parser::MimeHeaders;
 
 pub mod batch_import;
+pub mod cached_reader;
 pub mod cat_file;
 pub mod datekey;
 pub mod git_util;
@@ -16,7 +17,9 @@ pub mod thread_file;
 
 pub mod ai_backend;
 pub mod date_util;
+pub mod digestive;
 pub mod fast_import;
+pub mod periodic_digest;
 pub mod summarize;
 
 pub mod rag_db;

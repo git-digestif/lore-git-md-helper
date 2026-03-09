@@ -9,6 +9,7 @@ const PROJECT_CONTEXT: &str = include_str!("../prompts/git-project-context.md");
 pub struct EmailContext {
     pub email_md: String,
     pub thread_ai_summary: Option<String>,
+    pub parent_ai_summary: Option<String>,
 }
 
 pub struct SummarizationOutput {
@@ -32,6 +33,11 @@ pub fn email_user_message(ctx: &EmailContext, mode: &str) -> String {
     if let Some(thread) = &ctx.thread_ai_summary {
         msg.push_str("Thread AI summary:\n\n");
         msg.push_str(thread);
+        msg.push_str("\n\n---\n\n");
+    }
+    if let Some(parent) = &ctx.parent_ai_summary {
+        msg.push_str("Parent email AI summary:\n\n");
+        msg.push_str(parent);
         msg.push_str("\n\n---\n\n");
     }
     msg.push_str("Email:\n\n");
@@ -201,6 +207,7 @@ mod tests {
         EmailContext {
             email_md: "# [PATCH] Fix the frobnitz\nSigned-off-by: A".into(),
             thread_ai_summary: None,
+            parent_ai_summary: None,
         }
     }
 
@@ -208,6 +215,7 @@ mod tests {
         EmailContext {
             email_md: "# [PATCH v2] Fix the frobnitz\nAddresses review".into(),
             thread_ai_summary: Some("Thread discusses frobnitz fix".into()),
+            parent_ai_summary: Some("Parent proposed the fix".into()),
         }
     }
 
@@ -246,6 +254,7 @@ mod tests {
         let msg = email_user_message(&ctx, "ai");
         assert!(msg.starts_with("Mode: ai\n\n"));
         assert!(msg.contains("Thread AI summary:\n\nThread discusses frobnitz fix"));
+        assert!(msg.contains("Parent email AI summary:\n\nParent proposed the fix"));
         assert!(msg.contains("Email:\n\n# [PATCH v2]"));
     }
 

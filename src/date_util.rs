@@ -1,9 +1,41 @@
 //! Day-level date helpers for "YYYY/MM/DD" day strings.
 
+use time::OffsetDateTime;
+
 /// Extract the day prefix ("YYYY/MM/DD") from a date-key like
 /// "2025/01/03/14-46-37".
 pub fn day_of(dk: &str) -> &str {
     &dk[..dk.rfind('/').unwrap_or(dk.len())]
+}
+
+/// Parse a full datekey ("YYYY/MM/DD/HH-MM-SS") into an
+/// `OffsetDateTime` (UTC).  Ignores any collision suffix like "-1".
+pub fn parse_datekey(dk: &str) -> Option<OffsetDateTime> {
+    if dk.len() < 19 {
+        return None;
+    }
+    let y: i32 = dk[0..4].parse().ok()?;
+    let mo: u8 = dk[5..7].parse().ok()?;
+    let d: u8 = dk[8..10].parse().ok()?;
+    let h: u8 = dk[11..13].parse().ok()?;
+    let mi: u8 = dk[14..16].parse().ok()?;
+    let s: u8 = dk[17..19].parse().ok()?;
+    let date = time::Date::from_calendar_date(y, time::Month::try_from(mo).ok()?, d).ok()?;
+    let time = time::Time::from_hms(h, mi, s).ok()?;
+    Some(date.with_time(time).assume_utc())
+}
+
+/// Format an `OffsetDateTime` as a datekey "YYYY/MM/DD/HH-MM-SS".
+pub fn format_datekey(dt: OffsetDateTime) -> String {
+    format!(
+        "{:04}/{:02}/{:02}/{:02}-{:02}-{:02}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
 }
 
 /// Extract "YYYY/MM" from a "YYYY/MM/DD" day string.
