@@ -17,6 +17,7 @@ pub mod thread_file;
 pub mod ai_backend;
 pub mod date_util;
 pub mod fast_import;
+pub mod summarize;
 
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     let mut md = String::new();
