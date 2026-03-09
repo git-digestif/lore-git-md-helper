@@ -70,7 +70,7 @@ pub fn write_fast_import(
         .iter()
         .map(|(p, t)| (p.as_str(), t.as_str()))
         .collect();
-    content_fi.commit_with_symlinks(&msg, &file_refs, &sym_refs)?;
+    content_fi.commit_with_symlinks(&msg, &file_refs, &sym_refs, &[])?;
 
     // Notes commit
     let notes_count = emit_notes_update(notes_fi, map, result.last_source_commit.as_deref())?;

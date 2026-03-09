@@ -1263,7 +1263,7 @@ mod tests {
             ], &[
                 (&format!("{REPLY}.thread.md"),
                  "../../../2024/12/15/10-00-00.thread.md"),
-            ]).unwrap();
+            ], &[]).unwrap();
 
             fi.finish().unwrap();
         }
@@ -1381,6 +1381,7 @@ mod tests {
                     (&format!("{REPLY1}.thread.md"), "10-00-00.thread.md"),
                     (&format!("{REPLY2}.thread.md"), "10-00-00.thread.md"),
                 ],
+                &[],
             )
             .unwrap();
 
@@ -1815,6 +1816,7 @@ mod tests {
                     ),
                 ],
                 &[(&format!("{REPLY}.thread.md"), "10-00-00.thread.md")],
+                &[],
             )
             .unwrap();
 
@@ -1934,7 +1936,7 @@ mod tests {
                 (&format!("{BOB_REPLY}.thread.md"), "09-00-00.thread.md"),
                 (&format!("{ALICE_V2}.thread.md"), "../06/09-00-00.thread.md"),
                 (&format!("{EVE_REPLY}.thread.md"), "../../01/06/09-00-00.thread.md"),
-            ]).unwrap();
+            ], &[]).unwrap();
 
             // Seed commit 2: pre-existing email summaries and thread state.
             fi.commit(
