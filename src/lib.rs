@@ -4,6 +4,8 @@ use mail_parser::MimeHeaders;
 pub mod datekey;
 pub mod git_util;
 
+pub mod fast_import;
+
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     let mut md = String::new();
 
