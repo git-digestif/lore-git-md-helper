@@ -134,4 +134,29 @@ mod tests {
         assert!(input.contains("Granularity: monthly"));
         assert!(input.contains("Sub-period digests: 1"));
     }
+
+    #[tokio::test]
+    async fn test_generate_periodic_digest_with_mock() {
+        let backend = Backend::Mock { nth_word: 3 };
+        let digests = vec![
+            SubDigest {
+                label: "2025/01/06".into(),
+                content: "alpha beta gamma delta epsilon".into(),
+            },
+            SubDigest {
+                label: "2025/01/07".into(),
+                content: "one two three four five six".into(),
+            },
+        ];
+        let output = generate_periodic_digest(
+            "2025/01/06 -- 2025/01/12",
+            Granularity::Weekly,
+            &digests,
+            &backend,
+        )
+        .await
+        .unwrap();
+        assert!(!output.human.is_empty());
+        assert!(!output.ai.is_empty());
+    }
 }
