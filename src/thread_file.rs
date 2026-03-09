@@ -133,9 +133,83 @@ impl ThreadTree {
         );
     }
 
+    /// Remove a node from the tree, re-parenting its children to the
+    /// removed node's parent.
+    pub fn remove(&mut self, dk: &str) {
+        let parent = self.parents.remove(dk).flatten();
+        let children = self.children.remove(dk).unwrap_or_default();
+        self.nodes.remove(dk);
+
+        // Remove from parent's children list (or roots)
+        if let Some(ref p) = parent {
+            if let Some(siblings) = self.children.get_mut(p) {
+                siblings.retain(|c| c != dk);
+            }
+        } else {
+            self.roots.retain(|r| r != dk);
+        }
+
+        // Re-parent children
+        for child in &children {
+            self.parents.insert(child.clone(), parent.clone());
+            if let Some(ref p) = parent {
+                self.children
+                    .entry(p.clone())
+                    .or_default()
+                    .push(child.clone());
+            } else {
+                self.roots.push(child.clone());
+            }
+        }
+    }
+
+    /// Change a node's date-key, updating all internal references.
+    pub fn rename(&mut self, old_dk: &str, new_dk: &str) {
+        if let Some(mut node) = self.nodes.remove(old_dk) {
+            node.date_key = new_dk.to_string();
+            self.nodes.insert(new_dk.to_string(), node);
+        }
+
+        if let Some(parent) = self.parents.remove(old_dk) {
+            self.parents.insert(new_dk.to_string(), parent.clone());
+            if let Some(ref p) = parent {
+                if let Some(siblings) = self.children.get_mut(p) {
+                    for s in siblings.iter_mut() {
+                        if s == old_dk {
+                            *s = new_dk.to_string();
+                        }
+                    }
+                }
+            } else {
+                for r in self.roots.iter_mut() {
+                    if r == old_dk {
+                        *r = new_dk.to_string();
+                    }
+                }
+            }
+        }
+
+        if let Some(children) = self.children.remove(old_dk) {
+            for child in &children {
+                if let Some(p) = self.parents.get_mut(child) {
+                    *p = Some(new_dk.to_string());
+                }
+            }
+            self.children.insert(new_dk.to_string(), children);
+        }
+    }
+
     /// Check whether a date-key is in the tree.
     pub fn contains(&self, date_key: &str) -> bool {
         self.nodes.contains_key(date_key)
+    }
+
+    /// Get the children of a node (empty slice if none).
+    pub fn children_of(&self, date_key: &str) -> &[String] {
+        self.children
+            .get(date_key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get all date-keys in the tree.
