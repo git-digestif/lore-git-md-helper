@@ -41,6 +41,15 @@ pub enum ApiAuth<'a> {
     None,
 }
 
+/// Endpoint-specific parameters for chat_api(), grouping the
+/// per-backend state that varies across Backend variants.
+struct ApiEndpoint<'a> {
+    api_url: &'a str,
+    model: &'a str,
+    auth: ApiAuth<'a>,
+    rate_limits: Option<&'a Mutex<RateLimitState>>,
+}
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -146,54 +155,51 @@ impl Backend {
                     Some(t) => ApiAuth::Bearer(t),
                     None => ApiAuth::None,
                 };
-                chat_api(api_url, model, &auth, system, user, None, temperature).await
+                let ep = ApiEndpoint {
+                    api_url,
+                    model,
+                    auth,
+                    rate_limits: None,
+                };
+                chat_api(&ep, system, user, temperature).await
             }
             Backend::CopilotCli { command, model } => {
                 chat_cli(command, model.as_deref(), system, user).await
             }
             Backend::Ollama { api_url, model } => {
-                chat_api(
+                let ep = ApiEndpoint {
                     api_url,
                     model,
-                    &ApiAuth::None,
-                    system,
-                    user,
-                    None,
-                    temperature,
-                )
-                .await
+                    auth: ApiAuth::None,
+                    rate_limits: None,
+                };
+                chat_api(&ep, system, user, temperature).await
             }
             Backend::GitHubModels {
                 model,
                 token,
                 rate_limits,
             } => {
-                chat_api(
-                    GITHUB_MODELS_URL,
+                let ep = ApiEndpoint {
+                    api_url: GITHUB_MODELS_URL,
                     model,
-                    &ApiAuth::Bearer(token),
-                    system,
-                    user,
-                    Some(rate_limits),
-                    temperature,
-                )
-                .await
+                    auth: ApiAuth::Bearer(token),
+                    rate_limits: Some(rate_limits),
+                };
+                chat_api(&ep, system, user, temperature).await
             }
             Backend::AzureOpenAI {
                 api_url,
                 model,
                 api_key,
             } => {
-                chat_api(
+                let ep = ApiEndpoint {
                     api_url,
                     model,
-                    &ApiAuth::ApiKey(api_key),
-                    system,
-                    user,
-                    None,
-                    temperature,
-                )
-                .await
+                    auth: ApiAuth::ApiKey(api_key),
+                    rate_limits: None,
+                };
+                chat_api(&ep, system, user, temperature).await
             }
         }
     }
@@ -299,18 +305,15 @@ struct ChatChoice {
 }
 
 async fn chat_api(
-    api_url: &str,
-    model: &str,
-    auth: &ApiAuth<'_>,
+    ep: &ApiEndpoint<'_>,
     system: &str,
     user: &str,
-    rate_limits: Option<&Mutex<RateLimitState>>,
     temperature: Option<f32>,
 ) -> Result<String> {
     // Preemptive rate limit back-off: if we know we are running low on
     // requests and the information is recent (within the last 60 s), sleep
     // briefly to avoid hammering the API.
-    if let Some(rl) = rate_limits {
+    if let Some(rl) = ep.rate_limits {
         let sleep_needed = {
             let state = rl.lock().expect("rate limit lock poisoned");
             state
@@ -325,14 +328,14 @@ async fn chat_api(
     }
 
     let client = reqwest::Client::new();
-    let base = api_url.trim_end_matches('/');
+    let base = ep.api_url.trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
         base.to_string()
     } else {
         format!("{base}/chat/completions")
     };
     let req = ChatRequest {
-        model: model.to_string(),
+        model: ep.model.to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".into(),
@@ -350,7 +353,7 @@ async fn chat_api(
     let mut attempt = 0;
     loop {
         let mut builder = client.post(&url).json(&req);
-        match auth {
+        match &ep.auth {
             ApiAuth::Bearer(t) => {
                 builder = builder.bearer_auth(t);
             }
@@ -359,7 +362,22 @@ async fn chat_api(
             }
             ApiAuth::None => {}
         }
-        let resp = builder.send().await.context("API request failed")?;
+        let resp = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                attempt += 1;
+                if attempt > max_retries {
+                    return Err(e).context("API request failed");
+                }
+                let backoff = retry_backoff_secs(attempt);
+                eprintln!(
+                    "[retry] send error (attempt {attempt}/{max_retries}): \
+                     {e:#}; sleeping {backoff}s"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                continue;
+            }
+        };
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             attempt += 1;
@@ -394,12 +412,27 @@ async fn chat_api(
             continue;
         }
 
+        if resp.status().is_server_error() || resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            attempt += 1;
+            let status = resp.status();
+            if attempt > max_retries {
+                anyhow::bail!("API returned {status} after {max_retries} retries");
+            }
+            let backoff = retry_backoff_secs(attempt);
+            eprintln!(
+                "[retry] {status} (attempt {attempt}/{max_retries}), \
+                 sleeping {backoff}s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            continue;
+        }
+
         let response = resp
             .error_for_status()
             .context("API returned error status")?;
 
         // Update rate limit state from response headers when available.
-        if let Some(rl) = rate_limits {
+        if let Some(rl) = ep.rate_limits {
             let mut state = rl.lock().expect("rate limit lock poisoned");
             if let Some(v) = response.headers().get("x-ratelimit-remaining-requests")
                 && let Ok(s) = v.to_str()
@@ -501,4 +534,162 @@ async fn chat_cli(command: &str, model: Option<&str>, system: &str, user: &str) 
         .context("copilot CLI output is not valid UTF-8")?
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_chat_response(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}}]
+        })
+        .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_retries_on_429() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_retries_on_5xx() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("recovered")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
+        assert_eq!(result, "recovered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_retries_on_empty_response() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("   ")))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(ok_chat_response("real content")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
+        assert_eq!(result, "real content");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_gives_up_after_max_retries() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(6) // 1 initial + 5 retries
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("429") && msg.contains("5 retries"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_bails_on_excessive_retry_after() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "86400"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("86400") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
 }
