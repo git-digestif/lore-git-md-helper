@@ -40,10 +40,13 @@ This repository is tackling the problem in stages:
    `In-Reply-To` / `References` headers to reconstruct conversation threads
    and represent them in Markdown (exact representation TBD).
 
-5. **AI-generated summaries** (future): Per-email summaries, per-thread
+5. **AI-generated summaries** (active): Per-email summaries, per-thread
    summaries (updated as new replies arrive), and roll-up summaries at daily,
-   weekly, monthly, and yearly granularity. This will require significant
-   iteration and fine-tuning.
+   weekly, and monthly granularity. The `digestive` pipeline handles this
+   end-to-end: it enumerates emails from the archive, generates four AI
+   summaries per email (human-readable, AI-consumable, thread-level human,
+   thread-level AI), then produces daily/weekly/monthly digests as period
+   boundaries are crossed.
 
 ## Current State
 
@@ -76,6 +79,36 @@ than producing error markers in the output.
 
 A `msgid-notes` tool maps Message-IDs to blob OIDs via Git notes
 (stage 3 groundwork).
+
+A **digestive pipeline** provides batch AI summarization of emails
+and hierarchical digest generation:
+
+- `summarize`: four-call summarization per email (human summary,
+  AI summary, thread-level human, thread-level AI) using tuned
+  prompts with project context
+- `digestive`: the main pipeline module with a `Digestive` struct
+  that owns all pipeline state and processes emails sequentially
+  via a streaming `ls-tree` loop with day/week/month boundary
+  detection
+- `periodic_digest`: weekly and monthly digest generation from
+  sub-period digests, with cache-aware collection that checks
+  in-memory caches before falling back to the repository
+- `date_util`: day-level date helpers (ISO week boundaries, month
+  extraction, day arithmetic)
+- `fast_import`: a `FastImport` struct mirroring the `CatFile`
+  pattern, encapsulating the git fast-import protocol behind a
+  clean commit/checkpoint/finish API
+- `digestive` binary: thin CLI shim that constructs a `Digestive`
+  struct, computes the starting point via auto-resume from the
+  latest digest commit, and delegates to the library
+
+Prompt files in `prompts/` define the AI agent behavior:
+- `git-digest-email.md`: per-email summarization with taxonomy
+- `git-thread-summary.md`: thread-level summary updates
+- `git-project-context.md`: shared project context for all agents
+- `git-daily-digest.md`: daily digest with thread-delta approach
+- `git-periodic-digest.md`: weekly/monthly digest with inventory-
+  first editorial workflow and include-all-topics guidance
 
 ## Technology
 
@@ -145,21 +178,42 @@ cargo test
 
 There are unit tests in `src/lib.rs` covering diff detection, nested
 quoting, snip/snap markers, indented blocks, ASCII art, and mixed content.
+The digestive pipeline has unit tests for date utilities, work-item
+planning, email context loading, daily digest input construction, and
+a comprehensive integration test that validates the full pipeline
+end-to-end with a mock backend.
 Run them before and after any change.
 
 ## Key Files
 
 - `src/lib.rs` — converter library (block parser + renderer + tests)
 - `src/bin/mbox2md.rs` — CLI entry point for mbox-to-markdown conversion
+- `src/bin/digestive.rs` — CLI for batch email summarization and digest
+  generation (thin shim over `Digestive` struct)
 - `src/bin/lore-rag.rs` — CLI for RAG ingest and query
 - `src/bin/msgid-notes.rs` — tool to map Message-IDs → blob OIDs via Git notes
 - `src/bin/test-prompt.rs` — smoke-test binary for AI backends
+- `src/digestive.rs` — main digestive pipeline: work-item iterator,
+  `Digestive` struct, email summarization, daily digest generation
+- `src/periodic_digest.rs` — weekly and monthly digest generation from
+  sub-period digests, with cache-aware collection
+- `src/summarize.rs` — per-email summarization (four AI calls per email)
+- `src/date_util.rs` — day-level date helpers (ISO weeks, months, arithmetic)
+- `src/fast_import.rs` — `FastImport` struct for git fast-import protocol
 - `src/ai_backend.rs` — shared AI backend abstraction (API, Copilot CLI,
-  Ollama, GitHub Models, Azure OpenAI)
+  Ollama, GitHub Models, Azure OpenAI, Mock for testing)
+- `src/git_util.rs` — Git helpers: source_commit_from_ref, resolve_ref,
+  latest_trailer, latest_digest, last_digest_day
+- `src/cat_file.rs` — `CatFile` struct for git cat-file batch protocol
 - `src/rag_db.rs` — SQLite schema with FTS5 for the RAG email index
 - `src/rag_parse.rs` — Markdown email field extraction
 - `src/rag_ingest.rs` — file-based and git-backed ingestion
 - `src/rag_query.rs` — FTS5 retrieval and prompt building
 - `src/rag_git.rs` — `ls_tree` and `diff_tree` for git-backed ingestion
+- `prompts/git-digest-email.md` — email summarization prompt
+- `prompts/git-thread-summary.md` — thread summary prompt
+- `prompts/git-project-context.md` — shared project context
+- `prompts/git-daily-digest.md` — daily digest prompt
+- `prompts/git-periodic-digest.md` — weekly/monthly digest prompt
 - `Cargo.toml` — dependencies and project metadata
 - `sample4.md` — example converter output (a real Git mailing list patch)
