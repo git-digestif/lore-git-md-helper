@@ -1222,4 +1222,979 @@ mod tests {
         );
         assert_eq!(new.email_summaries.len(), 1);
     }
+
+    /// Backfill test: a reply to a dormant thread triggers
+    /// summarization of the thread root, even though the root
+    /// is before the --since cutoff.
+    ///
+    /// Timeline:
+    ///   2024/12/15: Old email (thread root, no .ai.md)
+    ///   2025/01/20: Reply (within --since range)
+    ///   2025/02/01: Second email (new thread root, for day boundary)
+    ///
+    /// Expected: backfill generates .ai.md for the 2024/12/15 root
+    /// before summarizing the 2025/01/20 reply.
+    #[tokio::test]
+    async fn test_thread_backfill() {
+        use crate::ai_backend::Backend;
+
+        const OLD_ROOT: &str = "2024/12/15/10-00-00";
+        const REPLY: &str = "2025/01/20/14-00-00";
+        const STANDALONE: &str = "2025/02/01/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            fi.commit_with_symlinks("seed: dormant thread + reply", &[
+                (&format!("{OLD_ROOT}.md"),
+                 "Subject: Old discussion\nFrom: Oldie\nDate: Sun, 15 Dec 2024\n\nAncient text."),
+                (&format!("{OLD_ROOT}.thread.md"),
+                 "# Thread\n\n- 2024/12/15/10-00-00 [Old discussion](10-00-00.md) *Oldie*\n"),
+                (&format!("{REPLY}.md"),
+                 "Subject: Re: Old discussion\nFrom: Newbie\nDate: Mon, 20 Jan 2025\n\nLate reply."),
+                (&format!("{STANDALONE}.md"),
+                 "Subject: Fresh topic\nFrom: Solo\nDate: Sat, 1 Feb 2025\n\nNew."),
+                (&format!("{STANDALONE}.thread.md"),
+                 "# Thread\n\n- 2025/02/01/09-00-00 [Fresh topic](09-00-00.md) *Solo*\n"),
+            ], &[
+                (&format!("{REPLY}.thread.md"),
+                 "../../../2024/12/15/10-00-00.thread.md"),
+            ]).unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        // The old root has no .ai.md. Run with --since 2025/01/01
+        // so only the reply and standalone are in range.
+        let backend = Backend::Mock { nth_word: 3 };
+        let result = run_pipeline(
+            repo,
+            git_ref,
+            Some("2025/01/01"),
+            None,
+            5,
+            Some(&backend),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The old root should have been backfilled + reply + standalone.
+        assert_eq!(
+            result.total_processed, 3,
+            "should summarize old root (backfill) + reply + standalone"
+        );
+
+        let mut cat = CatFile::new(repo).unwrap();
+
+        // Old root (before --since) got backfilled.
+        assert!(
+            cat.get_str(&format!("{git_ref}:{OLD_ROOT}.ai.md"))
+                .is_some(),
+            "old root should have AI summary via backfill"
+        );
+
+        // Reply got summarized.
+        assert!(
+            cat.get_str(&format!("{git_ref}:{REPLY}.ai.md")).is_some(),
+            "reply should have AI summary"
+        );
+
+        // Standalone got summarized.
+        assert!(
+            cat.get_str(&format!("{git_ref}:{STANDALONE}.ai.md"))
+                .is_some(),
+            "standalone should have AI summary"
+        );
+
+        // git fsck --strict.
+        drop(cat);
+        crate::git_util::tests::git(repo, &["fsck", "--strict"]);
+    }
+
+    /// Verify that backfill does not re-summarize emails quadratically.
+    ///
+    /// When a thread has N unsummarized members, a naive implementation
+    /// would re-summarize all prior members for each new reply because
+    /// intermediate results are not visible until a checkpoint lands.
+    /// The fix caches `.ai.md` in memory so each email is summarized
+    /// exactly once.
+    ///
+    /// Setup: root + 2 replies + 1 next-day email, none with `.ai.md`.
+    /// Expected: 4 emails × 1 summarization each = 4.
+    #[tokio::test]
+    async fn test_no_quadratic_resummarization() {
+        use crate::ai_backend::Backend;
+
+        const ROOT: &str = "2025/04/01/10-00-00";
+        const REPLY1: &str = "2025/04/01/11-00-00";
+        const REPLY2: &str = "2025/04/01/12-00-00";
+        const NEXT_DAY: &str = "2025/04/02/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            let thread_md = [
+                "# Thread",
+                "",
+                &format!("- {ROOT} [topic](10-00-00.md) *Alice*"),
+                &format!("  - {REPLY1} [Re: topic](11-00-00.md) *Bob*"),
+                &format!("  - {REPLY2} [Re: topic](12-00-00.md) *Carol*"),
+                "",
+            ]
+            .join("\n");
+
+            fi.commit_with_symlinks(
+                "seed",
+                &[
+                    (
+                        &format!("{ROOT}.md"),
+                        "Subject: topic\nFrom: Alice\nDate: Tue, 1 Apr 2025\n\nOriginal.",
+                    ),
+                    (&format!("{ROOT}.thread.md"), &thread_md),
+                    (
+                        &format!("{REPLY1}.md"),
+                        "Subject: Re: topic\nFrom: Bob\nDate: Tue, 1 Apr 2025\n\nReply one.",
+                    ),
+                    (
+                        &format!("{REPLY2}.md"),
+                        "Subject: Re: topic\nFrom: Carol\nDate: Tue, 1 Apr 2025\n\nReply two.",
+                    ),
+                    (
+                        &format!("{NEXT_DAY}.md"),
+                        "Subject: other\nFrom: Dave\nDate: Wed, 2 Apr 2025\n\nNew.",
+                    ),
+                    (
+                        &format!("{NEXT_DAY}.thread.md"),
+                        "# Thread\n\n- 2025/04/02/09-00-00 [other](09-00-00.md) *Dave*\n",
+                    ),
+                ],
+                &[
+                    (&format!("{REPLY1}.thread.md"), "10-00-00.thread.md"),
+                    (&format!("{REPLY2}.thread.md"), "10-00-00.thread.md"),
+                ],
+            )
+            .unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        let backend = Backend::Mock { nth_word: 3 };
+        let result = run_pipeline(repo, git_ref, None, None, 20, Some(&backend), false)
+            .await
+            .unwrap();
+
+        // 4 unique emails need summarization: root, reply1, reply2,
+        // standalone.  Each should be summarized exactly once.
+        assert_eq!(
+            result.total_processed, 4,
+            "each email should be summarized exactly once; \
+             got {} (quadratic re-summarization bug)",
+            result.total_processed
+        );
+    }
+
+    /// Verify that backfill_thread does NOT process thread members
+    /// beyond the triggering email's datekey.
+    ///
+    /// Setup: a thread root on day 1 with replies on day 1 and day 2.
+    /// None have AI summaries.  The main loop processes day 1 first.
+    /// The day-1 reply triggers backfill, which must NOT summarize
+    /// the day-2 reply (it belongs to day 2's digest, not day 1's).
+    #[tokio::test]
+    async fn test_backfill_bounded_by_trigger_dk() {
+        use crate::ai_backend::Backend;
+
+        let root = "2025/03/10/10-00-00";
+        let day1_reply = "2025/03/10/14-00-00";
+        let day2_reply = "2025/03/11/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            let thread_md = [
+                "# Thread",
+                "",
+                &format!("- {root} [topic](10-00-00.md) *Alice*"),
+                &format!("  - {day1_reply} [Re: topic](14-00-00.md) *Bob*"),
+                &format!("  - {day2_reply} [Re: topic](09-00-00.md) *Carol*"),
+            ]
+            .join("\n");
+
+            fi.commit(
+                "seed",
+                &[
+                    (
+                        &format!("{root}.md"),
+                        "Subject: topic\nFrom: Alice\n\ntopic",
+                    ),
+                    (&format!("{root}.thread.md"), &thread_md),
+                    (
+                        &format!("{day1_reply}.md"),
+                        "Subject: Re: topic\nFrom: Bob\n\nreply1",
+                    ),
+                    (&format!("{day1_reply}.thread.md"), &thread_md),
+                    (
+                        &format!("{day2_reply}.md"),
+                        "Subject: Re: topic\nFrom: Carol\n\nreply2",
+                    ),
+                    (&format!("{day2_reply}.thread.md"), &thread_md),
+                    // Add a day-3 email to trigger the day-2 boundary
+                    // (finalize_day only fires at the next day boundary).
+                    (
+                        "2025/03/12/10-00-00.md",
+                        "Subject: other\nFrom: Dave\n\nother",
+                    ),
+                    (
+                        "2025/03/12/10-00-00.thread.md",
+                        "# Thread\n\n- 2025/03/12/10-00-00 [other](10-00-00.md) *Dave*\n",
+                    ),
+                ],
+            )
+            .unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        let backend = Backend::Mock { nth_word: 1 };
+        let result = run_pipeline(repo, git_ref, None, None, 20, Some(&backend), false)
+            .await
+            .unwrap();
+
+        // All 4 emails should be summarized.
+        assert_eq!(
+            result.total_processed, 4,
+            "expected 4 summaries; got {}",
+            result.total_processed
+        );
+
+        let mut cat = CatFile::new(repo).unwrap();
+
+        // Day 1 (Mar 10) daily digest should include root + day1_reply.
+        let day1_digest = cat
+            .get_str(&format!("{git_ref}:2025/03/10/digest.human.md"))
+            .expect("day 1 digest should exist");
+        assert!(
+            day1_digest.contains("2025/03/10/10-00-00"),
+            "day 1 digest should include the root email"
+        );
+        assert!(
+            day1_digest.contains("2025/03/10/14-00-00"),
+            "day 1 digest should include the day-1 reply"
+        );
+        // The day-2 reply must NOT leak into day 1's digest.
+        assert!(
+            !day1_digest.contains("2025/03/11"),
+            "day 1 digest must NOT contain day-2 content"
+        );
+
+        // Day 2 (Mar 11) daily digest should include day2_reply.
+        let day2_digest = cat
+            .get_str(&format!("{git_ref}:2025/03/11/digest.human.md"))
+            .expect("day 2 digest should exist");
+        assert!(
+            day2_digest.contains("2025/03/11/09-00-00"),
+            "day 2 digest should include the day-2 reply"
+        );
+
+        drop(cat);
+        crate::git_util::tests::git(repo, &["fsck", "--strict"]);
+    }
+
+    /// Test cross-boundary digest rollup with --since at a mid-week day.
+    ///
+    /// Calendar: 2025/01/01 is Wednesday.
+    /// ISO week: Mon Dec 30 – Sun Jan 05.
+    ///
+    /// Setup:
+    ///   Dec 30 (Mon): email + .ai.md + daily digest  (pre-since)
+    ///   Dec 31 (Tue): email + .ai.md, NO daily digest (pre-since, gap)
+    ///   Jan 01 (Wed): email + .ai.md + daily digest  (in range)
+    ///   Jan 02 (Thu): email + .ai.md, NO daily digest (in range, missing)
+    ///   Jan 06 (Mon): email .md only                  (new week)
+    ///   Feb 01 (Sat): email .md only                  (triggers month boundary)
+    ///
+    /// No weekly or monthly digests pre-exist.
+    ///
+    /// Verifications:
+    ///   - Dec 30, Dec 31 daily digests NOT generated (pre-since skip)
+    ///   - Dec 31 stays without daily digest (gap preserved)
+    ///   - Jan 02 daily digest IS generated
+    ///   - Weekly Jan 05 picks up dailies for Dec 30, Jan 01, Jan 02
+    ///     (NOT Dec 31: it has no daily digest)
+    ///   - Jan 06 email is summarized, daily digest generated
+    ///   - Weekly Jan 12 rolls up Jan 06's daily
+    ///   - Monthly Jan rolls up both weekly digests (Jan 05 + Jan 12)
+    #[tokio::test]
+    async fn test_cross_boundary_digest_rollup() {
+        use crate::ai_backend::Backend;
+
+        let dec30 = "2024/12/30/10-00-00";
+        let dec31 = "2024/12/31/10-00-00";
+        let jan01 = "2025/01/01/10-00-00";
+        let jan02 = "2025/01/02/10-00-00";
+        let jan06 = "2025/01/06/10-00-00";
+        let feb01 = "2025/02/01/10-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            // Each email is a standalone thread root.
+            fi.commit(
+                "seed: emails and pre-existing summaries",
+                &[
+                    // Dec 30: email + .ai.md + daily digest (pre-since)
+                    (
+                        &format!("{dec30}.md"),
+                        "Subject: Mon\nFrom: A\nDate: Mon, 30 Dec 2024\n\nMon.",
+                    ),
+                    (&format!("{dec30}.ai.md"), "AI summary for Dec 30"),
+                    (&format!("{dec30}.human.md"), "Human summary for Dec 30"),
+                    (
+                        &format!("{dec30}.thread.md"),
+                        &format!("# Thread\n\n- {dec30} [Mon](10-00-00.md) *A*\n"),
+                    ),
+                    (&format!("{dec30}.thread.ai.md"), "thread ai Dec 30"),
+                    (&format!("{dec30}.thread.human.md"), "thread human Dec 30"),
+                    ("2024/12/30/digest.human.md", "Daily digest Dec 30 human"),
+                    ("2024/12/30/digest.ai.md", "Daily digest Dec 30 ai"),
+                    // Dec 31: email + .ai.md but NO daily digest (gap)
+                    (
+                        &format!("{dec31}.md"),
+                        "Subject: Tue\nFrom: B\nDate: Tue, 31 Dec 2024\n\nTue.",
+                    ),
+                    (&format!("{dec31}.ai.md"), "AI summary for Dec 31"),
+                    (&format!("{dec31}.human.md"), "Human summary for Dec 31"),
+                    (
+                        &format!("{dec31}.thread.md"),
+                        &format!("# Thread\n\n- {dec31} [Tue](10-00-00.md) *B*\n"),
+                    ),
+                    (&format!("{dec31}.thread.ai.md"), "thread ai Dec 31"),
+                    (&format!("{dec31}.thread.human.md"), "thread human Dec 31"),
+                    // Jan 01: email + .ai.md + daily digest (in range)
+                    (
+                        &format!("{jan01}.md"),
+                        "Subject: Wed\nFrom: C\nDate: Wed, 1 Jan 2025\n\nWed.",
+                    ),
+                    (&format!("{jan01}.ai.md"), "AI summary for Jan 01"),
+                    (&format!("{jan01}.human.md"), "Human summary for Jan 01"),
+                    (
+                        &format!("{jan01}.thread.md"),
+                        &format!("# Thread\n\n- {jan01} [Wed](10-00-00.md) *C*\n"),
+                    ),
+                    (&format!("{jan01}.thread.ai.md"), "thread ai Jan 01"),
+                    (&format!("{jan01}.thread.human.md"), "thread human Jan 01"),
+                    ("2025/01/01/digest.human.md", "Daily digest Jan 01 human"),
+                    ("2025/01/01/digest.ai.md", "Daily digest Jan 01 ai"),
+                    // Jan 02: email + .ai.md but NO daily digest (missing)
+                    (
+                        &format!("{jan02}.md"),
+                        "Subject: Thu\nFrom: D\nDate: Thu, 2 Jan 2025\n\nThu.",
+                    ),
+                    (&format!("{jan02}.ai.md"), "AI summary for Jan 02"),
+                    (&format!("{jan02}.human.md"), "Human summary for Jan 02"),
+                    (
+                        &format!("{jan02}.thread.md"),
+                        &format!("# Thread\n\n- {jan02} [Thu](10-00-00.md) *D*\n"),
+                    ),
+                    (&format!("{jan02}.thread.ai.md"), "thread ai Jan 02"),
+                    (&format!("{jan02}.thread.human.md"), "thread human Jan 02"),
+                    // Jan 06: email only (no .ai.md), next week
+                    (
+                        &format!("{jan06}.md"),
+                        "Subject: Mon2\nFrom: E\nDate: Mon, 6 Jan 2025\n\nMon2.",
+                    ),
+                    (
+                        &format!("{jan06}.thread.md"),
+                        &format!("# Thread\n\n- {jan06} [Mon2](10-00-00.md) *E*\n"),
+                    ),
+                    // Feb 01: email only, next month
+                    (
+                        &format!("{feb01}.md"),
+                        "Subject: Feb\nFrom: F\nDate: Sat, 1 Feb 2025\n\nFeb.",
+                    ),
+                    (
+                        &format!("{feb01}.thread.md"),
+                        &format!("# Thread\n\n- {feb01} [Feb](10-00-00.md) *F*\n"),
+                    ),
+                ],
+            )
+            .unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        // Use nth_word: 1 so the mock echoes the full prompt, allowing
+        // us to verify which daily digests fed into weekly/monthly.
+        let backend = Backend::Mock { nth_word: 1 };
+        let result = run_pipeline(
+            repo,
+            git_ref,
+            Some("2025/01/01"),
+            None,
+            20,
+            Some(&backend),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Emails summarized: Jan 06 and Feb 01 (only ones without .ai.md
+        // in range).  Jan 02 already has .ai.md so only its daily digest
+        // is generated, not a new email summary.
+        assert_eq!(
+            result.total_processed, 2,
+            "should summarize Jan 06 + Feb 01 only; got {}",
+            result.total_processed
+        );
+
+        let mut cat = CatFile::new(repo).unwrap();
+
+        // --- Pre-since daily digests: NOT regenerated ---
+        // Dec 30 daily digest still exists (was pre-existing)
+        assert!(
+            cat.get_str(&format!("{git_ref}:2024/12/30/digest.ai.md"))
+                .is_some(),
+            "Dec 30 daily digest should still exist"
+        );
+
+        // Dec 31 daily digest should still NOT exist (pre-since gap)
+        assert!(
+            cat.get_str(&format!("{git_ref}:2024/12/31/digest.ai.md"))
+                .is_none(),
+            "Dec 31 daily digest should NOT be generated (pre-since)"
+        );
+
+        // --- Post-since missing daily: generated ---
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/02/digest.ai.md"))
+                .is_some(),
+            "Jan 02 daily digest should be generated"
+        );
+
+        // --- Jan 06 email summarized + daily digest ---
+        assert!(
+            cat.get_str(&format!("{git_ref}:{jan06}.ai.md")).is_some(),
+            "Jan 06 email should be summarized"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/06/digest.ai.md"))
+                .is_some(),
+            "Jan 06 daily digest should be generated"
+        );
+
+        // --- Weekly digests ---
+        // Week ending Jan 05 (Mon Dec 30 – Sun Jan 05):
+        // picks up dailies for Dec 30, Jan 01, Jan 02 (NOT Dec 31).
+        let weekly_jan05 = cat
+            .get_str(&format!("{git_ref}:2025/01/05/digest.weekly.human.md"))
+            .expect("weekly digest for Jan 05 should exist");
+        assert!(
+            weekly_jan05.contains("2024/12/30"),
+            "weekly Jan 05 should include Dec 30 daily"
+        );
+        assert!(
+            weekly_jan05.contains("2025/01/01"),
+            "weekly Jan 05 should include Jan 01 daily"
+        );
+        assert!(
+            weekly_jan05.contains("2025/01/02"),
+            "weekly Jan 05 should include Jan 02 daily"
+        );
+        assert!(
+            !weekly_jan05.contains("2024/12/31"),
+            "weekly Jan 05 must NOT include Dec 31 (no daily digest)"
+        );
+
+        // Week ending Jan 12 (Mon Jan 06 – Sun Jan 12):
+        let weekly_jan12 = cat
+            .get_str(&format!("{git_ref}:2025/01/12/digest.weekly.human.md"))
+            .expect("weekly digest for Jan 12 should exist");
+        assert!(
+            weekly_jan12.contains("2025/01/06"),
+            "weekly Jan 12 should include Jan 06 daily"
+        );
+
+        // --- Monthly digest ---
+        let monthly_jan = cat
+            .get_str(&format!("{git_ref}:2025/01/digest.monthly.human.md"))
+            .expect("monthly digest for Jan should exist");
+        // Monthly rolls up both weekly digests.
+        assert!(
+            monthly_jan.contains("2024/12/30"),
+            "monthly Jan should include week of Jan 05 (contains Dec 30)"
+        );
+        assert!(
+            monthly_jan.contains("2025/01/06"),
+            "monthly Jan should include week of Jan 12 (contains Jan 06)"
+        );
+
+        // --- git fsck ---
+        drop(cat);
+        crate::git_util::tests::git(repo, &["fsck", "--strict"]);
+    }
+
+    /// Verify that a reply email's AI summary prompt includes the
+    /// thread AI summary, the parent email's AI summary, and the
+    /// email's own markdown body.
+    ///
+    /// Uses `Mock { nth_word: 1 }` which echoes every word of the
+    /// user message, so the `.ai.md` output is the full prompt
+    /// (whitespace-normalized).  We check that unique fragments
+    /// from each input survive into the output.
+    #[tokio::test]
+    async fn test_reply_prompt_includes_parent_and_thread() {
+        use crate::ai_backend::Backend;
+
+        const ROOT: &str = "2025/03/01/10-00-00";
+        const REPLY: &str = "2025/03/01/11-00-00";
+        // Needs a second day so the first day boundary fires.
+        const NEXT_DAY: &str = "2025/03/02/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        // Unique markers that we can search for in the echoed prompt.
+        let thread_ai = "THREAD_MARKER_xyzzy42 accumulated thread context";
+        let parent_ai = "PARENT_MARKER_plugh99 parent email summary text";
+        let reply_body = "Subject: Re: topic\nFrom: Bob\n\
+                          Date: Sat, 1 Mar 2025\n\n\
+                          REPLY_MARKER_quux77 actual reply body";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            // Thread file lists root at depth 0, reply at depth 1.
+            let thread_md = [
+                "# Thread",
+                "",
+                &format!("- {ROOT} [topic](10-00-00.md) *Alice*"),
+                &format!("  - {REPLY} [Re: topic](11-00-00.md) *Bob*"),
+                "",
+            ]
+            .join("\n");
+
+            fi.commit_with_symlinks(
+                "seed",
+                &[
+                    (
+                        &format!("{ROOT}.md"),
+                        "Subject: topic\nFrom: Alice\nDate: Sat, 1 Mar 2025\n\nOriginal.",
+                    ),
+                    (&format!("{ROOT}.ai.md"), parent_ai),
+                    (&format!("{ROOT}.thread.md"), &thread_md),
+                    (&format!("{ROOT}.thread.ai.md"), thread_ai),
+                    (&format!("{ROOT}.thread.human.md"), "thread human"),
+                    (&format!("{ROOT}.human.md"), "root human"),
+                    (&format!("{REPLY}.md"), reply_body),
+                    // Next-day email so the day boundary fires.
+                    (
+                        &format!("{NEXT_DAY}.md"),
+                        "Subject: other\nFrom: Carol\nDate: Sun, 2 Mar 2025\n\nUnrelated.",
+                    ),
+                    (
+                        &format!("{NEXT_DAY}.thread.md"),
+                        "# Thread\n\n- 2025/03/02/09-00-00 [other](09-00-00.md) *Carol*\n",
+                    ),
+                ],
+                &[(&format!("{REPLY}.thread.md"), "10-00-00.thread.md")],
+            )
+            .unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        // nth_word: 1 echoes the full user message back.
+        let backend = Backend::Mock { nth_word: 1 };
+        let result = run_pipeline(repo, git_ref, None, None, 10, Some(&backend), false)
+            .await
+            .unwrap();
+
+        // The reply (and next-day standalone) should both be summarized.
+        assert!(
+            result.total_processed >= 2,
+            "expected at least reply + next-day, got {}",
+            result.total_processed
+        );
+
+        // Read the reply's AI summary from the repo.
+        let mut cat = CatFile::new(repo).unwrap();
+        let ai_md = cat
+            .get_str(&format!("{git_ref}:{REPLY}.ai.md"))
+            .expect("reply .ai.md should exist");
+
+        // The echoed prompt must contain our unique markers.
+        assert!(
+            ai_md.contains("THREAD_MARKER_xyzzy42"),
+            "prompt should include thread AI summary; got:\n{ai_md}"
+        );
+        assert!(
+            ai_md.contains("PARENT_MARKER_plugh99"),
+            "prompt should include parent AI summary; got:\n{ai_md}"
+        );
+        assert!(
+            ai_md.contains("REPLY_MARKER_quux77"),
+            "prompt should include reply email body; got:\n{ai_md}"
+        );
+
+        // Also check the structural prefixes survived.
+        assert!(
+            ai_md.contains("Thread AI summary:"),
+            "prompt should have 'Thread AI summary:' header; got:\n{ai_md}"
+        );
+        assert!(
+            ai_md.contains("Parent email AI summary:"),
+            "prompt should have 'Parent email AI summary:' header; got:\n{ai_md}"
+        );
+    }
+
+    /// Comprehensive end-to-end pipeline test.
+    ///
+    /// Timeline:
+    ///   01/06: Alice (root A), Bob (reply→A), Carol (root B)
+    ///   01/07: Alice_v2 (reply→A)
+    ///   01/10: Dave (root C)
+    ///   01/13: Eve (reply→A)
+    ///   02/03: Frank (root D)
+    ///
+    /// Pre-existing state before pipeline:
+    ///   Summaries: Alice✓ Bob✓ Carol✓ Alice_v2✓  (Dave✗ Eve✗ Frank✗)
+    ///   Thread A: updated to post-v2 state AFTER the 01/06 daily digest
+    ///   Daily digest 01/06: ✓ exists
+    ///   Daily digest 01/07: ✗ MISSING (must be backfilled)
+    ///
+    /// Merge commit at tip has no Source-Commit trailer, testing fallback.
+    #[tokio::test]
+    async fn test_comprehensive_pipeline() {
+        use crate::ai_backend::Backend;
+        use crate::git_util::source_commit_from_ref;
+        use crate::git_util::tests::git;
+
+        const ALICE: &str = "2025/01/06/09-00-00";
+        const BOB_REPLY: &str = "2025/01/06/10-00-00";
+        const CAROL: &str = "2025/01/06/11-00-00";
+        const ALICE_V2: &str = "2025/01/07/08-00-00";
+        const DAVE: &str = "2025/01/10/09-00-00";
+        const EVE_REPLY: &str = "2025/01/13/09-00-00";
+        const FRANK: &str = "2025/02/03/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        // --- Seed commit 1: all emails with proper thread symlinks ---
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+
+            fi.commit_with_symlinks("seed: add all emails", &[
+                // Alice (root of thread A, 01/06)
+                (&format!("{ALICE}.md"),
+                 "Subject: [PATCH] Fix frobnitz\nFrom: Alice\nDate: Mon, 6 Jan 2025\n\nPatch text here."),
+                (&format!("{ALICE}.thread.md"), "# Thread: Fix frobnitz"),
+                // Bob's reply to Alice (01/06)
+                (&format!("{BOB_REPLY}.md"),
+                 "Subject: Re: [PATCH] Fix frobnitz\nFrom: Bob\nDate: Mon, 6 Jan 2025\n\nLooks good, minor nit."),
+                // Carol (root of thread B, 01/06)
+                (&format!("{CAROL}.md"),
+                 "Subject: [RFC] New merge strategy\nFrom: Carol\nDate: Mon, 6 Jan 2025\n\nNew recursive merge."),
+                (&format!("{CAROL}.thread.md"), "# Thread: New merge strategy"),
+                // Alice v2 (reply to A, 01/07)
+                (&format!("{ALICE_V2}.md"),
+                 "Subject: Re: [PATCH] Fix frobnitz\nFrom: Alice\nDate: Tue, 7 Jan 2025\n\nFixed the nit, v2."),
+                // Dave (root of thread C, 01/10)
+                (&format!("{DAVE}.md"),
+                 "Subject: [PATCH] Update docs\nFrom: Dave\nDate: Fri, 10 Jan 2025\n\nDocs update."),
+                (&format!("{DAVE}.thread.md"), "# Thread: Update docs"),
+                // Eve's reply to Alice (01/13)
+                (&format!("{EVE_REPLY}.md"),
+                 "Subject: Re: [PATCH] Fix frobnitz\nFrom: Eve\nDate: Mon, 13 Jan 2025\n\nLGTM."),
+                // Frank (root of thread D, 02/03)
+                (&format!("{FRANK}.md"),
+                 "Subject: [RFC] New feature\nFrom: Frank\nDate: Mon, 3 Feb 2025\n\nNew feature."),
+                (&format!("{FRANK}.thread.md"), "# Thread: New feature"),
+            ], &[
+                // Symlinks: non-root emails point to thread A root
+                (&format!("{BOB_REPLY}.thread.md"), "09-00-00.thread.md"),
+                (&format!("{ALICE_V2}.thread.md"), "../06/09-00-00.thread.md"),
+                (&format!("{EVE_REPLY}.thread.md"), "../../01/06/09-00-00.thread.md"),
+            ]).unwrap();
+
+            // Seed commit 2: pre-existing email summaries and thread state.
+            fi.commit(
+                "seed: email summaries and thread state",
+                &[
+                    (&format!("{ALICE}.ai.md"), "SEED Alice ai summary"),
+                    (&format!("{ALICE}.human.md"), "SEED Alice human summary"),
+                    (&format!("{BOB_REPLY}.ai.md"), "SEED Bob ai summary"),
+                    (&format!("{BOB_REPLY}.human.md"), "SEED Bob human summary"),
+                    (&format!("{CAROL}.ai.md"), "SEED Carol ai summary"),
+                    (&format!("{CAROL}.human.md"), "SEED Carol human summary"),
+                    // Thread A pre-Alice-v2 state (includes Alice+Bob only)
+                    (
+                        &format!("{ALICE}.thread.ai.md"),
+                        "BEFORE_V2 BEFORE_V2 BEFORE_V2 BEFORE_V2 BEFORE_V2",
+                    ),
+                    (
+                        &format!("{ALICE}.thread.human.md"),
+                        "SEED thread A human pre-v2",
+                    ),
+                    // Thread B
+                    (&format!("{CAROL}.thread.ai.md"), "SEED thread B ai"),
+                    (&format!("{CAROL}.thread.human.md"), "SEED thread B human"),
+                ],
+            )
+            .unwrap();
+
+            // Seed commit 3: daily digest for 01/06.
+            fi.commit(
+                "digestive: daily digest for 2025/01/06",
+                &[
+                    (
+                        "2025/01/06/digest.human.md",
+                        "SEED daily digest 01/06 human",
+                    ),
+                    ("2025/01/06/digest.ai.md", "SEED daily digest 01/06 ai"),
+                ],
+            )
+            .unwrap();
+
+            // Seed commit 4: Alice v2 summary + thread A updated to post-v2.
+            fi.commit(
+                "seed: Alice v2 summary\n\nSource-Commit: abc123",
+                &[
+                    (&format!("{ALICE_V2}.ai.md"), "SEED Alice v2 ai summary"),
+                    (
+                        &format!("{ALICE_V2}.human.md"),
+                        "SEED Alice v2 human summary",
+                    ),
+                    // Thread A post-v2 state (DIFFERENT from pre-v2)
+                    (
+                        &format!("{ALICE}.thread.ai.md"),
+                        "AFTER_V2 AFTER_V2 AFTER_V2 AFTER_V2 AFTER_V2",
+                    ),
+                    (
+                        &format!("{ALICE}.thread.human.md"),
+                        "SEED thread A human after v2",
+                    ),
+                ],
+            )
+            .unwrap();
+
+            fi.finish().unwrap();
+        }
+
+        // Create a merge commit at the tip with no Source-Commit trailer.
+        {
+            let main_sha = git(repo, &["rev-parse", "refs/heads/main"]);
+            let parent_sha = git(repo, &["rev-parse", "refs/heads/main~1"]);
+            git(repo, &["update-ref", "refs/heads/side", &parent_sha]);
+            let tree = git(repo, &["rev-parse", "refs/heads/main^{tree}"]);
+            let merge = git(
+                repo,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &main_sha,
+                    "-p",
+                    &parent_sha,
+                    "-m",
+                    "merge side branch",
+                ],
+            );
+            git(repo, &["update-ref", "refs/heads/main", &merge]);
+            git(repo, &["branch", "-D", "side"]);
+        }
+
+        // --- Run the pipeline ---
+        let backend = Backend::Mock { nth_word: 5 };
+        let result = run_pipeline(repo, git_ref, None, None, 5, Some(&backend), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.total_processed, 3,
+            "should summarize Dave, Eve, Frank (Alice/Bob/Carol/Alice_v2 are pre-existing)"
+        );
+
+        // --- Verify results ---
+        let mut cat = CatFile::new(repo).unwrap();
+
+        // 1. Pre-existing summaries must NOT be regenerated.
+        assert_eq!(
+            cat.get_str(&format!("{git_ref}:{ALICE}.ai.md")).unwrap(),
+            "SEED Alice ai summary",
+            "Alice summary should be preserved"
+        );
+        assert_eq!(
+            cat.get_str(&format!("{git_ref}:{BOB_REPLY}.ai.md"))
+                .unwrap(),
+            "SEED Bob ai summary",
+            "Bob summary should be preserved"
+        );
+        assert_eq!(
+            cat.get_str(&format!("{git_ref}:{CAROL}.ai.md")).unwrap(),
+            "SEED Carol ai summary",
+            "Carol summary should be preserved"
+        );
+        assert_eq!(
+            cat.get_str(&format!("{git_ref}:{ALICE_V2}.ai.md")).unwrap(),
+            "SEED Alice v2 ai summary",
+            "Alice v2 summary should be preserved"
+        );
+
+        // 2. New summaries must be generated for unsummarized emails.
+        for dk in [DAVE, EVE_REPLY, FRANK] {
+            let ai = cat.get_str(&format!("{git_ref}:{dk}.ai.md"));
+            assert!(ai.is_some(), "missing .ai.md for {dk}");
+            assert!(
+                !ai.unwrap().starts_with("SEED"),
+                "{dk} should have mock output, not seed data"
+            );
+            assert!(
+                cat.get_str(&format!("{git_ref}:{dk}.human.md")).is_some(),
+                "missing .human.md for {dk}"
+            );
+        }
+
+        // 3. Pre-existing daily digest must NOT be regenerated.
+        assert_eq!(
+            cat.get_str(&format!("{git_ref}:2025/01/06/digest.human.md"))
+                .unwrap(),
+            "SEED daily digest 01/06 human",
+            "01/06 daily digest should be preserved",
+        );
+
+        // 4. Missing daily digest for 01/07 must be backfilled.
+        let digest_0107_human = cat.get_str(&format!("{git_ref}:2025/01/07/digest.human.md"));
+        assert!(
+            digest_0107_human.is_some(),
+            "01/07 daily digest should be backfilled"
+        );
+        let digest_0107_ai = cat.get_str(&format!("{git_ref}:2025/01/07/digest.ai.md"));
+        assert!(
+            digest_0107_ai.is_some(),
+            "01/07 daily AI digest should be backfilled"
+        );
+
+        // 5. Backfilled 01/07 digest must use pre-v2 thread state.
+        let d07_human = digest_0107_human.unwrap();
+        assert!(
+            !d07_human.contains("AFTER_V2"),
+            "01/07 digest should use pre-v2 thread state, but found post-v2 marker.\n\
+             Content: {d07_human}"
+        );
+
+        // 6. No daily digest for gap days (no emails on 01/08, 01/09).
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/08/digest.human.md"))
+                .is_none(),
+            "01/08 should have no digest (no emails)"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/09/digest.human.md"))
+                .is_none(),
+            "01/09 should have no digest (no emails)"
+        );
+
+        // 7. Daily digests generated for days with new emails.
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/10/digest.human.md"))
+                .is_some(),
+            "01/10 daily digest should exist"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/13/digest.human.md"))
+                .is_some(),
+            "01/13 daily digest should exist"
+        );
+
+        // 8. Last day (02/03) must NOT have a daily digest.
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/02/03/digest.human.md"))
+                .is_none(),
+            "last day (02/03) should NOT have a daily digest"
+        );
+
+        // 9. Weekly digest for week 1 (01/06-01/12).
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/12/digest.weekly.human.md"))
+                .is_some(),
+            "week 1 (01/12) should have a weekly digest"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/12/digest.weekly.ai.md"))
+                .is_some(),
+            "week 1 (01/12) should have a weekly AI digest"
+        );
+
+        // 10. Weekly digest for week 2 (01/13-01/19).
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/19/digest.weekly.human.md"))
+                .is_some(),
+            "week 2 (01/19) should have a weekly digest"
+        );
+
+        // 11. Monthly digest for January.
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/digest.monthly.human.md"))
+                .is_some(),
+            "January should have a monthly digest"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/digest.monthly.ai.md"))
+                .is_some(),
+            "January should have a monthly AI digest"
+        );
+
+        // 12. No weekly/monthly for incomplete periods.
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/02/09/digest.weekly.human.md"))
+                .is_none(),
+            "week of 02/03 should NOT have a weekly digest"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/02/digest.monthly.human.md"))
+                .is_none(),
+            "February should NOT have a monthly digest"
+        );
+
+        // 13. git fsck --strict: no NUL bytes or object corruption.
+        drop(cat);
+        crate::git_util::tests::git(repo, &["fsck", "--strict"]);
+
+        // 14. Source-Commit propagation through the merge commit.
+        let source = source_commit_from_ref(repo, git_ref);
+        assert_eq!(
+            source.as_deref(),
+            Some("abc123"),
+            "source_commit_from_ref should find trailer despite merge at tip"
+        );
+
+        // 15. Idempotent resume: running again should produce no new work.
+        let result2 = run_pipeline(repo, git_ref, None, None, 5, Some(&backend), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            result2.total_processed, 0,
+            "all emails should already be summarized on second run"
+        );
+    }
 }

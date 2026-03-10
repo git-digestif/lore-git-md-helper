@@ -77,6 +77,10 @@ pub enum Backend {
         model: String,
         api_key: String,
     },
+    /// Deterministic mock for testing.  Returns every Nth word from
+    /// the user message (default: every 5th word).
+    #[cfg(test)]
+    Mock { nth_word: usize },
 }
 
 impl Backend {
@@ -201,6 +205,8 @@ impl Backend {
                 };
                 chat_api(&ep, system, user, temperature).await
             }
+            #[cfg(test)]
+            Backend::Mock { nth_word } => Ok(mock_summarize(user, *nth_word)),
         }
     }
 }
@@ -536,6 +542,17 @@ async fn chat_cli(command: &str, model: Option<&str>, system: &str, user: &str) 
         .to_string())
 }
 
+/// Deterministic mock: return every `nth` word from the user message.
+#[cfg(test)]
+fn mock_summarize(user: &str, nth: usize) -> String {
+    let nth = nth.max(1);
+    user.split_whitespace()
+        .skip(nth - 1)
+        .step_by(nth)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +708,43 @@ mod tests {
             msg.contains("86400") && msg.contains("cap"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn mock_every_fifth_word() {
+        let input = "one two three four five six seven eight nine ten";
+        assert_eq!(mock_summarize(input, 5), "five ten");
+    }
+
+    #[test]
+    fn mock_every_word() {
+        let input = "hello world";
+        assert_eq!(mock_summarize(input, 1), "hello world");
+    }
+
+    #[test]
+    fn mock_nth_zero_clamps_to_one() {
+        let input = "a b c";
+        assert_eq!(mock_summarize(input, 0), "a b c");
+    }
+
+    #[test]
+    fn mock_empty_input() {
+        assert_eq!(mock_summarize("", 3), "");
+    }
+
+    #[test]
+    fn mock_nth_exceeds_word_count() {
+        assert_eq!(mock_summarize("only three words", 10), "");
+    }
+
+    #[tokio::test]
+    async fn mock_backend_chat_returns_nth_words() {
+        let backend = Backend::Mock { nth_word: 3 };
+        let result = backend
+            .chat("ignored system prompt", "one two three four five six")
+            .await
+            .unwrap();
+        assert_eq!(result, "three six");
     }
 }
