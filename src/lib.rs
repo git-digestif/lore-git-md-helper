@@ -1,6 +1,21 @@
 use anyhow::Result;
 use mail_parser::MimeHeaders;
 
+pub mod batch_import;
+pub mod cat_file;
+pub mod datekey;
+pub mod git_util;
+pub mod import_writer;
+pub mod lore_link;
+pub mod msgid_map;
+pub mod notes_import;
+pub mod source_reader;
+pub mod symlink;
+pub mod thread;
+pub mod thread_file;
+
+pub mod fast_import;
+
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     let mut md = String::new();
 
