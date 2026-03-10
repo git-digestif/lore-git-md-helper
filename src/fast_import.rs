@@ -97,22 +97,24 @@ impl FastImport {
     /// Returns the mark of the new commit, or 0 when both `files` and
     /// `symlinks` are empty (no commit written).
     pub fn commit(&mut self, msg: &str, files: &[(&str, &str)]) -> Result<u64> {
-        self.commit_with_symlinks(msg, files, &[])
+        self.commit_with_symlinks(msg, files, &[], &[])
     }
 
     /// Write a single commit containing regular files and symlinks.
     ///
     /// Regular `files` are `(path, content)` pairs (mode `100644`).
     /// `symlinks` are `(path, target)` pairs (mode `120000`).
-    /// Returns the mark of the new commit, or 0 when both slices are
+    /// `deletes` are paths to remove from the tree.
+    /// Returns the mark of the new commit, or 0 when all slices are
     /// empty (no commit written).
     pub fn commit_with_symlinks(
         &mut self,
         msg: &str,
         files: &[(&str, &str)],
         symlinks: &[(&str, &str)],
+        deletes: &[&str],
     ) -> Result<u64> {
-        if files.is_empty() && symlinks.is_empty() {
+        if files.is_empty() && symlinks.is_empty() && deletes.is_empty() {
             return Ok(0);
         }
 
@@ -136,6 +138,13 @@ impl FastImport {
             writeln!(s.out, "from {p}")?;
         }
         self.parent = Some(format!(":{m}"));
+
+        // Deletes first so that a path appearing in both deletes and
+        // files/symlinks results in the file being recreated (the last
+        // command for a path wins in fast-import).
+        for path in deletes {
+            writeln!(s.out, "D {path}")?;
+        }
 
         for (path, content) in files {
             let data = content.as_bytes();
@@ -296,6 +305,7 @@ mod tests {
             "with links",
             &[("file.md", "content")],
             &[("link.md", "file.md")],
+            &[],
         )
         .unwrap();
 
