@@ -546,13 +546,31 @@ impl<'a> Digestive<'a> {
             !before_since && !after_until
         };
 
+        // Clock-skew guard: datekeys whose day portion lexically
+        // exceeds tomorrow are clamped to today.
+        use crate::date_util::format_datekey;
+        let now = time::OffsetDateTime::now_utc();
+        let today = format_datekey(now)[..10].to_string();
+        let tomorrow = format_datekey(now + time::Duration::days(1))[..10].to_string();
+
         // Per-day state, reset at each day boundary.
         let mut state = LoopState::default();
 
         for path in stdout.lines() {
-            let day = match path.get(..10) {
+            let raw_day = match path.get(..10) {
                 Some(d) if path.as_bytes().get(10) == Some(&b'/') => d,
                 _ => continue,
+            };
+
+            // Clamp bogus future dates to today.
+            let day = if raw_day > tomorrow.as_str() {
+                eprintln!(
+                    "[digestive] clamping bogus future date \
+                     {raw_day} → {today}",
+                );
+                today.as_str()
+            } else {
+                raw_day
             };
 
             // --- Day boundary detection ---
