@@ -88,6 +88,7 @@ pub async fn summarize_one(
     cat: &mut impl BlobRead,
     backend: &Backend,
     git_ref: &str,
+    label: Option<&str>,
 ) -> Result<Option<SummaryFiles>> {
     let ctx = match load_email_context(email, cat, git_ref) {
         Some(ctx) => ctx,
@@ -97,7 +98,11 @@ pub async fn summarize_one(
         }
     };
 
-    eprintln!("[digestive] summarizing {} ...", email.dk);
+    eprintln!(
+        "[digestive] {} {} ...",
+        label.unwrap_or("summarizing"),
+        email.dk
+    );
     let result = summarize::summarize_email(&ctx, backend).await?;
 
     Ok(Some(SummaryFiles {
@@ -174,7 +179,12 @@ impl<'a> Digestive<'a> {
     ///
     /// Returns `true` if a summary was produced (even if it contained
     /// errors), `false` if the email was skipped (dry-run or missing).
-    async fn summarize_and_record(&mut self, dk: &str, root_dk: &str) -> Result<bool> {
+    async fn summarize_and_record(
+        &mut self,
+        dk: &str,
+        root_dk: &str,
+        label: Option<&str>,
+    ) -> Result<bool> {
         let email = EmailToSummarize {
             dk: dk.to_string(),
             root_dk: root_dk.to_string(),
@@ -188,6 +198,7 @@ impl<'a> Digestive<'a> {
             &mut self.cached,
             self.backend.context("backend unavailable")?,
             self.git_ref,
+            label,
         )
         .await?
         {
@@ -211,6 +222,44 @@ impl<'a> Digestive<'a> {
             self.flush_batch()?;
         }
         Ok(true)
+    }
+
+    /// Backfill unsummarized emails in a thread before processing a reply.
+    ///
+    /// When a reply arrives for a thread whose earlier emails lack
+    /// `.ai.md` summaries, this method loads the thread tree, collects
+    /// all participating date-keys strictly before `up_to_dk`, and
+    /// summarizes any that are missing in chronological order. This
+    /// ensures the thread AI summary accumulates correctly before the
+    /// new reply is processed.
+    async fn backfill_thread(&mut self, root_dk: &str, up_to_dk: &str) -> Result<()> {
+        let (_, tree) = match thread_file::load_from_repo(&mut self.cached, self.git_ref, root_dk) {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+
+        let mut dks: Vec<String> = tree
+            .date_keys()
+            .filter(|d| *d < up_to_dk)
+            .map(|s| s.to_string())
+            .collect();
+        dks.sort();
+
+        for dk in &dks {
+            let spec = format!("{}:{dk}.ai.md", self.git_ref);
+            if self.cached.get_str(&spec).is_some() {
+                continue; // already summarized
+            }
+            if let Err(e) = self
+                .summarize_and_record(dk, root_dk, Some("backfilling"))
+                .await
+            {
+                let _ = self.flush_batch();
+                return Err(e);
+            }
+        }
+
+        Ok(())
     }
 
     fn flush_batch(&mut self) -> Result<()> {
@@ -308,7 +357,21 @@ impl<'a> Digestive<'a> {
                 if in_range(dk) && !ai_exists.contains(dk) {
                     let root_dk =
                         resolve_thread_root(dk, &mut self.cached, self.git_ref, &mut thread_roots);
-                    self.summarize_and_record(dk, &root_dk).await?;
+
+                    // Backfill older thread members that lack summaries,
+                    // but only up to this email's position in time.
+                    if root_dk != dk {
+                        self.backfill_thread(&root_dk, dk).await?;
+                    }
+
+                    // Backfill may have already summarized this email
+                    // (it processes unsummarized thread members up to dk).
+                    let ai_spec = format!("{}:{dk}.ai.md", self.git_ref);
+                    if self.cached.get_str(&ai_spec).is_some() {
+                        continue;
+                    }
+
+                    self.summarize_and_record(dk, &root_dk, None).await?;
                 }
             }
             // All other files (thread.md, thread.human.md, etc.) are skipped.
