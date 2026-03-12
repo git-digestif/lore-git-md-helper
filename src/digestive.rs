@@ -15,12 +15,14 @@ use crate::cat_file::{BlobRead, CatFile};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, resolve_ref, source_commit_from_ref};
 use crate::summarize::{self, EmailContext};
-use crate::thread_file;
+use crate::thread_file::{self, ThreadTree};
 
 /// An email in the date range, with its thread root and summary status.
 pub struct EmailToSummarize {
     pub dk: String,
     pub root_dk: String,
+    /// Date-key of the direct parent email (`None` for thread roots).
+    pub parent_dk: Option<String>,
 }
 
 /// Lazily resolve the thread root for a date-key.
@@ -29,19 +31,24 @@ pub struct EmailToSummarize {
 /// file via CatFile (which follows symlinks for replies) and parses
 /// it to extract the root date-key.  Falls back to `dk` itself if no
 /// thread file exists (standalone email).
+///
+/// When loading the thread file, also caches the full `ThreadTree`
+/// (keyed by root_dk) so that callers can look up per-email parent
+/// relationships without a second load.
 fn resolve_thread_root(
     dk: &str,
     cached: &mut impl BlobRead,
     git_ref: &str,
     thread_roots: &mut HashMap<String, String>,
+    thread_trees: &mut HashMap<String, ThreadTree>,
 ) -> String {
     if let Some(root) = thread_roots.get(dk) {
         return root.clone();
     }
-    let root_dk = thread_file::load_from_repo(cached, git_ref, dk)
-        .map(|(root, _)| root)
-        .unwrap_or_else(|| dk.to_string());
+    let (root_dk, tree) = thread_file::load_from_repo(cached, git_ref, dk)
+        .unwrap_or_else(|| (dk.to_string(), ThreadTree::new()));
     thread_roots.insert(dk.to_string(), root_dk.clone());
+    thread_trees.entry(root_dk.clone()).or_insert(tree);
     root_dk
 }
 
@@ -72,9 +79,15 @@ pub fn load_email_context(
     let thread_spec = format!("{git_ref}:{}.thread.ai.md", email.root_dk);
     let thread_ai_summary = cat.get_str(&thread_spec);
 
+    let parent_ai_summary = email.parent_dk.as_ref().and_then(|parent_dk| {
+        let spec = format!("{git_ref}:{parent_dk}.ai.md");
+        cat.get_str(&spec)
+    });
+
     Some(EmailContext {
         email_md,
         thread_ai_summary,
+        parent_ai_summary,
     })
 }
 
@@ -183,11 +196,13 @@ impl<'a> Digestive<'a> {
         &mut self,
         dk: &str,
         root_dk: &str,
+        parent_dk: Option<&str>,
         label: Option<&str>,
     ) -> Result<bool> {
         let email = EmailToSummarize {
             dk: dk.to_string(),
             root_dk: root_dk.to_string(),
+            parent_dk: parent_dk.map(|s| s.to_string()),
         };
         if self.dry_run {
             eprintln!("[dry-run] would summarize {dk}");
@@ -250,8 +265,9 @@ impl<'a> Digestive<'a> {
             if self.cached.get_str(&spec).is_some() {
                 continue; // already summarized
             }
+            let parent_dk = tree.parent_of(dk);
             if let Err(e) = self
-                .summarize_and_record(dk, root_dk, Some("backfilling"))
+                .summarize_and_record(dk, root_dk, parent_dk, Some("backfilling"))
                 .await
             {
                 let _ = self.flush_batch();
@@ -336,6 +352,7 @@ impl<'a> Digestive<'a> {
 
         let mut ai_exists: HashSet<String> = HashSet::new();
         let mut thread_roots: HashMap<String, String> = HashMap::new();
+        let mut thread_trees: HashMap<String, ThreadTree> = HashMap::new();
 
         for path in stdout.lines() {
             // --- File classification ---
@@ -355,8 +372,13 @@ impl<'a> Digestive<'a> {
 
                 // Summarize in-range emails that lack an AI summary.
                 if in_range(dk) && !ai_exists.contains(dk) {
-                    let root_dk =
-                        resolve_thread_root(dk, &mut self.cached, self.git_ref, &mut thread_roots);
+                    let root_dk = resolve_thread_root(
+                        dk,
+                        &mut self.cached,
+                        self.git_ref,
+                        &mut thread_roots,
+                        &mut thread_trees,
+                    );
 
                     // Backfill older thread members that lack summaries,
                     // but only up to this email's position in time.
@@ -371,7 +393,9 @@ impl<'a> Digestive<'a> {
                         continue;
                     }
 
-                    self.summarize_and_record(dk, &root_dk, None).await?;
+                    let parent_dk = thread_trees.get(&root_dk).and_then(|t| t.parent_of(dk));
+                    self.summarize_and_record(dk, &root_dk, parent_dk, None)
+                        .await?;
                 }
             }
             // All other files (thread.md, thread.human.md, etc.) are skipped.
@@ -412,6 +436,7 @@ mod tests {
         let email = EmailToSummarize {
             dk: "2025/01/06/10-00-00".into(),
             root_dk: "2025/01/06/10-00-00".into(),
+            parent_dk: None,
         };
         let ctx = load_email_context(&email, &mut blobs, "main");
         assert!(ctx.is_none(), "missing email should return None");
@@ -426,6 +451,7 @@ mod tests {
         let email = EmailToSummarize {
             dk: "2025/01/06/10-00-00".into(),
             root_dk: "2025/01/06/10-00-00".into(),
+            parent_dk: None,
         };
         let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
         assert_eq!(ctx.email_md, "email body");
@@ -445,6 +471,7 @@ mod tests {
         let email = EmailToSummarize {
             dk: "2025/01/06/12-00-00".into(),
             root_dk: "2025/01/05/09-00-00".into(),
+            parent_dk: None,
         };
         let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
         assert_eq!(ctx.thread_ai_summary.as_deref(), Some("repo thread"));
@@ -469,12 +496,51 @@ mod tests {
         let email = EmailToSummarize {
             dk: "2025/01/06/12-00-00".into(),
             root_dk: "2025/01/05/09-00-00".into(),
+            parent_dk: None,
         };
         let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
         assert_eq!(
             ctx.thread_ai_summary.as_deref(),
             Some("cached thread"),
             "in-memory cache should take precedence over repo"
+        );
+    }
+
+    #[test]
+    fn test_load_context_with_parent() {
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert("main:2025/01/06/12-00-00.md".into(), "reply body".into());
+        blobs.0.insert(
+            "main:2025/01/06/10-00-00.ai.md".into(),
+            "parent summary".into(),
+        );
+        let email = EmailToSummarize {
+            dk: "2025/01/06/12-00-00".into(),
+            root_dk: "2025/01/06/10-00-00".into(),
+            parent_dk: Some("2025/01/06/10-00-00".into()),
+        };
+        let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
+        assert_eq!(ctx.parent_ai_summary.as_deref(), Some("parent summary"));
+    }
+
+    #[test]
+    fn test_load_context_parent_missing_summary() {
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert("main:2025/01/06/12-00-00.md".into(), "reply body".into());
+        // parent_dk is set but no .ai.md exists for it
+        let email = EmailToSummarize {
+            dk: "2025/01/06/12-00-00".into(),
+            root_dk: "2025/01/06/10-00-00".into(),
+            parent_dk: Some("2025/01/06/10-00-00".into()),
+        };
+        let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
+        assert!(
+            ctx.parent_ai_summary.is_none(),
+            "missing parent .ai.md should yield None"
         );
     }
 }
