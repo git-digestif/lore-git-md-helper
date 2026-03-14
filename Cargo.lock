@@ -939,6 +939,7 @@ dependencies = [
  "clap",
  "html2text",
  "mail-parser",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

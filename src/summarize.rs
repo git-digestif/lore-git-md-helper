@@ -93,11 +93,104 @@ pub async fn summarize_email(ctx: &EmailContext, cfg: &Backend) -> Result<Summar
         .context("thread AI summary failed")?;
 
     Ok(SummarizationOutput {
-        human_summary,
+        human_summary: normalize_headings(&human_summary),
         ai_summary,
-        thread_human_summary,
+        thread_human_summary: normalize_headings(&thread_human_summary),
         thread_ai_summary,
     })
+}
+
+/// Section names that should be `## …` headings.
+const SECTION_HEADINGS: &[&str] = &[
+    "notable threads",
+    "in brief",
+    "the day in brief",
+    "on the radar",
+    "future directions",
+    "looking ahead",
+    "key developments",
+];
+
+/// Normalize AI-generated Markdown that uses bold text instead of
+/// proper heading syntax.
+///
+/// Handles two separate concerns:
+/// 1. The first paragraph: if it is a short plain-text or bold line
+///    mentioning a month name or "digest", promote it to `# …`.
+/// 2. Section headings: `**Notable threads**` etc. at the start of
+///    a paragraph are promoted to `## …`, splitting off any
+///    following content in the same paragraph.
+pub fn normalize_headings(md: &str) -> String {
+    let mut paragraphs = md.split("\n\n").peekable();
+    let mut out: Vec<String> = Vec::new();
+
+    // Handle the first paragraph separately: promote short
+    // title-like text to `# …`.  Only consumed when it matches;
+    // otherwise it falls through to the normal loop.
+    if let Some(&first) = paragraphs.peek() {
+        let t = first.trim();
+        if !t.is_empty() && !t.starts_with('#') && is_title_line(t) {
+            paragraphs.next();
+            if let Some((inner, _)) = strip_bold(t) {
+                out.push(format!("# {inner}"));
+            } else {
+                out.push(format!("# {t}"));
+            }
+        }
+    }
+
+    for part in paragraphs {
+        let trimmed = part.trim();
+        if let Some((label, rest)) = strip_bold(trimmed)
+            && is_known_section(label)
+        {
+            out.push(format!("## {label}"));
+            if !rest.is_empty() {
+                out.push(rest.to_string());
+            }
+            continue;
+        }
+        out.push(part.to_string());
+    }
+
+    out.join("\n\n")
+}
+
+/// True if `text` is a short single-line string that looks like a
+/// digest title (mentions a month name or the word "digest").
+fn is_title_line(text: &str) -> bool {
+    lazy_static_regex().is_match(text) && !text.contains('\n') && text.len() < 80
+}
+
+fn lazy_static_regex() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(
+        r"(?i)\b(?:january|february|march|april|may|june|july|august|september|october|november|december|digest)\b"
+    ).unwrap())
+}
+
+/// If `text` starts with `**label**` (followed by optional
+/// whitespace/punctuation and then end-of-string or newline),
+/// return `(label, remaining_text)`.
+fn strip_bold(text: &str) -> Option<(&str, &str)> {
+    let inner = text.strip_prefix("**")?;
+    let end = inner.find("**")?;
+    let label = &inner[..end];
+    let after = &inner[end + 2..];
+    let after = after.trim_start_matches([' ', '\t', '.', ':']);
+    if after.is_empty() {
+        Some((label, ""))
+    } else if let Some(rest) = after.strip_prefix('\n') {
+        Some((label, rest))
+    } else {
+        None
+    }
+}
+
+fn is_known_section(label: &str) -> bool {
+    let normalized = label.trim_end_matches(['.', ':']).trim().to_lowercase();
+    SECTION_HEADINGS.contains(&normalized.as_str())
 }
 
 #[cfg(test)]
@@ -202,5 +295,104 @@ mod tests {
             sys.len() > msg.len(),
             "system prompt should be larger than user message for short emails"
         );
+    }
+
+    #[test]
+    fn normalize_bold_section_to_h2() {
+        let input = "Some intro\n\n**Notable threads**\n\nContent here\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("## Notable threads"),
+            "expected ## heading, got: {out}"
+        );
+        assert!(!out.contains("**Notable threads**"));
+    }
+
+    #[test]
+    fn normalize_bold_title_with_month() {
+        let input = "**Daily digest for March 11, 2026**\n\nBody\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.starts_with("# Daily digest for March 11, 2026"),
+            "expected # heading, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_plain_title_with_month() {
+        let input = "Here's the daily digest for March 11, 2026:\n\nBody\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.starts_with("# Here's the daily digest for March 11, 2026:"),
+            "expected # heading, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_proper_headings() {
+        let input = "# Good title\n\n## Notable threads\n\nContent\n";
+        assert_eq!(normalize_headings(input), input);
+    }
+
+    #[test]
+    fn normalize_bold_with_trailing_colon() {
+        let input = "**In brief**:\n\nStuff\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("## In brief"),
+            "expected ## heading, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_bold_with_inner_punctuation() {
+        let input = "**The day in brief.**\n\nContent\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("## The day in brief."),
+            "expected ## heading, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_ignores_bold_in_paragraph() {
+        let input = "This has **in brief** inside a sentence.\n";
+        assert_eq!(normalize_headings(input), input);
+    }
+
+    #[test]
+    fn normalize_splits_heading_from_fused_content() {
+        let input = "**Notable threads**\ncontinued on this line.\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.starts_with("## Notable threads\n\n"),
+            "heading should be split from content, got: {out}"
+        );
+        assert!(
+            out.contains("continued on this line."),
+            "content should be preserved"
+        );
+    }
+
+    #[test]
+    fn normalize_fused_section_with_hard_break() {
+        // Real-world pattern: heading with trailing spaces (hard
+        // break) fused with content in the same paragraph.
+        let input = "**In brief**  \n**Upload-pack series** -- details here.\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("## In brief"),
+            "expected ## heading, got: {out}"
+        );
+        assert!(
+            out.contains("**Upload-pack series**"),
+            "content should be preserved"
+        );
+    }
+
+    #[test]
+    fn normalize_long_first_line_not_promoted() {
+        let input = "This is a much longer introductory paragraph that happens to mention January but should not become a heading because it is too long.\n";
+        assert_eq!(normalize_headings(input), input);
     }
 }
