@@ -425,6 +425,116 @@ pub async fn run_pipeline(
     s.finish()
 }
 
+const DAILY_DIGEST_AGENT: &str = include_str!("../prompts/git-daily-digest.md");
+
+const PROJECT_CONTEXT: &str = include_str!("../prompts/git-project-context.md");
+
+/// Per-thread data accumulated for a single day's digest.
+pub struct ThreadDayActivity {
+    /// Thread root date-key.
+    pub root_dk: String,
+    /// Thread AI summary from *before* today's emails (None if new thread).
+    pub thread_ai_before: Option<String>,
+    /// Today's email AI summaries, in chronological order.
+    pub email_summaries: Vec<(String, String)>,
+}
+
+/// Output from daily digest generation.
+pub struct DayDigestOutput {
+    pub human: String,
+    pub ai: String,
+}
+
+/// Build the daily digest input for a given day.
+///
+/// `before_commit` is the ref/sha whose `.thread.ai.md` files represent
+/// the accumulated thread state *before* today's emails.  For each thread
+/// active today, we read the "before" state from that commit.
+pub fn build_day_digest_input(
+    summaries: &[(String, String, String)], // (dk, root_dk, ai_summary)
+    before_commit: &str,
+    cat: &mut impl BlobRead,
+) -> (Vec<ThreadDayActivity>, usize) {
+    use std::collections::BTreeMap;
+
+    let mut by_thread: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (dk, root_dk, ai) in summaries {
+        by_thread
+            .entry(root_dk.clone())
+            .or_default()
+            .push((dk.clone(), ai.clone()));
+    }
+
+    let email_count = summaries.len();
+
+    let threads: Vec<ThreadDayActivity> = by_thread
+        .into_iter()
+        .map(|(root_dk, emails)| {
+            let spec = format!("{before_commit}:{root_dk}.thread.ai.md");
+            let thread_ai_before = cat.get_str(&spec);
+            ThreadDayActivity {
+                root_dk,
+                thread_ai_before,
+                email_summaries: emails,
+            }
+        })
+        .collect();
+
+    (threads, email_count)
+}
+
+/// Generate a daily digest from thread deltas.
+///
+/// For each thread active today, the AI receives the "before" thread
+/// summary and today's individual email summaries, letting it compute
+/// the delta.
+pub async fn generate_daily_digest(
+    day: &str,
+    threads: &[ThreadDayActivity],
+    email_count: usize,
+    backend: &Backend,
+) -> Result<DayDigestOutput> {
+    let thread_count = threads.len();
+
+    let mut user_msg = format!(
+        "Date: {day}\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
+    );
+
+    for activity in threads {
+        user_msg.push_str("---\n\n");
+        user_msg.push_str(&format!("Thread root: {}\n\n", activity.root_dk));
+
+        if let Some(ref before) = activity.thread_ai_before {
+            user_msg.push_str("Previous thread state (before today):\n\n");
+            user_msg.push_str(before);
+            user_msg.push_str("\n\n");
+        }
+
+        user_msg.push_str("Today's new emails in this thread:\n\n");
+        for (dk, ai) in &activity.email_summaries {
+            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
+        }
+    }
+
+    eprintln!(
+        "[digestive] generating daily digest for {day} ({email_count} emails, {thread_count} threads) ...",
+    );
+
+    let system = format!("{DAILY_DIGEST_AGENT}\n\n{PROJECT_CONTEXT}");
+
+    let human = backend
+        .chat_with_options(&system, &format!("Mode: human\n\n{user_msg}"), Some(0.0))
+        .await
+        .context("daily digest (human) failed")?;
+
+    let ai = backend
+        .chat_with_options(&system, &format!("Mode: ai\n\n{user_msg}"), Some(0.0))
+        .await
+        .context("daily digest (AI) failed")?;
+
+    Ok(DayDigestOutput { human, ai })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +652,106 @@ mod tests {
             ctx.parent_ai_summary.is_none(),
             "missing parent .ai.md should yield None"
         );
+    }
+
+    #[test]
+    fn test_build_day_digest_new_thread() {
+        let mut blobs = MockBlobs(Default::default());
+        let summaries = vec![(
+            "2025/01/06/10-00-00".into(),
+            "2025/01/06/10-00-00".into(),
+            "email ai".into(),
+        )];
+        let (threads, count) = build_day_digest_input(&summaries, "before", &mut blobs);
+        assert_eq!(count, 1);
+        assert_eq!(threads.len(), 1);
+        assert!(
+            threads[0].thread_ai_before.is_none(),
+            "new thread should have no before state"
+        );
+    }
+
+    #[test]
+    fn test_build_day_digest_existing_thread() {
+        let mut blobs = MockBlobs(Default::default());
+        blobs.0.insert(
+            "before:2025/01/05/09-00-00.thread.ai.md".into(),
+            "prior thread summary".into(),
+        );
+        let summaries = vec![(
+            "2025/01/06/10-00-00".into(),
+            "2025/01/05/09-00-00".into(),
+            "reply ai".into(),
+        )];
+        let (threads, _) = build_day_digest_input(&summaries, "before", &mut blobs);
+        assert_eq!(
+            threads[0].thread_ai_before.as_deref(),
+            Some("prior thread summary")
+        );
+    }
+
+    #[test]
+    fn test_build_day_digest_ignores_post_digest_thread_update() {
+        let mut blobs = MockBlobs(Default::default());
+        let summaries = vec![(
+            "2025/01/06/12-00-00".into(),
+            "2025/01/05/09-00-00".into(),
+            "new reply".into(),
+        )];
+        let (threads, _) = build_day_digest_input(&summaries, "before", &mut blobs);
+        assert!(
+            threads[0].thread_ai_before.is_none(),
+            "should not see thread summary from a commit after the daily digest"
+        );
+    }
+
+    #[test]
+    fn test_build_day_digest_multiple_threads() {
+        let mut blobs = MockBlobs(Default::default());
+        blobs.0.insert(
+            "before:2025/01/03/08-00-00.thread.ai.md".into(),
+            "old thread state".into(),
+        );
+        let summaries = vec![
+            (
+                "2025/01/06/10-00-00".into(),
+                "2025/01/03/08-00-00".into(),
+                "reply1".into(),
+            ),
+            (
+                "2025/01/06/11-00-00".into(),
+                "2025/01/06/11-00-00".into(),
+                "new thread".into(),
+            ),
+            (
+                "2025/01/06/12-00-00".into(),
+                "2025/01/03/08-00-00".into(),
+                "reply2".into(),
+            ),
+        ];
+        let (threads, count) = build_day_digest_input(&summaries, "before", &mut blobs);
+        assert_eq!(count, 3);
+        assert_eq!(threads.len(), 2);
+
+        let old = threads
+            .iter()
+            .find(|t| t.root_dk == "2025/01/03/08-00-00")
+            .unwrap();
+        assert_eq!(old.thread_ai_before.as_deref(), Some("old thread state"));
+        assert_eq!(
+            old.email_summaries.len(),
+            2,
+            "two replies in existing thread"
+        );
+
+        let new = threads
+            .iter()
+            .find(|t| t.root_dk == "2025/01/06/11-00-00")
+            .unwrap();
+        assert!(
+            new.thread_ai_before.is_none(),
+            "new thread has no prior state"
+        );
+        assert_eq!(new.email_summaries.len(), 1);
     }
 }
