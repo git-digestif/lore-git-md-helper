@@ -3,6 +3,7 @@ use clap::Parser;
 
 use lore_git_md_helper::ai_backend::BackendArgs;
 use lore_git_md_helper::digestive::Digestive;
+use lore_git_md_helper::git_util::last_digest_day;
 
 #[derive(Parser)]
 #[command(about = "Batch-summarize Git mailing list emails in a bare repository")]
@@ -45,6 +46,12 @@ async fn main() -> Result<()> {
         None
     };
 
+    let since = args.since.or_else(|| {
+        let day = last_digest_day(&args.target_repo, &args.git_ref)?;
+        eprintln!("[digestive] resuming after {day}");
+        Some(day)
+    });
+
     let mut d = Digestive::new(
         &args.target_repo,
         &args.git_ref,
@@ -53,7 +60,7 @@ async fn main() -> Result<()> {
         args.dry_run,
     )?;
 
-    d.run(args.since.as_deref(), args.until.as_deref()).await?;
+    d.run(since.as_deref(), args.until.as_deref()).await?;
     let result = d.finish()?;
 
     eprintln!(

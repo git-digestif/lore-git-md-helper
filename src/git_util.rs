@@ -186,6 +186,37 @@ pub fn source_commit_from_ref(repo_path: &str, refname: &str) -> Option<String> 
     None
 }
 
+/// Find the day and OID of the most recent daily digest commit on
+/// `refname`.
+///
+/// Parses the subject line "digestive: daily digest for YYYY/MM/DD"
+/// and returns `(day, oid)`.  The OID identifies the commit whose
+/// tree holds the accumulated thread state up to (and including) the
+/// digested day.
+pub fn latest_digest(repo_path: &str, refname: &str) -> Option<(String, String)> {
+    let line = git(
+        repo_path,
+        &[
+            "log",
+            "--date-order",
+            "--grep=^digestive: daily digest for ",
+            "-1",
+            "--format=%H %s",
+            refname,
+        ],
+    )
+    .ok()?;
+    let (oid, subject) = line.split_once(' ')?;
+    let day = subject.strip_prefix("digestive: daily digest for ")?;
+    Some((day.to_string(), oid.to_string()))
+}
+
+/// Thin wrapper around `latest_digest` for callers that only need
+/// the day string.
+pub fn last_digest_day(repo_path: &str, refname: &str) -> Option<String> {
+    latest_digest(repo_path, refname).map(|(day, _)| day)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod tests {
     pub fn git(git_dir: &str, args: &[&str]) -> String {
