@@ -2,6 +2,7 @@ use anyhow::Result;
 use mail_parser::MimeHeaders;
 
 pub mod batch_import;
+pub mod cached_reader;
 pub mod cat_file;
 pub mod datekey;
 pub mod git_util;
