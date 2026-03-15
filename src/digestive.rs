@@ -13,7 +13,7 @@ use crate::ai_backend::Backend;
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
 use crate::fast_import::FastImport;
-use crate::git_util::{self, resolve_ref, source_commit_from_ref};
+use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::summarize::{self, EmailContext};
 use crate::thread_file::{self, ThreadTree};
 
@@ -50,6 +50,24 @@ fn resolve_thread_root(
     thread_roots.insert(dk.to_string(), root_dk.clone());
     thread_trees.entry(root_dk.clone()).or_insert(tree);
     root_dk
+}
+
+/// Find the commit OID of a daily digest by grepping the commit subject.
+fn find_digest_commit(repo_path: &str, refname: &str, day: &str) -> Option<String> {
+    let needle = format!("^digestive: daily digest for {day}$");
+    let s = git_util::git(
+        repo_path,
+        &[
+            "log",
+            "--date-order",
+            &format!("--grep={needle}"),
+            "-1",
+            "--format=%H",
+            refname,
+        ],
+    )
+    .ok()?;
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Summary artifacts for a single email.
@@ -133,10 +151,26 @@ pub struct PipelineResult {
     pub total_processed: u64,
 }
 
+/// Per-day mutable state tracked across day boundaries in the
+/// main loop.  Reset (partially) at each day boundary.
+#[derive(Default)]
+struct LoopState {
+    prev_day: Option<String>,
+    day_has_digest: bool,
+    /// AI summary existence for emails in the current day.
+    day_ai_exists: HashSet<String>,
+    /// All email datekeys for the current day.
+    day_email_dks: Vec<String>,
+    /// Lazy thread root cache: dk → root_dk.
+    thread_roots: HashMap<String, String>,
+    /// Thread tree cache: root_dk → ThreadTree.
+    thread_trees: HashMap<String, ThreadTree>,
+}
+
 /// Pipeline state for the digestive batch processor.
 ///
 /// Collects all shared mutable state for email summarization
-/// and fast-import output.
+/// and daily digest generation.
 pub struct Digestive<'a> {
     repo_path: &'a str,
     git_ref: &'a str,
@@ -146,7 +180,17 @@ pub struct Digestive<'a> {
     backend: Option<&'a Backend>,
     dry_run: bool,
     batch_size: usize,
+    /// Resolved OID of the commit whose tree represents the "before
+    /// today" thread state for daily digest generation.  Cleared after
+    /// each daily digest commit so that the next day re-resolves it
+    /// (via polling) once fast-import's checkpoint has landed.
+    before_oid: Option<String>,
+    /// Day string (e.g. "2025/01/13") of the most recently written
+    /// daily digest commit.  Used by `resolve_before_oid()` to poll
+    /// for the commit OID when `before_oid` is `None`.
+    last_digested_day: Option<String>,
     total_processed: u64,
+    day_summaries: Vec<(String, String, String)>,
     batch: Vec<SummaryFiles>,
 }
 
@@ -173,6 +217,11 @@ impl<'a> Digestive<'a> {
 
         let source_commit = source_commit_from_ref(repo_path, git_ref);
 
+        let (last_digested_day, before_oid) = match latest_digest(repo_path, git_ref) {
+            Some((day, oid)) => (Some(day), Some(oid)),
+            None => (None, resolve_ref(repo_path, git_ref)),
+        };
+
         Ok(Digestive {
             repo_path,
             git_ref,
@@ -182,7 +231,10 @@ impl<'a> Digestive<'a> {
             backend,
             dry_run,
             batch_size,
+            before_oid,
+            last_digested_day,
             total_processed: 0,
+            day_summaries: Vec::new(),
             batch: Vec::new(),
         })
     }
@@ -231,6 +283,8 @@ impl<'a> Digestive<'a> {
             let key = format!("{}:{}.thread.ai.md", self.git_ref, sf.root_dk,);
             self.cached.insert(key, sf.thread_ai.clone());
         }
+        self.day_summaries
+            .push((sf.dk.clone(), sf.root_dk.clone(), sf.ai.clone()));
         self.batch.push(sf);
         self.total_processed += 1;
         if self.batch.len() >= self.batch_size {
@@ -319,6 +373,147 @@ impl<'a> Digestive<'a> {
         Ok(())
     }
 
+    /// Resolve the "before" commit OID for daily digest generation.
+    ///
+    /// When `before_oid` is already cached, returns it immediately.
+    /// Otherwise, polls `git log --grep` for the commit that wrote
+    /// the previous daily digest (identified by `last_digested_day`).
+    /// This handles the case where fast-import's checkpoint hasn't
+    /// landed yet: we try immediately, then retry with exponential
+    /// backoff (100ms, 200ms, 400ms, ... up to ~25s total).
+    ///
+    /// Returns an empty string as fallback (no prior state).
+    fn resolve_before_oid(&mut self) -> String {
+        if let Some(ref oid) = self.before_oid {
+            return oid.clone();
+        }
+        let day = match self.last_digested_day {
+            Some(ref d) => d.clone(),
+            None => return String::new(),
+        };
+        let mut delay_ms = 100u64;
+        for attempt in 0..10 {
+            if let Some(oid) = find_digest_commit(self.repo_path, self.git_ref, &day) {
+                self.before_oid = Some(oid.clone());
+                return oid;
+            }
+            eprintln!(
+                "[digestive] waiting for daily digest commit \
+                 for {day} to land (attempt {}/{}, {}ms)...",
+                attempt + 1,
+                10,
+                delay_ms,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            delay_ms = (delay_ms * 2).min(10_000);
+        }
+        eprintln!(
+            "[warn] daily digest commit for {day} not found after \
+             polling; falling back to ref tip",
+        );
+        resolve_ref(self.repo_path, self.git_ref).unwrap_or_default()
+    }
+
+    async fn commit_day_digest(&mut self, day: &str) -> Result<()> {
+        let ai_path = format!("{day}/digest.ai.md");
+        let exists = self
+            .cached
+            .get_str(&format!("{}:{ai_path}", self.git_ref))
+            .is_some();
+        if exists {
+            return Ok(());
+        }
+
+        if self.dry_run {
+            eprintln!("[dry-run] would generate daily digest for {day}");
+            return Ok(());
+        }
+
+        let before = self.resolve_before_oid();
+        let (threads, email_count) =
+            build_day_digest_input(&self.day_summaries, &before, &mut self.cached);
+        let digest = generate_daily_digest(
+            day,
+            &threads,
+            email_count,
+            self.backend.context("backend unavailable")?,
+        )
+        .await?;
+
+        self.cached.insert(
+            format!("{}:{day}/digest.human.md", self.git_ref),
+            digest.human.clone(),
+        );
+        self.cached.insert(
+            format!("{}:{day}/digest.ai.md", self.git_ref),
+            digest.ai.clone(),
+        );
+
+        let mut msg = format!("digestive: daily digest for {day}");
+        if let Some(ref sc) = self.source_commit {
+            msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+        }
+        let human_path = format!("{day}/digest.human.md");
+        let ai_path = format!("{day}/digest.ai.md");
+        let files = [
+            (human_path.as_str(), digest.human.as_str()),
+            (ai_path.as_str(), digest.ai.as_str()),
+        ];
+        let fi = self.fi.as_mut().context("fast-import unavailable")?;
+        fi.commit(&msg, &files)?;
+        fi.checkpoint()?;
+
+        // Clear before_oid so the next day re-resolves it via polling,
+        // waiting for this commit's checkpoint to land.
+        self.last_digested_day = Some(day.to_string());
+        self.before_oid = None;
+
+        Ok(())
+    }
+
+    /// Called at each day boundary (and implicitly, never for the last
+    /// day).  Emits daily digests for completed days.
+    async fn finalize_day(&mut self, state: &mut LoopState, since: Option<&str>) -> Result<()> {
+        let Some(ref prev) = state.prev_day else {
+            return Ok(());
+        };
+
+        // Skip digest generation for days entirely before --since.
+        let before_since = since.is_some_and(|s| prev.as_str() < s);
+        if before_since {
+            self.day_summaries.clear();
+            return Ok(());
+        }
+
+        // --- Daily digest for the previous day ---
+        if !state.day_has_digest {
+            for dk in state.day_email_dks.iter() {
+                let already_loaded = self.day_summaries.iter().any(|(d, _, _)| d == dk);
+                if state.day_ai_exists.contains(dk.as_str()) && !already_loaded {
+                    let spec = format!("{}:{dk}.ai.md", self.git_ref);
+                    if let Some(ai_text) = self.cached.get_str(&spec) {
+                        let root_dk = resolve_thread_root(
+                            dk,
+                            &mut self.cached,
+                            self.git_ref,
+                            &mut state.thread_roots,
+                            &mut state.thread_trees,
+                        );
+                        self.day_summaries.push((dk.clone(), root_dk, ai_text));
+                    }
+                }
+            }
+
+            if !self.day_summaries.is_empty() {
+                self.flush_batch()?;
+                self.commit_day_digest(prev).await?;
+            }
+        }
+        self.day_summaries.clear();
+
+        Ok(())
+    }
+
     pub fn finish(self) -> Result<PipelineResult> {
         if let Some(fi) = self.fi {
             fi.finish()?;
@@ -331,7 +526,8 @@ impl<'a> Digestive<'a> {
     /// Run the pipeline as a single streaming pass over `ls-tree -r`.
     ///
     /// Instead of planning all work items upfront, this processes emails
-    /// inline as they are discovered during the ls-tree scan.
+    /// inline as they are discovered and emits daily digest events at
+    /// day boundaries.
     pub async fn run(&mut self, since: Option<&str>, until: Option<&str>) -> Result<()> {
         let stdout = match git_util::resolve_ref(self.repo_path, self.git_ref) {
             None => {
@@ -350,15 +546,31 @@ impl<'a> Digestive<'a> {
             !before_since && !after_until
         };
 
-        let mut ai_exists: HashSet<String> = HashSet::new();
-        let mut thread_roots: HashMap<String, String> = HashMap::new();
-        let mut thread_trees: HashMap<String, ThreadTree> = HashMap::new();
+        // Per-day state, reset at each day boundary.
+        let mut state = LoopState::default();
 
         for path in stdout.lines() {
+            let day = match path.get(..10) {
+                Some(d) if path.as_bytes().get(10) == Some(&b'/') => d,
+                _ => continue,
+            };
+
+            // --- Day boundary detection ---
+            if state.prev_day.as_deref() != Some(day) {
+                self.finalize_day(&mut state, since).await?;
+
+                state.prev_day = Some(day.to_string());
+                state.day_has_digest = false;
+                state.day_ai_exists.clear();
+                state.day_email_dks.clear();
+            }
+
             // --- File classification ---
             if let Some(dk) = path.strip_suffix(".ai.md") {
-                if !dk.ends_with(".thread") {
-                    ai_exists.insert(dk.to_string());
+                if dk.ends_with("/digest") {
+                    state.day_has_digest = true;
+                } else if !dk.ends_with(".thread") {
+                    state.day_ai_exists.insert(dk.to_string());
                 }
             } else if let Some(dk) = path.strip_suffix(".md") {
                 // Skip derivative files.
@@ -370,14 +582,16 @@ impl<'a> Digestive<'a> {
                     continue;
                 }
 
+                state.day_email_dks.push(dk.to_string());
+
                 // Summarize in-range emails that lack an AI summary.
-                if in_range(dk) && !ai_exists.contains(dk) {
+                if in_range(dk) && !state.day_ai_exists.contains(dk) {
                     let root_dk = resolve_thread_root(
                         dk,
                         &mut self.cached,
                         self.git_ref,
-                        &mut thread_roots,
-                        &mut thread_trees,
+                        &mut state.thread_roots,
+                        &mut state.thread_trees,
                     );
 
                     // Backfill older thread members that lack summaries,
@@ -393,15 +607,29 @@ impl<'a> Digestive<'a> {
                         continue;
                     }
 
-                    let parent_dk = thread_trees.get(&root_dk).and_then(|t| t.parent_of(dk));
-                    self.summarize_and_record(dk, &root_dk, parent_dk, None)
-                        .await?;
+                    let parent_dk = state
+                        .thread_trees
+                        .get(&root_dk)
+                        .and_then(|t| t.parent_of(dk));
+                    if let Err(e) = self
+                        .summarize_and_record(dk, &root_dk, parent_dk, None)
+                        .await
+                    {
+                        // Flush successful work before propagating the error
+                        // so we don't lose everything since the last checkpoint.
+                        let _ = self.flush_batch();
+                        return Err(e);
+                    }
                 }
             }
             // All other files (thread.md, thread.human.md, etc.) are skipped.
         }
 
+        // Finalize the last day.  No digest is emitted for the last day
+        // because finalize_day only emits digests for the *previous* day,
+        // and there is no "next day" to trigger it.
         self.flush_batch()?;
+        self.day_summaries.clear();
 
         Ok(())
     }
