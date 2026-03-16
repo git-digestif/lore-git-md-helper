@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use crate::ai_backend::Backend;
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
-use crate::date_util::{add_days, iso_sunday};
+use crate::date_util::{add_days, iso_sunday, month_of};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
@@ -154,16 +154,19 @@ pub struct PipelineResult {
 }
 
 /// Per-day mutable state tracked across day boundaries in the
-/// main loop.  Reset (partially) at each day/week boundary.
+/// main loop.  Reset (partially) at each day/week/month boundary.
 #[derive(Default)]
 struct LoopState {
     prev_day: Option<String>,
     prev_week: Option<String>,
+    prev_month: Option<String>,
     day_has_digest: bool,
     week_has_digest: bool,
-    /// Whether the current week has any content that could
+    month_has_digest: bool,
+    /// Whether the current week/month has any content that could
     /// feed digest generation.
     week_has_content: bool,
+    month_has_content: bool,
     /// AI summary existence for emails in the current day.
     day_ai_exists: HashSet<String>,
     /// All email datekeys for the current day.
@@ -177,7 +180,8 @@ struct LoopState {
 /// Pipeline state for the digestive batch processor.
 ///
 /// Collects all shared mutable state for email summarization,
-/// daily digest generation, and weekly digest generation.
+/// daily digest generation, and periodic (weekly/monthly) digest
+/// generation.
 pub struct Digestive<'a> {
     repo_path: &'a str,
     git_ref: &'a str,
@@ -190,6 +194,8 @@ pub struct Digestive<'a> {
     /// Days (e.g. "2025/01/02") with a daily `digest.ai.md`, seen in
     /// ls-tree or generated this run.  Content is read via CachedReader.
     daily_digest_days: std::collections::BTreeSet<String>,
+    /// Sundays (e.g. "2025/01/05") with a weekly `digest.weekly.ai.md`.
+    weekly_digest_sundays: std::collections::BTreeSet<String>,
     /// Resolved OID of the commit whose tree represents the "before
     /// today" thread state for daily digest generation.  Cleared after
     /// each daily digest commit so that the next day re-resolves it
@@ -242,6 +248,7 @@ impl<'a> Digestive<'a> {
             dry_run,
             batch_size,
             daily_digest_days: std::collections::BTreeSet::new(),
+            weekly_digest_sundays: std::collections::BTreeSet::new(),
             before_oid,
             last_digested_day,
             total_processed: 0,
@@ -484,7 +491,8 @@ impl<'a> Digestive<'a> {
     }
 
     /// Called at each day boundary (and implicitly, never for the last
-    /// day).  Emits daily digests for completed days.
+    /// day).  Emits daily, weekly, and monthly digests for completed
+    /// periods.
     async fn finalize_day(
         &mut self,
         state: &mut LoopState,
@@ -538,6 +546,16 @@ impl<'a> Digestive<'a> {
             self.commit_weekly_digest(pw).await?;
         }
 
+        // --- Monthly digest at month boundary ---
+        let new_month = month_of(new_day);
+        if Some(new_month) != state.prev_month.as_deref()
+            && let Some(ref pm) = state.prev_month
+            && !state.month_has_digest
+            && state.month_has_content
+        {
+            self.commit_monthly_digest(pm).await?;
+        }
+
         Ok(())
     }
 
@@ -589,6 +607,7 @@ impl<'a> Digestive<'a> {
         )
         .await?;
 
+        self.weekly_digest_sundays.insert(week_sunday.to_string());
         self.cached.insert(
             format!("{}:{week_sunday}/digest.weekly.human.md", self.git_ref),
             result.human.clone(),
@@ -601,6 +620,80 @@ impl<'a> Digestive<'a> {
         let ai_path = format!("{week_sunday}/digest.weekly.ai.md");
         let human_path = format!("{week_sunday}/digest.weekly.human.md");
         let mut msg = format!("digestive: weekly digest for {week_sunday}");
+        if let Some(ref sc) = self.source_commit {
+            msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+        }
+        let files = [
+            (human_path.as_str(), result.human.as_str()),
+            (ai_path.as_str(), result.ai.as_str()),
+        ];
+        let fi = self.fi.as_mut().context("fast-import unavailable")?;
+        fi.commit(&msg, &files)?;
+        fi.checkpoint()?;
+
+        Ok(())
+    }
+
+    async fn commit_monthly_digest(&mut self, month: &str) -> Result<()> {
+        let ai_path = format!("{month}/digest.monthly.ai.md");
+        let exists = self
+            .cached
+            .get_str(&format!("{}:{ai_path}", self.git_ref))
+            .is_some();
+        if exists {
+            return Ok(());
+        }
+
+        if self.dry_run {
+            eprintln!("[dry-run] would generate monthly digest for {month}");
+            return Ok(());
+        }
+
+        // Collect weekly digests from the precomputed set, reading
+        // content via CachedReader.  A week overlaps this month if
+        // its Monday..Sunday range intersects the month's day range.
+        let month_start = format!("{month}/01");
+        let month_end = format!("{month}/31");
+        let digests: Vec<_> = self
+            .weekly_digest_sundays
+            .iter()
+            .filter_map(|sunday| {
+                let monday = add_days(sunday, -6)?;
+                let overlaps = sunday.as_str() >= month_start.as_str()
+                    && monday.as_str() <= month_end.as_str();
+                if !overlaps {
+                    return None;
+                }
+                let spec = format!("{}:{sunday}/digest.weekly.human.md", self.git_ref,);
+                let content = self.cached.get_str(&spec)?;
+                Some(SubDigest {
+                    label: format!("{monday} -- {sunday}"),
+                    content,
+                })
+            })
+            .collect();
+        if digests.is_empty() {
+            eprintln!(
+                "[digestive] no weekly digests for {month}, \
+                skipping monthly digest"
+            );
+            return Ok(());
+        }
+
+        let from = format!("{month}/01");
+        let to = format!("{month}/31");
+        let label = format!("{from} -- {to}");
+        let result = generate_periodic_digest(
+            &label,
+            Granularity::Monthly,
+            &digests,
+            self.backend.context("backend unavailable")?,
+        )
+        .await?;
+
+        let ai_path = format!("{month}/digest.monthly.ai.md");
+        let human_path = format!("{month}/digest.monthly.human.md");
+        let mut msg = format!("digestive: monthly digest for {month}");
         if let Some(ref sc) = self.source_commit {
             msg.push_str(&format!("\n\nSource-Commit: {sc}"));
         }
@@ -679,12 +772,18 @@ impl<'a> Digestive<'a> {
                 self.finalize_day(&mut state, day, since).await?;
 
                 let new_week = iso_sunday(day);
+                let new_month = month_of(day).to_string();
 
                 state.prev_day = Some(day.to_string());
                 if new_week != state.prev_week {
                     state.week_has_digest = false;
                     state.week_has_content = false;
                     state.prev_week = new_week;
+                }
+                if Some(new_month.as_str()) != state.prev_month.as_deref() {
+                    state.month_has_digest = false;
+                    state.month_has_content = false;
+                    state.prev_month = Some(new_month);
                 }
                 state.day_has_digest = false;
                 state.day_ai_exists.clear();
@@ -696,12 +795,18 @@ impl<'a> Digestive<'a> {
                 if dk.ends_with("/digest") {
                     state.day_has_digest = true;
                     state.week_has_content = true;
+                    state.month_has_content = true;
                     self.daily_digest_days.insert(day.to_string());
                 } else if dk.ends_with("/digest.weekly") {
                     state.week_has_digest = true;
+                    state.month_has_content = true;
+                    self.weekly_digest_sundays.insert(day.to_string());
+                } else if dk.ends_with("/digest.monthly") {
+                    state.month_has_digest = true;
                 } else if !dk.ends_with(".thread") {
                     state.day_ai_exists.insert(dk.to_string());
                     state.week_has_content = true;
+                    state.month_has_content = true;
                 }
             } else if let Some(dk) = path.strip_suffix(".md") {
                 // Skip derivative files.
@@ -736,6 +841,7 @@ impl<'a> Digestive<'a> {
                     let ai_spec = format!("{}:{dk}.ai.md", self.git_ref);
                     if self.cached.get_str(&ai_spec).is_some() {
                         state.week_has_content = true;
+                        state.month_has_content = true;
                         continue;
                     }
 
@@ -753,6 +859,7 @@ impl<'a> Digestive<'a> {
                         return Err(e);
                     }
                     state.week_has_content = true;
+                    state.month_has_content = true;
                 }
             }
             // All other files (thread.md, thread.human.md, etc.) are skipped.
