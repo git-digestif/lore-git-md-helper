@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use anyhow::Result;
 use time::OffsetDateTime;
 
+use crate::git_util::git;
+
 /// Convert a Unix timestamp to a UTC date-key: `YYYY/MM/DD/HH-MM-SS`.
 ///
 /// If `existing` already contains that key, appends `-1`, `-2`, … to resolve
@@ -48,6 +50,37 @@ fn resolve_key(utc: OffsetDateTime, existing: &mut HashSet<String>) -> Result<St
     unreachable!()
 }
 
+/// Scan the target repo's tree for existing `.md` files and return their
+/// date-keys as a `HashSet`, ready for use with `date_to_key()`.
+///
+/// Runs `git ls-tree -r --name-only refs/heads/main` and strips the
+/// `.md` suffix.  Ignores `.thread.md` files (those are not date-keys).
+/// Returns an empty set if the ref does not exist yet (fresh repo).
+pub fn load_existing_keys(repo_path: &str) -> Result<HashSet<String>> {
+    use crate::git_util::resolve_ref;
+
+    if resolve_ref(repo_path, "refs/heads/main").is_none() {
+        return Ok(HashSet::new());
+    }
+
+    let stdout = git(
+        repo_path,
+        &["ls-tree", "-r", "--name-only", "refs/heads/main"],
+    )?;
+
+    let mut keys = HashSet::new();
+    for path in stdout.lines() {
+        if path.ends_with(".thread.md") {
+            continue;
+        }
+        if let Some(key) = path.strip_suffix(".md") {
+            keys.insert(key.to_string());
+        }
+    }
+
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +124,62 @@ mod tests {
         let mut existing = HashSet::new();
         let key = date_to_key("Tue, 31 Dec 2024 23:30:00 -0100", &mut existing).unwrap();
         assert_eq!(key, "2025/01/01/00-30-00");
+    }
+
+    #[test]
+    fn test_load_existing_keys_empty_repo() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let keys = load_existing_keys(repo).unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_load_existing_keys_with_files() {
+        use crate::fast_import::FastImport;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+
+        let mut fi = FastImport::new(repo, "refs/heads/main").unwrap();
+        fi.commit(
+            "seed",
+            &[
+                ("2025/02/12/04-10-17.md", "email one"),
+                ("2025/02/10/00-00-00.md", "email two"),
+                ("2025/02/10/00-00-00.thread.md", "thread summary"),
+            ],
+        )
+        .unwrap();
+        fi.finish().unwrap();
+
+        let keys = load_existing_keys(repo).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("2025/02/12/04-10-17"));
+        assert!(keys.contains("2025/02/10/00-00-00"));
+    }
+
+    #[test]
+    fn test_load_existing_keys_excludes_thread_files() {
+        use crate::fast_import::FastImport;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+
+        let mut fi = FastImport::new(repo, "refs/heads/main").unwrap();
+        fi.commit(
+            "seed",
+            &[
+                ("2025/03/01/12-00-00.md", "email"),
+                ("2025/03/01/12-00-00.thread.md", "thread"),
+            ],
+        )
+        .unwrap();
+        fi.finish().unwrap();
+
+        let keys = load_existing_keys(repo).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("2025/03/01/12-00-00"));
+        assert!(!keys.contains("2025/03/01/12-00-00.thread"));
     }
 }
