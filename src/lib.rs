@@ -15,16 +15,20 @@ pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     if let Some(from) = message.from()
         && let Some(addr) = from.first()
     {
-        md.push_str(&format!("| **From** | {} |\n", format_address(addr)));
+        let from = escape_markdown_table_cell(&format_address(addr));
+        md.push_str(&format!("| **From** | {from} |\n"));
     }
 
     if let Some(to) = message.to() {
-        let to_addrs: Vec<String> = to.iter().map(format_address).collect();
-        md.push_str(&format!("| **To** | {} |\n", to_addrs.join(", ")));
+        let to_addrs = escape_markdown_table_cell(
+            &to.iter().map(format_address).collect::<Vec<_>>().join(", "),
+        );
+        md.push_str(&format!("| **To** | {to_addrs} |\n"));
     }
 
     if let Some(date) = message.date() {
-        md.push_str(&format!("| **Date** | {} |\n", date.to_rfc3339()));
+        let date = escape_markdown_table_cell(&date.to_rfc3339());
+        md.push_str(&format!("| **Date** | {date} |\n"));
     }
 
     if let Some(message_id) = message.message_id() {
@@ -44,9 +48,11 @@ pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
         md.push_str("---\n\n");
         md.push_str("**Attachments:**\n\n");
         for (filename, content_type) in attachments {
+            let link_text = escape_markdown_link_text(&filename);
+            let link_target = encode_markdown_link_destination(&filename);
             md.push_str(&format!(
                 "- [{}]({}) ({})\n",
-                filename, filename, content_type
+                link_text, link_target, content_type
             ));
         }
     }
@@ -60,6 +66,45 @@ fn format_address(addr: &mail_parser::Addr) -> String {
     } else {
         addr.address().unwrap_or("").to_string()
     }
+}
+
+fn escape_markdown_table_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '|' => out.push_str("\\|"),
+            '\r' | '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_markdown_link_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn encode_markdown_link_destination(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(out, "%{byte:02X}").unwrap();
+        }
+    }
+    out
 }
 
 fn extract_body(message: &mail_parser::Message) -> Result<String> {
@@ -604,15 +649,47 @@ mod tests {
     use super::*;
     use mail_parser::MessageParser;
 
+    fn create_test_email_with_headers(from: &str, to: &str, subject: &str, body: &str) -> Vec<u8> {
+        format!(
+            "From: {from}\r\n\
+             To: {to}\r\n\
+             Subject: {subject}\r\n\
+             Date: Mon, 9 Dec 2024 10:00:00 +0000\r\n\
+             \r\n\
+             {body}"
+        )
+        .into_bytes()
+    }
+
     fn create_test_email(subject: &str, body: &str) -> Vec<u8> {
+        create_test_email_with_headers("test@example.com", "user@example.com", subject, body)
+    }
+
+    fn create_test_email_with_attachment(
+        subject: &str,
+        body: &str,
+        filename: &str,
+        content_type: &str,
+    ) -> Vec<u8> {
         format!(
             "From: test@example.com\r\n\
              To: user@example.com\r\n\
-             Subject: {}\r\n\
+             Subject: {subject}\r\n\
              Date: Mon, 9 Dec 2024 10:00:00 +0000\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
              \r\n\
-             {}",
-            subject, body
+             --BOUNDARY\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             {body}\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: {content_type}; name=\"{filename}\"\r\n\
+             Content-Disposition: attachment; filename=\"{filename}\"\r\n\
+             Content-Transfer-Encoding: 7bit\r\n\
+             \r\n\
+             attachment body\r\n\
+             --BOUNDARY--\r\n"
         )
         .into_bytes()
     }
@@ -643,6 +720,36 @@ mod tests {
             "Should have To in table"
         );
         assert!(result.contains("| **Date** |"), "Should have Date in table");
+    }
+
+    #[test]
+    fn test_header_table_escapes_raw_pipes() {
+        let email = create_test_email_with_headers(
+            r#""Terrence | Wolf1098" <wolf@example.com>"#,
+            r#""Review | List" <list@example.com>"#,
+            "Test Subject",
+            "Simple message.",
+        );
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains(r"| **From** | Terrence \| Wolf1098 <wolf@example.com> |"));
+        assert!(result.contains(r"| **To** | Review \| List <list@example.com> |"));
+    }
+
+    #[test]
+    fn test_attachment_links_escape_label_and_target() {
+        let email = create_test_email_with_attachment(
+            "Attachment test",
+            "See attachment.",
+            "weird [name] (v1) | final.patch",
+            "text/x-patch",
+        );
+        let result = parse_and_convert(&email);
+
+        assert!(result.contains("**Attachments:**"));
+        assert!(result.contains(
+            r"- [weird \[name\] (v1) | final.patch](weird%20%5Bname%5D%20%28v1%29%20%7C%20final.patch) (text)"
+        ));
     }
 
     #[test]
