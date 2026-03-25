@@ -15,7 +15,9 @@ pub mod thread;
 pub mod thread_file;
 
 pub mod ai_backend;
+pub mod date_util;
 pub mod fast_import;
+pub mod summarize;
 
 pub mod rag_db;
 pub mod rag_git;
