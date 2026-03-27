@@ -7,6 +7,7 @@ pub mod git_util;
 pub mod lore_link;
 pub mod msgid_map;
 pub mod notes_import;
+pub mod source_reader;
 pub mod symlink;
 pub mod thread;
 pub mod thread_file;
