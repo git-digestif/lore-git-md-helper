@@ -1,9 +1,11 @@
-//! Persistent `git cat-file --batch` process for efficient object lookups.
+//! Persistent `git cat-file --batch --follow-symlinks` process for
+//! efficient object lookups.
 //!
-//! Wraps a single long-running `git cat-file --batch` child process.
-//! Callers write object specs (e.g. `HEAD:path/to/file` or a raw OID)
-//! and read back the content, avoiding per-lookup process spawn
-//! overhead.
+//! Wraps a single long-running child process.  Callers write object
+//! specs (e.g. `HEAD:path/to/file` or a raw OID) and read back the
+//! content, avoiding per-lookup process spawn overhead.  The
+//! `--follow-symlinks` flag transparently resolves symlink entries
+//! in the tree.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Stdio};
@@ -25,10 +27,15 @@ pub struct CatFile {
 }
 
 impl CatFile {
-    /// Spawn a persistent `git cat-file --batch` process against
-    /// `repo_path`.
+    /// Spawn a persistent `git cat-file --batch --follow-symlinks`
+    /// process against `repo_path`.
+    ///
+    /// The `--follow-symlinks` flag lets specs like
+    /// `HEAD:path/to/symlink` transparently resolve to the target
+    /// content.  This does not affect callers that query non-symlink
+    /// paths (e.g. `commit:m` or `refs/notes/msgid:ab/cd/rest`).
     pub fn new(repo_path: &str) -> Result<Self> {
-        let mut child = GitCommand::new(repo_path, &["cat-file", "--batch"])
+        let mut child = GitCommand::new(repo_path, &["cat-file", "--batch", "--follow-symlinks"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -55,6 +62,10 @@ impl CatFile {
         let header = header.trim_end();
 
         if header.contains("missing") {
+            return None;
+        }
+        if header.contains("symlink") {
+            eprintln!("WARN: unresolved symlink for {spec}");
             return None;
         }
 
