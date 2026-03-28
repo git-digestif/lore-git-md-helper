@@ -157,6 +157,35 @@ pub fn resolve_ref(repo_path: &str, refname: &str) -> Option<String> {
     git(repo_path, &["rev-parse", "--verify", refname]).ok()
 }
 
+/// Read the `Source-Commit:` trailer from the first reachable commit
+/// (in date order) of the given ref that contains one.
+///
+/// Returns `None` if the ref doesn't exist or no commit with a
+/// `Source-Commit:` trailer is found.
+pub fn source_commit_from_ref(repo_path: &str, refname: &str) -> Option<String> {
+    let body = git(
+        repo_path,
+        &[
+            "log",
+            "--date-order",
+            "--format=%B",
+            "--grep=Source-Commit: ",
+            "-1",
+            refname,
+        ],
+    )
+    .ok()?;
+    for line in body.lines() {
+        if let Some(oid) = line.strip_prefix("Source-Commit: ") {
+            let oid = oid.trim();
+            if !oid.is_empty() {
+                return Some(oid.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod tests {
     pub fn git(git_dir: &str, args: &[&str]) -> String {
@@ -185,5 +214,51 @@ pub mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("rev-parse"), "unexpected error: {msg}");
         assert!(msg.contains("does-not-exist"), "unexpected error: {msg}");
+    }
+
+    /// Create a commit with the given message in a bare repo.
+    #[cfg(test)]
+    fn bare_commit(git_dir: &str, refname: &str, msg: &str) {
+        use super::resolve_ref;
+        let tree = git(git_dir, &["mktree", "--missing"]);
+        let mut args = vec!["commit-tree", &tree, "-m", msg];
+        let parent = resolve_ref(git_dir, refname);
+        if let Some(ref p) = parent {
+            args.extend(["-p", p.as_str()]);
+        }
+        let sha = git(git_dir, &args);
+        git(git_dir, &["update-ref", refname, &sha]);
+    }
+
+    #[test]
+    fn finds_trailer_on_tip() {
+        use super::source_commit_from_ref;
+        let dir = init_bare_repo();
+        let p = dir.path().to_str().unwrap();
+        bare_commit(p, "refs/heads/main", "first\n\nSource-Commit: aaa111");
+        assert_eq!(source_commit_from_ref(p, "main"), Some("aaa111".into()));
+    }
+
+    #[test]
+    fn finds_trailer_on_ancestor() {
+        use super::source_commit_from_ref;
+        let dir = init_bare_repo();
+        let p = dir.path().to_str().unwrap();
+        bare_commit(
+            p,
+            "refs/heads/main",
+            "with trailer\n\nSource-Commit: bbb222",
+        );
+        bare_commit(p, "refs/heads/main", "no trailer here");
+        assert_eq!(source_commit_from_ref(p, "main"), Some("bbb222".into()));
+    }
+
+    #[test]
+    fn returns_none_when_absent() {
+        use super::source_commit_from_ref;
+        let dir = init_bare_repo();
+        let p = dir.path().to_str().unwrap();
+        bare_commit(p, "refs/heads/main", "no trailer");
+        assert_eq!(source_commit_from_ref(p, "main"), None);
     }
 }
