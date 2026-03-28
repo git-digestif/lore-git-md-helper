@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use lore_git_md_helper::batch_import::process_emails;
 use lore_git_md_helper::cat_file::CatFile;
@@ -25,6 +25,8 @@ fn main() -> Result<()> {
     };
     check(source_repo)?;
     check(target_repo)?;
+
+    check_refs_in_sync(target_repo)?;
 
     let range = if let Some(r) = args.get(3) {
         r.clone()
@@ -83,4 +85,90 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Verify that refs/heads/main and refs/notes/msgid carry the same
+/// Source-Commit trailer.  A mismatch means an earlier run updated one
+/// ref but not the other (e.g. notes ref was never pushed/fetched).
+fn check_refs_in_sync(target_repo: &str) -> Result<()> {
+    let main_sc = source_commit_from_ref(target_repo, "refs/heads/main");
+    let notes_sc = source_commit_from_ref(target_repo, "refs/notes/msgid");
+    match (&main_sc, &notes_sc) {
+        (Some(m), Some(n)) if m != n => {
+            bail!(
+                "refs/heads/main and refs/notes/msgid are out of sync!\n\
+                 main  Source-Commit: {m}\n\
+                 notes Source-Commit: {n}\n\
+                 Fix manually before running an incremental update."
+            );
+        }
+        (Some(_), None) => {
+            bail!(
+                "refs/heads/main has a Source-Commit trailer but \
+                 refs/notes/msgid does not exist or has no trailer.\n\
+                 The notes ref was probably never pushed/fetched."
+            );
+        }
+        // notes exist but main doesn't: shouldn't happen, but not fatal
+        // both None: fresh repo, fine
+        // both equal: fine
+        _ => Ok(()),
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use lore_git_md_helper::fast_import::FastImport;
+    use lore_git_md_helper::git_util::tests::init_bare_repo;
+
+    fn commit_with_trailer(repo: &str, refname: &str, source_commit: &str) {
+        let mut fi = FastImport::new(repo, refname).unwrap();
+        if let Some(tip) = lore_git_md_helper::git_util::resolve_ref(repo, refname) {
+            fi.set_parent(tip);
+        }
+        fi.commit(
+            &format!("test commit\n\nSource-Commit: {source_commit}"),
+            &[("dummy.md", "x")],
+        )
+        .unwrap();
+        fi.finish().unwrap();
+    }
+
+    #[test]
+    fn sync_check_passes_on_fresh_repo() {
+        let dir = init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        check_refs_in_sync(repo).unwrap();
+    }
+
+    #[test]
+    fn sync_check_passes_when_both_match() {
+        let dir = init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        commit_with_trailer(repo, "refs/heads/main", "abc123");
+        commit_with_trailer(repo, "refs/notes/msgid", "abc123");
+        check_refs_in_sync(repo).unwrap();
+    }
+
+    #[test]
+    fn sync_check_fails_on_mismatch() {
+        let dir = init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        commit_with_trailer(repo, "refs/heads/main", "abc123");
+        commit_with_trailer(repo, "refs/notes/msgid", "def456");
+        let err = check_refs_in_sync(repo).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("out of sync"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn sync_check_fails_when_notes_missing() {
+        let dir = init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        commit_with_trailer(repo, "refs/heads/main", "abc123");
+        let err = check_refs_in_sync(repo).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("never pushed"), "unexpected: {msg}");
+    }
 }
