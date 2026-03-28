@@ -1,6 +1,8 @@
 use anyhow::Result;
 use mail_parser::MimeHeaders;
 
+pub mod git_util;
+
 pub fn email_to_markdown(message: &mail_parser::Message) -> Result<String> {
     let mut md = String::new();
 
