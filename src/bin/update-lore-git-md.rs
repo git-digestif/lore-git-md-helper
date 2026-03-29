@@ -171,4 +171,81 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("never pushed"), "unexpected: {msg}");
     }
+
+    /// End-to-end test: run the full import pipeline and verify that
+    /// both refs/heads/main and refs/notes/msgid are updated.
+    /// This catches regressions where content commits are written to
+    /// a throwaway buffer instead of the fast-import process.
+    #[test]
+    fn pipeline_updates_both_main_and_notes() {
+        use lore_git_md_helper::cat_file::CatFile;
+        use lore_git_md_helper::git_util;
+
+        // Create source repo with one email
+        let source_dir = init_bare_repo();
+        let source = source_dir.path().to_str().unwrap();
+        let email = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "To: git@vger.kernel.org\r\n",
+            "Subject: [PATCH] Fix frobnicate\r\n",
+            "Date: Mon, 10 Feb 2025 00:00:00 +0000\r\n",
+            "Message-ID: <test-pipeline@example.com>\r\n",
+            "\r\n",
+            "This fixes the frobnicate.\r\n",
+        );
+        let mut fi = FastImport::new(source, "refs/heads/main").unwrap();
+        fi.commit("add email", &[("m", email)]).unwrap();
+        fi.finish().unwrap();
+
+        // Create empty target repo
+        let target_dir = init_bare_repo();
+        let target = target_dir.path().to_str().unwrap();
+
+        // Run the pipeline (same logic as main())
+        let emails = read_source_emails(source, "HEAD").unwrap();
+        assert_eq!(emails.len(), 1, "should find one email");
+
+        let mut existing_keys = lore_git_md_helper::datekey::load_existing_keys(target).unwrap();
+        let notes_cat = CatFile::new(target).unwrap();
+        let mut map = MsgIdMap::new(Some(Box::new(notes_cat)));
+        let mut target_cat = CatFile::new(target).unwrap();
+
+        let result = process_emails(&emails, &mut map, &mut existing_keys, &mut target_cat);
+        assert_eq!(result.emails.len(), 1, "should convert one email");
+
+        let mut fi = FastImport::new(target, "refs/heads/main").unwrap();
+        if let Some(tip) = resolve_ref(target, "refs/heads/main") {
+            fi.set_parent(tip);
+        }
+        let mut notes_fi = fi.sibling("refs/notes/msgid");
+        if let Some(tip) = resolve_ref(target, "refs/notes/msgid") {
+            notes_fi.set_parent(tip);
+        }
+
+        write_fast_import(&mut fi, &result, &map, &mut notes_fi, source).unwrap();
+        map.clear_dirty();
+        fi.finish().unwrap();
+
+        // Verify refs/heads/main was updated with the email .md file
+        let main_tip = git_util::resolve_ref(target, "refs/heads/main");
+        assert!(
+            main_tip.is_some(),
+            "refs/heads/main should exist after import"
+        );
+
+        let tree_output =
+            git_util::git(target, &["ls-tree", "-r", "--name-only", "refs/heads/main"]).unwrap();
+        let has_md = tree_output.lines().any(|p| p.ends_with(".md"));
+        assert!(
+            has_md,
+            "refs/heads/main should contain at least one .md file, got: {tree_output}"
+        );
+
+        // Verify refs/notes/msgid was also updated
+        let notes_tip = git_util::resolve_ref(target, "refs/notes/msgid");
+        assert!(
+            notes_tip.is_some(),
+            "refs/notes/msgid should exist after import"
+        );
+    }
 }
