@@ -247,5 +247,96 @@ mod tests {
             notes_tip.is_some(),
             "refs/notes/msgid should exist after import"
         );
+
+        // Remember source tip for incremental range
+        let first_oid =
+            git_util::resolve_ref(source, "refs/heads/main").expect("source should have main");
+
+        // Add two more emails: a reply and a reply-to-reply
+        let email2 = concat!(
+            "From: Bob <bob@example.com>\r\n",
+            "To: git@vger.kernel.org\r\n",
+            "Subject: Re: [PATCH] Fix frobnicate\r\n",
+            "Date: Mon, 10 Feb 2025 01:00:00 +0000\r\n",
+            "Message-ID: <reply1@example.com>\r\n",
+            "In-Reply-To: <test-pipeline@example.com>\r\n",
+            "\r\n",
+            "Looks good, one nit.\r\n",
+        );
+        let email3 = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "To: git@vger.kernel.org\r\n",
+            "Subject: Re: [PATCH] Fix frobnicate\r\n",
+            "Date: Mon, 10 Feb 2025 02:00:00 +0000\r\n",
+            "Message-ID: <reply2@example.com>\r\n",
+            "In-Reply-To: <reply1@example.com>\r\n",
+            "References: <test-pipeline@example.com> <reply1@example.com>\r\n",
+            "\r\n",
+            "Fixed, thanks.\r\n",
+        );
+        let mut fi = FastImport::new(source, "refs/heads/main").unwrap();
+        fi.set_parent(first_oid.clone());
+        fi.commit("email 2", &[("m", email2)]).unwrap();
+        fi.commit("email 3", &[("m", email3)]).unwrap();
+        fi.finish().unwrap();
+
+        // Incremental import (only new commits)
+        let emails = read_source_emails(source, &format!("{first_oid}..HEAD")).unwrap();
+        assert_eq!(emails.len(), 2, "should find two new emails");
+
+        let mut existing_keys = lore_git_md_helper::datekey::load_existing_keys(target).unwrap();
+        let notes_cat = CatFile::new(target).unwrap();
+        let mut map = MsgIdMap::new(Some(Box::new(notes_cat)));
+        let mut target_cat = CatFile::new(target).unwrap();
+
+        let result = process_emails(&emails, &mut map, &mut existing_keys, &mut target_cat);
+        assert_eq!(result.emails.len(), 2, "should convert two emails");
+
+        let mut fi = FastImport::new(target, "refs/heads/main").unwrap();
+        if let Some(tip) = resolve_ref(target, "refs/heads/main") {
+            fi.set_parent(tip);
+        }
+        let mut notes_fi = fi.sibling("refs/notes/msgid");
+        if let Some(tip) = resolve_ref(target, "refs/notes/msgid") {
+            notes_fi.set_parent(tip);
+        }
+
+        write_fast_import(&mut fi, &result, &map, &mut notes_fi, source).unwrap();
+        map.clear_dirty();
+        fi.finish().unwrap();
+
+        // Verify all three .md files exist
+        let tree_output =
+            git_util::git(target, &["ls-tree", "-r", "--name-only", "refs/heads/main"]).unwrap();
+        let md_count = tree_output
+            .lines()
+            .filter(|p| p.ends_with(".md") && !p.ends_with(".thread.md"))
+            .count();
+        assert!(
+            md_count >= 3,
+            "should have at least 3 email .md files after incremental import, \
+             got {md_count}: {tree_output}"
+        );
+
+        // Verify Source-Commit trailers are in sync
+        check_refs_in_sync(target).expect(
+            "refs/heads/main and refs/notes/msgid should have matching Source-Commit trailers",
+        );
+
+        // Verify notes were created for the reply Message-IDs too
+        let mut notes_cat = CatFile::new(target).unwrap();
+        for msgid in ["reply1@example.com", "reply2@example.com"] {
+            let oid = lore_git_md_helper::msgid_map::hash_message_id(msgid);
+            let (d1, rest) = oid.split_at(2);
+            let (d2, d3) = rest.split_at(2);
+            let spec = format!("refs/notes/msgid:{d1}/{d2}/{d3}");
+            let val = notes_cat
+                .get_str(&spec)
+                .unwrap_or_else(|| panic!("note for {msgid} should exist"));
+            assert!(
+                val.trim().starts_with("2025/02/10/"),
+                "note for {msgid} should map to a 2025/02/10 date-key, got: {val}"
+            );
+        }
     }
 }
