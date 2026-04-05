@@ -2,6 +2,66 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
+/// Describes a single path changed between two commits.
+pub struct DiffEntry {
+    pub path: String,
+    /// New blob SHA (empty string of zeros for deletions).
+    pub new_sha: String,
+    /// True when the path was deleted.
+    pub deleted: bool,
+}
+
+/// Diff two commits and return only changed `.md` files (excluding
+/// `.thread.md`).  Uses `git diff-tree -r` which is much faster than
+/// a full `ls-tree` scan for incremental updates.
+pub fn diff_tree(
+    repo: &str,
+    old: &str,
+    new: &str,
+    mut on_entry: impl FnMut(usize, &str),
+) -> Result<Vec<DiffEntry>> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    use crate::git_util::GitCommand;
+
+    let mut child = GitCommand::new(repo, &["diff-tree", "-r", old, new])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("git diff-tree failed")?;
+
+    let stdout = child.take_stdout().context("no stdout from diff-tree")?;
+    let reader = BufReader::new(stdout);
+
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line.context("reading diff-tree output")?;
+        // ":old_mode new_mode old_sha new_sha status\tpath"
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if !path.ends_with(".md") || path.ends_with(".thread.md") {
+            continue;
+        }
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let new_sha = parts[3].to_owned();
+        let status = parts[4];
+        let deleted = status == "D";
+        entries.push(DiffEntry {
+            path: path.to_owned(),
+            new_sha,
+            deleted,
+        });
+        on_entry(entries.len(), path);
+    }
+
+    child.wait_with_output()?;
+    Ok(entries)
+}
+
 /// List all `.md` blobs (excluding `.thread.md`) in the tree of
 /// `git_ref`.  Returns a map of `path -> blob SHA`.
 ///
