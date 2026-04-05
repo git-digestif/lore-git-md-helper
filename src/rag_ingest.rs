@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::{cat_file::CatFile, git_util::resolve_ref, rag_db, rag_git::ls_tree, rag_parse};
+use crate::{cat_file::CatFile, git_util::resolve_ref, rag_db, rag_git, rag_parse};
 
 /// Ingest a single markdown email file into the database.
 ///
@@ -57,52 +57,78 @@ pub fn ingest_repo(
     use std::time::Instant;
 
     let current = resolve_ref(repo, git_ref).context(format!("failed to resolve {git_ref}"))?;
-    if rag_db::get_state(conn, "last_commit").as_deref() == Some(&current) {
+    let last_commit = rag_db::get_state(conn, "last_commit");
+    if last_commit.as_deref() == Some(&current) {
         return Ok(0);
     }
 
-    let t = Instant::now();
-    let tree = ls_tree(repo, git_ref, on_scan)?;
-    eprintln!(
-        "\rscanned {} emails in {:.1}s, loading database...",
-        tree.len(),
-        t.elapsed().as_secs_f64(),
-    );
-
-    // Load existing path->blob_sha from DB
-    let t = Instant::now();
-    let mut existing: HashMap<String, String> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT path, blob_sha FROM emails")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for r in rows {
-            let (p, s) = r?;
-            existing.insert(p, s);
+    // When a previous commit is known, use diff-tree to find only the
+    // changed paths.  This avoids the full ls-tree scan and the full
+    // DB load that dominate incremental ingest time on large repos.
+    let (to_upsert, to_delete) = if let Some(ref old) = last_commit {
+        let t = Instant::now();
+        let entries = rag_git::diff_tree(repo, old, &current, on_scan)?;
+        let mut upsert = Vec::new();
+        let mut delete = Vec::new();
+        for e in &entries {
+            if e.deleted {
+                delete.push(e.path.clone());
+            } else {
+                upsert.push((e.path.clone(), e.new_sha.clone()));
+            }
         }
-    }
+        eprintln!(
+            "\rdiffed {} changes in {:.1}s; {} to upsert, {} to delete",
+            entries.len(),
+            t.elapsed().as_secs_f64(),
+            upsert.len(),
+            delete.len(),
+        );
+        (upsert, delete)
+    } else {
+        // Cold start: full tree scan + DB load
+        let t = Instant::now();
+        let tree = rag_git::ls_tree(repo, git_ref, on_scan)?;
+        eprintln!(
+            "\rscanned {} emails in {:.1}s, loading database...",
+            tree.len(),
+            t.elapsed().as_secs_f64(),
+        );
 
-    // Determine what to upsert and delete
-    let to_upsert: Vec<(&str, &str)> = tree
-        .iter()
-        .filter(|(path, sha)| existing.get(*path) != Some(*sha))
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
+        let t = Instant::now();
+        let mut existing: HashMap<String, String> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT path, blob_sha FROM emails")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (p, s) = r?;
+                existing.insert(p, s);
+            }
+        }
 
-    let to_delete: Vec<&str> = existing
-        .keys()
-        .filter(|p| !tree.contains_key(p.as_str()))
-        .map(|p| p.as_str())
-        .collect();
+        let upsert: Vec<(String, String)> = tree
+            .iter()
+            .filter(|(path, sha)| existing.get(*path) != Some(*sha))
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
 
-    eprintln!(
-        "loaded {} existing in {:.1}s; {} to upsert, {} to delete",
-        existing.len(),
-        t.elapsed().as_secs_f64(),
-        to_upsert.len(),
-        to_delete.len(),
-    );
+        let delete: Vec<String> = existing
+            .keys()
+            .filter(|p| !tree.contains_key(p.as_str()))
+            .cloned()
+            .collect();
+
+        eprintln!(
+            "loaded {} existing in {:.1}s; {} to upsert, {} to delete",
+            existing.len(),
+            t.elapsed().as_secs_f64(),
+            upsert.len(),
+            delete.len(),
+        );
+        (upsert, delete)
+    };
 
     // Delete removed paths
     if !to_delete.is_empty() {
@@ -131,7 +157,7 @@ pub fn ingest_repo(
     let t = Instant::now();
     let mut cat = CatFile::new(repo)?;
     let mut failed = 0usize;
-    for (i, &(path, sha)) in to_upsert.iter().enumerate() {
+    for (i, (path, sha)) in to_upsert.iter().enumerate() {
         match cat.get_str(sha) {
             Some(content) => ingest_str(conn, path, sha, &content)?,
             None => {
@@ -155,11 +181,21 @@ pub fn ingest_repo(
 
     rag_db::set_state(conn, "last_commit", &current)?;
 
-    // Optimize the FTS index (can take a while on large tables)
-    let t = Instant::now();
-    eprintln!("optimizing search index...");
-    conn.execute("INSERT INTO emails_fts(emails_fts) VALUES ('optimize')", [])?;
-    eprintln!("optimized in {:.1}s", t.elapsed().as_secs_f64());
+    // Track accumulated inserts since the last FTS optimize, and only
+    // run the expensive segment merge when enough rows have piled up.
+    let unoptimized: usize = rag_db::get_state(conn, "unoptimized_inserts")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        + total;
+    if unoptimized >= 5000 {
+        let t = Instant::now();
+        eprintln!("optimizing search index...");
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES ('optimize')", [])?;
+        eprintln!("optimized in {:.1}s", t.elapsed().as_secs_f64());
+        rag_db::set_state(conn, "unoptimized_inserts", "0")?;
+    } else {
+        rag_db::set_state(conn, "unoptimized_inserts", &unoptimized.to_string())?;
+    }
 
     Ok(total)
 }
