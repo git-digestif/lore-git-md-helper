@@ -1,0 +1,98 @@
+name: Release
+
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build arm64 and create universal binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+          dir="lore-git-md-helper-${GITHUB_REF_NAME}-macos"
+          mkdir "$dir"
+          for bin in target/x86_64-apple-darwin/release/*; do
+            name=$(basename "$bin")
+            arm="target/aarch64-apple-darwin/release/$name"
+            test -f "$arm" && test -x "$bin" && test ! -d "$bin" || continue
+            lipo -create "$bin" "$arm" -output "$dir/$name"
+          done
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Package binaries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dir="lore-git-md-helper-${GITHUB_REF_NAME}-${{ matrix.suffix }}"
+          mkdir "$dir"
+          find "target/${{ matrix.target }}/release" -maxdepth 1 -executable -type f \
+            -exec cp {} "$dir/" \;
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          dir="lore-git-md-helper-${GITHUB_REF_NAME}-${{ matrix.suffix }}"
+          mkdir "$dir"
+          cp target/${{ matrix.target }}/release/*.exe "$dir/"
+          7z a "$dir.zip" "$dir"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.suffix }}
+          path: |
+            lore-git-md-helper-*.tar.gz
+            lore-git-md-helper-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --generate-notes artifacts/*.tar.gz artifacts/*.zip
