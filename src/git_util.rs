@@ -228,6 +228,11 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
         git(p, &["init", "--bare", "-b", "main"]);
+        git(p, &["config", "user.name", "Git Digestive"]);
+        git(
+            p,
+            &["config", "user.email", "digestive@git-digestif.github.io"],
+        );
         dir
     }
 
