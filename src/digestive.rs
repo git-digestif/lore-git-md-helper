@@ -865,9 +865,25 @@ impl<'a> Digestive<'a> {
             // All other files (thread.md, thread.human.md, etc.) are skipped.
         }
 
-        // Finalize the last day.  No digest is emitted for the last day
-        // because finalize_day only emits digests for the *previous* day,
-        // and there is no "next day" to trigger it.
+        // Finalize the last day.  When UTC midnight for the last day
+        // in the stream had already passed at least 15 minutes before
+        // the ls-tree snapshot was taken, the day is complete and its
+        // daily digest (plus any pending weekly/monthly digests for
+        // completed periods) should be emitted.
+        //
+        // The 15-minute grace period guards against a race where the
+        // email import finishes just before midnight but the pipeline
+        // starts just after: without the grace period, the snapshot
+        // might miss late-arriving emails that belong to the day.
+        let cutoff = format_datekey(now - time::Duration::minutes(15));
+        let cutoff_day = &cutoff[..10];
+        if state
+            .prev_day
+            .as_deref()
+            .is_some_and(|d| d < cutoff_day)
+        {
+            self.finalize_day(&mut state, cutoff_day, since).await?;
+        }
         self.flush_batch()?;
         self.day_summaries.clear();
 
@@ -2128,11 +2144,12 @@ mod tests {
             "01/13 daily digest should exist"
         );
 
-        // 8. Last day (02/03) must NOT have a daily digest.
+        // 8. Last day (02/03) now HAS a daily digest (UTC midnight
+        //    long past when the test runs).
         assert!(
             cat.get_str(&format!("{git_ref}:2025/02/03/digest.human.md"))
-                .is_none(),
-            "last day (02/03) should NOT have a daily digest"
+                .is_some(),
+            "last day (02/03) should have a daily digest"
         );
 
         // 9. Weekly digest for week 1 (01/06-01/12).
@@ -2166,16 +2183,17 @@ mod tests {
             "January should have a monthly AI digest"
         );
 
-        // 12. No weekly/monthly for incomplete periods.
+        // 12. Weekly/monthly for the last period are now generated
+        //     because UTC midnight is long past.
         assert!(
             cat.get_str(&format!("{git_ref}:2025/02/09/digest.weekly.human.md"))
-                .is_none(),
-            "week of 02/03 should NOT have a weekly digest"
+                .is_some(),
+            "week of 02/03 should have a weekly digest"
         );
         assert!(
             cat.get_str(&format!("{git_ref}:2025/02/digest.monthly.human.md"))
-                .is_none(),
-            "February should NOT have a monthly digest"
+                .is_some(),
+            "February should have a monthly digest"
         );
 
         // 13. git fsck --strict: no NUL bytes or object corruption.
