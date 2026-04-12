@@ -980,8 +980,13 @@ pub async fn generate_daily_digest(
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
 
+    // Compute the weekday name so the LLM does not have to guess it.
+    let weekday = crate::date_util::parse_day(day)
+        .map(|d| format!("{}", d.weekday()))
+        .unwrap_or_default();
+
     let mut user_msg = format!(
-        "Date: {day}\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
+        "Date: {day} ({weekday})\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
     );
 
     for activity in threads {
