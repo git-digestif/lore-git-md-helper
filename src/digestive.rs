@@ -1016,7 +1016,10 @@ pub async fn generate_daily_digest(
         .await
         .context("daily digest (AI) failed")?;
 
-    Ok(DayDigestOutput { human, ai })
+    Ok(DayDigestOutput {
+        human: summarize::normalize_headings(&human),
+        ai,
+    })
 }
 
 #[cfg(test)]

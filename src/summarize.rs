@@ -127,6 +127,11 @@ const SECTION_HEADINGS: &[&str] = &[
 ///    a paragraph are promoted to `## …`, splitting off any
 ///    following content in the same paragraph.
 pub fn normalize_headings(md: &str) -> String {
+    // Pre-pass: fix headings with missing space ("##Foo" -> "## Foo").
+    // Process line-by-line so we don't accidentally mangle non-heading
+    // content that happens to start with `#` after a blank line.
+    let md = fix_heading_spaces(md);
+
     let mut paragraphs = md.split("\n\n").peekable();
     let mut out: Vec<String> = Vec::new();
 
@@ -156,10 +161,46 @@ pub fn normalize_headings(md: &str) -> String {
             }
             continue;
         }
+        // Bold line followed by body text on the next line: treat
+        // as a subsection heading (### …).
+        if let Some((label, rest)) = strip_bold(trimmed)
+            && !rest.is_empty()
+        {
+            out.push(format!("### {label}"));
+            out.push(rest.to_string());
+            continue;
+        }
         out.push(part.to_string());
     }
 
     out.join("\n\n")
+}
+
+/// Fix ATX headings that lack the required space after the `#` run.
+/// E.g. `##Notable threads` -> `## Notable threads`.
+fn fix_heading_spaces(md: &str) -> String {
+    let mut result = String::with_capacity(md.len() + 16);
+    for (i, line) in md.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        let hashes = line.bytes().take_while(|&b| b == b'#').count();
+        if hashes >= 1 && hashes <= 6 {
+            let rest = &line[hashes..];
+            if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('#') {
+                result.push_str(&line[..hashes]);
+                result.push(' ');
+                result.push_str(rest);
+                continue;
+            }
+        }
+        result.push_str(line);
+    }
+    // Preserve trailing newline if the original had one.
+    if md.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 /// True if `text` is a short single-line string that looks like a
@@ -403,5 +444,43 @@ mod tests {
     fn normalize_long_first_line_not_promoted() {
         let input = "This is a much longer introductory paragraph that happens to mention January but should not become a heading because it is too long.\n";
         assert_eq!(normalize_headings(input), input);
+    }
+
+    #[test]
+    fn normalize_fixes_missing_space_after_hashes() {
+        let input = "# Good title\n\n##Notable threads\n\nContent\n\n###Sub heading\n\nMore\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("## Notable threads"),
+            "expected space after ##, got: {out}"
+        );
+        assert!(
+            out.contains("### Sub heading"),
+            "expected space after ###, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_bold_topic_to_h3() {
+        let input = "## Notable threads\n\n**fsmonitor approved**  \nPaul's series gets merged.\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("### fsmonitor approved"),
+            "expected ### heading for bold topic, got: {out}"
+        );
+        assert!(
+            out.contains("Paul's series gets merged."),
+            "content should be preserved, got: {out}"
+        );
+    }
+
+    #[test]
+    fn normalize_inline_bold_not_promoted() {
+        let input = "## In brief\n\n**Reftable fix** -- Patrick fixes a bug.\n";
+        let out = normalize_headings(input);
+        assert!(
+            out.contains("**Reftable fix** -- Patrick fixes a bug."),
+            "inline bold should stay as-is, got: {out}"
+        );
     }
 }
