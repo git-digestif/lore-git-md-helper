@@ -185,7 +185,7 @@ fn fix_heading_spaces(md: &str) -> String {
             result.push('\n');
         }
         let hashes = line.bytes().take_while(|&b| b == b'#').count();
-        if hashes >= 1 && hashes <= 6 {
+        if (1..=6).contains(&hashes) {
             let rest = &line[hashes..];
             if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('#') {
                 result.push_str(&line[..hashes]);

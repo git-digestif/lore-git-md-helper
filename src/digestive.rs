@@ -877,11 +877,7 @@ impl<'a> Digestive<'a> {
         // might miss late-arriving emails that belong to the day.
         let cutoff = format_datekey(now - time::Duration::minutes(15));
         let cutoff_day = &cutoff[..10];
-        if state
-            .prev_day
-            .as_deref()
-            .is_some_and(|d| d < cutoff_day)
-        {
+        if state.prev_day.as_deref().is_some_and(|d| d < cutoff_day) {
             self.finalize_day(&mut state, cutoff_day, since).await?;
         }
         self.flush_batch()?;
