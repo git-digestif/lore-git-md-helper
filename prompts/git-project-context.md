@@ -135,15 +135,18 @@ at Microsoft as part of the Office engineering team. He still contributes
 frequently to the Microsoft Git fork but no longer co-owns it. His patches
 often target large-repository performance.
 
-**Eric Sunshine** -- one of the most prolific reviewers on the list. Rarely
-the primary author of large patch series, but consistently sends thorough,
-high-volume review feedback across a wide range of subsystems: test
-infrastructure, CI configuration, worktree handling, documentation, and
-general plumbing. When his review comments appear in a thread, they are
-typically detailed and precise, addressing both correctness and style. His
-review throughput is exceptional -- in 2024 he was among the top three most
-active participants on the list by email count -- and he is one of the people
-most responsible for the quality of what eventually reaches Junio.
+**Eric Sunshine** -- historically one of the most prolific reviewers on the
+list, particularly in 2024 when he was among the top three participants by
+email count. His reviews cover test infrastructure, CI configuration,
+worktree handling, documentation, and general plumbing, and are typically
+detailed and precise. His activity has tapered off in 2025-2026, but when
+his review comments do appear they remain sharp and well-informed.
+
+**SZEDER Gabor** -- low-volume contributor whose reviews punch well above
+their frequency. Known for catching uninitialized variables, raising
+forward-compatibility concerns (notably on the `git history` series), and
+identifying cleanup opportunities in post-approval code. When his name
+appears in a thread, the observation is usually worth paying attention to.
 
 **Justin Tobler** -- active contributor closely involved in the ODB
 abstraction effort alongside Patrick Steinhardt, working on the internal
@@ -158,9 +161,10 @@ tooling correctness. His patches are typically well-motivated improvements
 to infrastructure rather than user-visible features, and he participates
 broadly in review discussions.
 
-**Toon Claes** -- works at GitLab and contributes primarily to the ref
-backends (the effort to make the reference storage backend configurable at
-runtime), `git replay`, and Coccinelle semantic patches for code hygiene.
+**Toon Claes** -- works at GitLab. Previously contributed to the ref
+backends and Coccinelle semantic patches; more recently the author of
+`git last-modified`, an experimental command showing when files were
+last changed.
 
 **Adrian Ratiu** -- focused contributor working on the hook subsystem. His
 main effort is enabling hooks to be specified and configured via Git
@@ -168,12 +172,11 @@ configuration (rather than fixed filesystem paths), including a `git hook
 list` subcommand and related plumbing to support multiple hooks per event.
 
 **Julia Evans** -- well-known technical blogger (jvns.ca, "Wizard Zines") who
-has contributed documentation patches to Git, most notably a multi-iteration
-effort to add an explanation of Git's data model to the official
-documentation. Active in review discussions on documentation and
-user-facing topics. Not a subsystem expert in the traditional sense, but
-brings an unusual clarity-of-explanation perspective that the project
-benefits from.
+contributed documentation patches to Git, most notably a multi-iteration
+effort to add an explanation of Git's data model and a pedagogical rewrite
+of the `git reset` man page (later shepherded to completion by D. Ben
+Knoble). Not a subsystem expert in the traditional sense, but brings an
+unusual clarity-of-explanation perspective that the project benefits from.
 
 **Aditya Garg** -- contributor focused on `git send-email` improvements:
 SMTP server configuration options, IMAP folder integration for archiving
@@ -184,8 +187,13 @@ the `git maintenance` infrastructure, and fetch/push plumbing improvements.
 Works at GitLab on Patrick Steinhardt's team.
 
 **Phillip Wood** -- contributor with deep knowledge of the sequencer
-(interactive rebase), `git add -p`, and worktree handling. His patches are
-typically well-motivated fixes to subtle behavioral issues.
+(interactive rebase), `git add -p`, worktree handling, and the xdiff
+subsystem. One of the most active and thorough reviewers on the list:
+his feedback consistently surfaces subtle correctness issues, from
+control flow regressions to undefined behavior in low-level code. His
+reviews were instrumental in landing several major 2025-2026 efforts
+including the status push-tracking feature, the xdiff Rust-readiness
+refactoring, and the `git replay --revert` series.
 
 **Jean-Noël Avila** -- the French translation maintainer, coordinator of the
 Pro Git book translations, and a significant documentation contributor.
@@ -221,18 +229,33 @@ should not be mistaken for the weight of their arguments.
 **Kristoffer Haugsbakk** -- active documentation contributor, sending frequent
 small patches to improve man pages, cross-references, and wording.
 
+**Paul Tarjan** -- drove the Linux fsmonitor implementation (inotify-based
+daemon) through 14+ iterations to production readiness, bringing Linux to
+parity with the existing Windows and macOS backends. Also contributed fixes
+for promisor-remote recursive fetch issues and fsmonitor memory leaks. His
+patches demonstrate careful attention to edge cases and cross-platform
+concerns.
+
+**Tian Yuchen** -- an emerging reviewer who contributes substantive
+technical feedback across multiple subsystems beyond their own patches.
+Reviews have caught ODB transaction safety issues, overly simplistic
+range checks in `git replay`, and misleading commit message claims. The
+ratio of review replies to original patches is notably high for a newer
+contributor.
+
 **Taylor Blau** -- works at GitHub. A PLC member who has twice stepped in as
 interim maintainer during Junio's absences; when Junio has been away since,
 the role has not been delegated again. His technical focus is the pack
 subsystem: multi-pack-index (MIDX), geometric repacking, cruft packs, and
-pseudo-merge bitmaps. His series in this area tend to be ambitious in scope;
-issues that surface after merging have typically been addressed through
-follow-up work by other contributors rather than by the original author.
-Outside his immediate domain, his reviews tend to be brief and sometimes
-note limited familiarity with the subject at hand. He takes a visible role
-around the annual Git Merge conference and Contributor's Summit, and blogs
-about Git releases on the GitHub blog, with summaries that closely track the
-pack-storage improvements he has contributed.
+pseudo-merge bitmaps. His series tend to be ambitious in scope but
+routinely miss second-order consequences such as backwards compatibility of
+on-disk format changes. Issues that surface after merging have typically
+been addressed through follow-up work by other contributors rather than by
+the original author. Outside his immediate domain, his reviews tend to be
+brief and sometimes note limited familiarity with the subject at hand.
+Historically, when his technical positions have diverged from those of other
+long-standing contributors in the same thread, the eventual project outcome
+has tended to align with the other contributor's view.
 
 **Jiang Xin** -- the Chinese (zh_CN) translation maintainer and contributor
 to l10n infrastructure.
