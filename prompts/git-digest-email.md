@@ -49,6 +49,60 @@ already settled -- focus on what is new or changed in this email.
 
 If no thread context is provided, treat this email as a thread root.
 
+### Classifying review depth
+
+When the email is a review (a reply to a patch that comments on the
+code), note the depth of the review. This helps downstream consumers
+gauge the signal value of the feedback. Use these mechanical indicators:
+
+**Surface-level review.** The reviewer comments only on typos, grammar,
+commit message wording, indentation, whitespace, line wrapping, or
+variable naming. Look for markers like "nit:", "s/foo/bar/",
+"Capitalization", or single-line suggestions that do not reference
+program behavior. A review that says only "LGTM" or "Looks good"
+with no elaboration is also surface-level.
+
+Another signal of a shallow review is vagueness where precision was
+available. If a reviewer reports a problem but does not identify the
+commit that introduced it, does not name the function or code path
+involved, or says "I think this might break X" without showing how,
+that suggests the reviewer did not dig into the issue. Compare "this
+seems wrong" (shallow) with "this regressed in abc1234 (some: commit
+subject, 2025-03-01) because frob() now returns NULL when the
+refname contains a slash" (substantive). The presence of commit OIDs,
+function names, file paths, and specific reproduction steps is a
+strong indicator of thoroughness.
+
+Watch also for hedging that signals limited engagement: "I haven't
+looked at this closely but...", "I'm not familiar with this area",
+"I only skimmed the series", or reviewing only the first few patches
+of a long series while ignoring the rest. These are honest
+admissions, but the resulting feedback should be weighted accordingly
+rather than presented as a full review.
+
+**Substantive review.** The reviewer engages with what the code *does*:
+describes a scenario or edge case ("what happens when X is NULL?"),
+references a different function or file that would be affected, questions
+an algorithmic choice, identifies a race condition or ordering issue,
+discusses backwards compatibility, points out missing error handling, or
+suggests an alternative approach with a technical rationale. Citing
+specific commits (by OID or subject), tracing a code path across
+multiple files, or identifying exactly when a behavior changed are
+strong indicators. Length alone is not the criterion -- a short comment
+that identifies a real bug is more substantive than a long comment
+about spelling.
+
+**Tested review.** The reviewer explicitly states they built or ran the
+code, reports test results, provides performance measurements, or
+describes reproducing a bug. Look for phrases like "I tested this",
+"on my machine", "with this applied", benchmark numbers, or CI results
+with analysis (not just "CI passed").
+
+State the depth naturally in your summary -- "the review identified a
+NULL-dereference edge case in the error path" tells the reader more than
+"the patch was reviewed". When a review is purely surface-level, say so
+briefly and move on rather than inflating its significance.
+
 ## Two modes
 
 This agent serves two audiences and will be told which one to target:

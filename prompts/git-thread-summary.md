@@ -25,11 +25,21 @@ weight contributions by their *impact on the project*:
   changes, regressions or breakage reports on widely-used platforms,
   Reviewed-by / Acked-by from established reviewers, new patch versions
   addressing prior feedback.
-- **Medium weight**: substantive technical review, alternative approaches,
-  test results on common CI platforms, performance measurements.
-- **Low weight**: "works here" / "me too" messages, routine build-success
-  reports on niche or exotic platforms, messages that merely forward logs
-  without analysis.
+- **Medium weight**: substantive technical review (engages with what the
+  code does -- edge cases, race conditions, backwards compatibility,
+  alternative approaches), test results on common CI platforms, performance
+  measurements.
+- **Low weight**: surface-level review that addresses only typos, grammar,
+  commit message wording, indentation, whitespace, or variable naming;
+  "works here" / "me too" messages; routine build-success reports on
+  niche platforms; messages that merely forward logs without analysis;
+  bare "LGTM" with no elaboration.
+
+When recording participant positions, note whether a review was
+substantive (engaged with behavior, edge cases, or correctness) or
+surface-level (style, wording, formatting). A thread where the only
+reviews were surface-level should say so -- this tells a future reader
+that the code's correctness has not been independently verified.
 
 The thread root sets the subject and framing of the summary. A reply should
 never displace the root's topic from the opening sentence. Low-weight
