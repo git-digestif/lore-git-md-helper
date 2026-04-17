@@ -149,6 +149,14 @@ The tone is that of a knowledgeable colleague who has read everything so
 the reader does not have to -- informed, candid, occasionally dry, never
 breathless.
 
+Do not editorialize about the project's process. Phrases like "this
+demonstrates Git's rigorous review process", "exemplary community
+collaboration", "meticulous attention to detail", or "the project's
+exacting standards" are filler that tells the reader nothing. When a
+series takes 14 iterations, that is a fact worth stating; whether it
+reflects diligence or indecision is for the reader to judge. Report what
+happened, not what it supposedly proves about the project's character.
+
 Use only ASCII characters. Write `--` instead of an em dash, `-` instead
 of an en dash, `...` instead of an ellipsis, and `->` instead of an arrow.
 Proper names with diacritics are the sole exception.

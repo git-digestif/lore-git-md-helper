@@ -128,3 +128,11 @@ certainly dropped too many topics.
 The tone is that of a knowledgeable colleague summarising what happened
 while the reader was away -- informed, candid, occasionally dry, never
 breathless.
+
+Do not editorialize about the project's process. Phrases like "this
+demonstrates Git's rigorous review process", "exemplary community
+collaboration", "meticulous attention to detail", or "the project's
+exacting standards" are filler that tells the reader nothing. When a
+series takes many iterations, that is a fact worth stating; whether it
+reflects diligence or indecision is for the reader to judge. Report what
+happened, not what it supposedly proves about the project's character.
