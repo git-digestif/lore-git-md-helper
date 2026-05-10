@@ -418,7 +418,10 @@ async fn chat_api(
             continue;
         }
 
-        if resp.status().is_server_error() || resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        if resp.status().is_server_error()
+            || resp.status() == reqwest::StatusCode::BAD_REQUEST
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+        {
             attempt += 1;
             let status = resp.status();
             if attempt > max_retries {
@@ -603,6 +606,40 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("recovered")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
+        assert_eq!(result, "recovered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_retries_on_404() {
+        // Azure OpenAI deployments occasionally return a transient 404
+        // ("DeploymentNotFound") even when the deployment is healthy and
+        // a probe a moment later succeeds.  Treat 404 the same as a
+        // server error and retry.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
             .up_to_n_times(1)
             .expect(1)
             .mount(&server)
