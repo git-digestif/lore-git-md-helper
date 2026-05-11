@@ -1,25 +1,36 @@
 //! Post-process converter output for the lore-git-md repository.
 //!
-//! Replaces the backtick-quoted Message-ID with a lore.kernel.org link
-//! and inserts (or replaces) a thread link below the header table.
+//! Replaces the backtick-quoted Message-ID with a hyperlink whose host
+//! is configurable (defaulting to the lore.kernel.org/git archive) and
+//! inserts (or replaces) a thread link below the header table.
 
 const THREAD_PREFIX: &str = "**Thread**: ";
 
+/// Default Message-ID URL prefix, pointing at the lore.kernel.org Git
+/// mailing-list archive.  Other public-inbox archives (e.g.
+/// `https://inbox.sourceware.org/cygwin-patches/`) can override this
+/// via the `--message-id-url-prefix` option on `update-lore-git-md`.
+pub const DEFAULT_MESSAGE_ID_URL_PREFIX: &str = "https://lore.kernel.org/git/";
+
 /// Patch the markdown output from `email_to_markdown`:
 ///
-/// 1. Replace `` `<message-id>` `` in the header table with a lore link
+/// 1. Replace `` `<message-id>` `` in the header table with a link
+///    formed by concatenating `url_prefix` and the bare Message-ID
 /// 2. Insert or replace the thread link line after the `---` separator
 ///
 /// `email_dk` is the date-key of the email being patched.
 /// `thread_root_key` is the date-key of the thread root (may be self).
 /// `message_id` is the bare Message-ID (no angle brackets).
+/// `url_prefix` is the URL stem (typically including a trailing slash)
+/// that is concatenated with `message_id` to form the hyperlink target.
 pub fn patch_markdown(
     markdown: &str,
     message_id: &str,
     email_dk: &str,
     thread_root_key: &str,
+    url_prefix: &str,
 ) -> String {
-    let lore_link = format!("[{message_id}](https://lore.kernel.org/git/{message_id})");
+    let lore_link = format!("[{message_id}]({url_prefix}{message_id})");
     let backtick_id = format!("`{message_id}`");
 
     let email_dir = email_dk.rsplit_once('/').map_or("", |(d, _)| d);
@@ -85,6 +96,7 @@ mod tests {
             "20250212041017.91370-1-alice@example.com",
             "2025/02/12/04-10-17",
             "2025/02/12/04-10-17",
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
         );
         assert!(result.contains("[20250212041017.91370-1-alice@example.com](https://lore.kernel.org/git/20250212041017.91370-1-alice@example.com)"));
         assert!(!result.contains("`20250212041017.91370-1-alice@example.com`"));
@@ -97,6 +109,7 @@ mod tests {
             "20250212041017.91370-1-alice@example.com",
             "2025/02/12/04-10-17",
             "2025/02/12/04-10-17",
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
         );
         assert!(result.contains("**Thread**: [thread](04-10-17.thread.md"));
         let idx_sep = result.find("---").unwrap();
@@ -131,6 +144,7 @@ mod tests {
             "20250212041017.91370-1-alice@example.com",
             "2025/02/12/04-10-17",
             "2025/02/12/04-10-17",
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
         );
         // Old thread root should be gone
         assert!(!result.contains("2025/01/01/00-00-00"));
@@ -147,6 +161,7 @@ mod tests {
             "20250212041017.91370-1-alice@example.com",
             "2025/02/12/04-10-17",
             "2025/02/12/04-10-17",
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
         );
         assert!(result.contains("# [PATCH] Fix race condition in ref update\n"));
         assert!(result.contains("| **From** | Alice Developer <alice@example.com> |"));
@@ -160,9 +175,27 @@ mod tests {
             "20250212041017.91370-1-alice@example.com",
             "2025/02/13/10-00-00",
             "2025/02/12/04-10-17",
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
         );
         assert!(result.contains(
             "**Thread**: [thread](../12/04-10-17.thread.md#:~:text=2025/02/13/10-00-00)"
         ));
+    }
+
+    #[test]
+    fn test_url_prefix_override() {
+        let result = patch_markdown(
+            FULL_EMAIL_MD,
+            "20250212041017.91370-1-alice@example.com",
+            "2025/02/12/04-10-17",
+            "2025/02/12/04-10-17",
+            "https://inbox.sourceware.org/cygwin-patches/",
+        );
+        assert!(result.contains("[20250212041017.91370-1-alice@example.com](https://inbox.sourceware.org/cygwin-patches/20250212041017.91370-1-alice@example.com)"));
+        // The default host must not appear when an override is supplied.
+        assert!(
+            !result.contains("lore.kernel.org"),
+            "override should suppress default host: {result}"
+        );
     }
 }

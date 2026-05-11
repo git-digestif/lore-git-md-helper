@@ -39,11 +39,16 @@ pub struct BatchResult {
 /// symlinks) when the batch encounters a thread that already exists.
 /// `target_cat` is a persistent blob reader (typically CatFile) for loading
 /// existing thread files; used for lazy thread root resolution.
+/// `message_id_url_prefix` is the URL stem (typically including a
+/// trailing slash) used to build per-email Message-ID hyperlinks; pass
+/// `lore_link::DEFAULT_MESSAGE_ID_URL_PREFIX` to preserve historical
+/// `https://lore.kernel.org/git/<msgid>` behaviour.
 pub fn process_emails(
     emails: &[SourceEmail],
     map: &mut MsgIdMap,
     existing_keys: &mut HashSet<String>,
     target_cat: &mut impl BlobRead,
+    message_id_url_prefix: &str,
 ) -> BatchResult {
     let parser = MessageParser::default();
     let mut results = Vec::new();
@@ -153,7 +158,7 @@ pub fn process_emails(
             eprintln!("WARN: markdown conversion failed for {msgid}: {e}");
             format!("# Error\n\nFailed to convert email: {e}\n")
         });
-        let md = patch_markdown(&md, &msgid, &dk, &thread_root);
+        let md = patch_markdown(&md, &msgid, &dk, &thread_root, message_id_url_prefix);
 
         results.push(ProcessedEmail {
             date_key: dk,
@@ -174,6 +179,7 @@ pub fn process_emails(
 mod tests {
     use super::*;
     use crate::cat_file::MockBlobs;
+    use crate::lore_link::DEFAULT_MESSAGE_ID_URL_PREFIX;
 
     fn make_email(msgid: &str, date: &str, subject: &str, refs: &str) -> SourceEmail {
         let mut headers = format!(
@@ -208,7 +214,13 @@ mod tests {
         let mut keys = HashSet::new();
         let mut blobs = MockBlobs(std::collections::HashMap::new());
 
-        let result = process_emails(&emails, &mut map, &mut keys, &mut blobs);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut keys,
+            &mut blobs,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
 
         assert_eq!(result.emails.len(), 1);
         assert_eq!(result.skipped, 0);
@@ -237,7 +249,13 @@ mod tests {
         let mut keys = HashSet::new();
         let mut blobs = MockBlobs(std::collections::HashMap::new());
 
-        let result = process_emails(&emails, &mut map, &mut keys, &mut blobs);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut keys,
+            &mut blobs,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
 
         assert_eq!(result.emails.len(), 2);
         let root_dk = &result.emails[0].date_key;
@@ -255,7 +273,13 @@ mod tests {
         let mut keys = HashSet::new();
         let mut blobs = MockBlobs(std::collections::HashMap::new());
 
-        let result = process_emails(&emails, &mut map, &mut keys, &mut blobs);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut keys,
+            &mut blobs,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
 
         assert_eq!(result.emails.len(), 0);
         assert_eq!(result.skipped, 1);
@@ -276,7 +300,13 @@ mod tests {
         let mut keys = HashSet::new();
         let mut blobs = MockBlobs(std::collections::HashMap::new());
 
-        let result = process_emails(&emails, &mut map, &mut keys, &mut blobs);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut keys,
+            &mut blobs,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
 
         assert_eq!(
             result.last_source_commit.as_deref(),

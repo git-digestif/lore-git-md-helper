@@ -1,21 +1,48 @@
 use anyhow::{Result, bail};
+use clap::Parser;
 
 use lore_git_md_helper::batch_import::process_emails;
 use lore_git_md_helper::cat_file::CatFile;
 use lore_git_md_helper::fast_import::FastImport;
 use lore_git_md_helper::git_util::{resolve_ref, source_commit_from_ref};
 use lore_git_md_helper::import_writer::write_fast_import;
+use lore_git_md_helper::lore_link::DEFAULT_MESSAGE_ID_URL_PREFIX;
 use lore_git_md_helper::msgid_map::MsgIdMap;
 use lore_git_md_helper::source_reader::read_source_emails;
 
+/// Convert a public-inbox-style mailing-list archive (one email per
+/// commit, `m` blob) into a markdown mirror with per-email Message-ID
+/// hyperlinks, thread trees, and a `refs/notes/msgid` lookup table.
+#[derive(Parser)]
+#[command(
+    name = "update-lore-git-md",
+    about = "Update a lore-git-md mirror from a public-inbox source repo"
+)]
+struct Args {
+    /// Path to the source public-inbox bare repo (one email per commit).
+    source_repo: String,
+
+    /// Path to the target bare repo that receives the markdown commits.
+    target_repo: String,
+
+    /// Optional commit range to process (default: incremental resume,
+    /// or `HEAD` for a fresh target).
+    range: Option<String>,
+
+    /// URL prefix used to build per-email Message-ID hyperlinks.  The
+    /// bare Message-ID is concatenated verbatim, so the value should
+    /// usually end in `/`.  Default matches the historical
+    /// `https://lore.kernel.org/git/<msgid>` output; override e.g. with
+    /// `https://inbox.sourceware.org/cygwin-patches/` for other
+    /// public-inbox archives.
+    #[arg(long, default_value = DEFAULT_MESSAGE_ID_URL_PREFIX)]
+    message_id_url_prefix: String,
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: update-lore-git-md <source-repo> <target-repo> [range]");
-        std::process::exit(1);
-    }
-    let source_repo = &args[1];
-    let target_repo = &args[2];
+    let args = Args::parse();
+    let source_repo = &args.source_repo;
+    let target_repo = &args.target_repo;
 
     // Verify both repos exist
     let check = |path: &str| -> Result<()> {
@@ -28,7 +55,7 @@ fn main() -> Result<()> {
 
     check_refs_in_sync(target_repo)?;
 
-    let range = if let Some(r) = args.get(3) {
+    let range = if let Some(r) = args.range.as_ref() {
         r.clone()
     } else if let Some(last) = source_commit_from_ref(target_repo, "refs/heads/main") {
         eprintln!("resuming after {last}");
@@ -39,6 +66,7 @@ fn main() -> Result<()> {
 
     eprintln!("source: {source_repo} range: {range}");
     eprintln!("target: {target_repo}");
+    eprintln!("message-id url prefix: {}", args.message_id_url_prefix);
 
     let emails = read_source_emails(source_repo, &range)?;
     eprintln!("{} emails to process", emails.len());
@@ -55,7 +83,13 @@ fn main() -> Result<()> {
     let mut map = MsgIdMap::new(Some(Box::new(notes_cat)));
     let mut target_cat = CatFile::new(target_repo)?;
 
-    let result = process_emails(&emails, &mut map, &mut existing_keys, &mut target_cat);
+    let result = process_emails(
+        &emails,
+        &mut map,
+        &mut existing_keys,
+        &mut target_cat,
+        &args.message_id_url_prefix,
+    );
     eprintln!(
         "{} emails converted, {} skipped, {} threads",
         result.emails.len(),
@@ -210,7 +244,13 @@ mod tests {
         let mut map = MsgIdMap::new(Some(Box::new(notes_cat)));
         let mut target_cat = CatFile::new(target).unwrap();
 
-        let result = process_emails(&emails, &mut map, &mut existing_keys, &mut target_cat);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut existing_keys,
+            &mut target_cat,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
         assert_eq!(result.emails.len(), 1, "should convert one email");
 
         let mut fi = FastImport::new(target, "refs/heads/main").unwrap();
@@ -289,7 +329,13 @@ mod tests {
         let mut map = MsgIdMap::new(Some(Box::new(notes_cat)));
         let mut target_cat = CatFile::new(target).unwrap();
 
-        let result = process_emails(&emails, &mut map, &mut existing_keys, &mut target_cat);
+        let result = process_emails(
+            &emails,
+            &mut map,
+            &mut existing_keys,
+            &mut target_cat,
+            DEFAULT_MESSAGE_ID_URL_PREFIX,
+        );
         assert_eq!(result.emails.len(), 2, "should convert two emails");
 
         let mut fi = FastImport::new(target, "refs/heads/main").unwrap();
