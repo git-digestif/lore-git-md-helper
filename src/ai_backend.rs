@@ -16,7 +16,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
-const DEFAULT_AZURE_MODEL: &str = "DeepSeek-V3-0324";
+const DEFAULT_AZURE_MODEL: &str = "DeepSeek-V4-Flash";
 const MAX_RETRY_WAIT_SECS: u64 = 300;
 
 /// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
@@ -237,7 +237,7 @@ pub struct BackendArgs {
     /// Use Azure OpenAI Service. Optionally pass the endpoint URL
     /// (falls back to AZURE_OPENAI_ENDPOINT env var).
     /// Reads the API key from AZURE_OPENAI_API_KEY.
-    /// Model defaults to DeepSeek-V3-0324; override via --model or
+    /// Model defaults to DeepSeek-V4-Flash; override via --model or
     /// AZURE_OPENAI_MODEL env var.
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
