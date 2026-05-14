@@ -69,16 +69,6 @@ address review feedback without changing the substance. Example:
 > **French translation update** -- Jean-Noël Avila brings the French
 > `.po` file up to date with the latest source strings.
 
-Three rules govern "In brief" strictly. First, a thread that already
-has its own paragraph in "Notable threads" or its own line in "On the
-radar" must not reappear in "In brief", not even as a terse one-line
-restatement; every thread is covered in exactly one section. Second,
-treat a multi-patch series as a single "In brief" item regardless of
-how many patches it contains; do not give individual patches of the
-same series their own bold-prefixed paragraphs. Third, each thread
-appears at most once within "In brief" itself; do not list the same
-topic twice with different framings.
-
 **On the radar.** Optional. Same format as "In brief" -- bold topic,
 ` -- `, one or two sentences. Use this section only when something worth
 tracking is not yet generating traffic today: a series that went quiet and
