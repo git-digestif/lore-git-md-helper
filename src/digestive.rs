@@ -208,6 +208,11 @@ pub struct Digestive<'a> {
     total_processed: u64,
     day_summaries: Vec<(String, String, String)>,
     batch: Vec<SummaryFiles>,
+    /// Wall-clock deadline.  When `Some` and `Instant::now()` has
+    /// passed this value, the streaming loop in `run` stops at the
+    /// next iteration boundary rather than initiating another AI
+    /// call.  Set from the `--max-runtime` CLI argument.
+    deadline: Option<std::time::Instant>,
 }
 
 impl<'a> Digestive<'a> {
@@ -254,7 +259,23 @@ impl<'a> Digestive<'a> {
             total_processed: 0,
             day_summaries: Vec::new(),
             batch: Vec::new(),
+            deadline: None,
         })
+    }
+
+    /// Install a wall-clock deadline.  When `Instant::now()` has
+    /// passed `deadline`, the streaming loop in `run` exits cleanly
+    /// at the next iteration boundary.  The midnight flush at the end
+    /// of `run` is also suppressed in that case, so a partially
+    /// processed day does not get a partial daily digest committed.
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    fn deadline_exceeded(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Summarize a single email: call the AI backend, update caches,
@@ -751,6 +772,15 @@ impl<'a> Digestive<'a> {
         let mut state = LoopState::default();
 
         for path in stdout.lines() {
+            if self.deadline_exceeded() {
+                eprintln!(
+                    "[digestive] --max-runtime exceeded; exiting cleanly \
+                     after summarizing {} email(s)",
+                    self.total_processed,
+                );
+                break;
+            }
+
             let raw_day = match path.get(..10) {
                 Some(d) if path.as_bytes().get(10) == Some(&b'/') => d,
                 _ => continue,
@@ -875,10 +905,17 @@ impl<'a> Digestive<'a> {
         // email import finishes just before midnight but the pipeline
         // starts just after: without the grace period, the snapshot
         // might miss late-arriving emails that belong to the day.
-        let cutoff = format_datekey(now - time::Duration::minutes(15));
-        let cutoff_day = &cutoff[..10];
-        if state.prev_day.as_deref().is_some_and(|d| d < cutoff_day) {
-            self.finalize_day(&mut state, cutoff_day, since).await?;
+        //
+        // Skip this when a deadline forced an early exit: the day in
+        // flight is likely partial, and emitting a digest from it
+        // would commit an incomplete summary that the next run cannot
+        // overwrite (commit_day_digest is gated on absence).
+        if !self.deadline_exceeded() {
+            let cutoff = format_datekey(now - time::Duration::minutes(15));
+            let cutoff_day = &cutoff[..10];
+            if state.prev_day.as_deref().is_some_and(|d| d < cutoff_day) {
+                self.finalize_day(&mut state, cutoff_day, since).await?;
+            }
         }
         self.flush_batch()?;
         self.day_summaries.clear();
@@ -2219,6 +2256,129 @@ mod tests {
         assert_eq!(
             result2.total_processed, 0,
             "all emails should already be summarized on second run"
+        );
+    }
+
+    /// A deadline that has already passed must cause `run` to exit
+    /// before processing any email, leave `total_processed` at zero,
+    /// and skip the midnight flush so that no partial daily digest is
+    /// written.  This is the `--max-runtime 0s` smoke test from the
+    /// soft-deadline finding's acceptance criteria.
+    #[tokio::test]
+    async fn run_skips_all_work_when_deadline_already_passed() {
+        use crate::ai_backend::Backend;
+
+        const E1: &str = "2025/01/06/09-00-00";
+        const E2: &str = "2025/01/06/10-00-00";
+        const E3: &str = "2025/01/07/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+            fi.commit_with_symlinks(
+                "seed",
+                &[
+                    (
+                        &format!("{E1}.md"),
+                        "Subject: A\nFrom: A\nDate: Mon, 6 Jan 2025\n\nbody",
+                    ),
+                    (&format!("{E1}.thread.md"), "# T1"),
+                    (
+                        &format!("{E2}.md"),
+                        "Subject: B\nFrom: B\nDate: Mon, 6 Jan 2025\n\nbody",
+                    ),
+                    (
+                        &format!("{E3}.md"),
+                        "Subject: C\nFrom: C\nDate: Tue, 7 Jan 2025\n\nbody",
+                    ),
+                    (&format!("{E3}.thread.md"), "# T2"),
+                ],
+                &[(&format!("{E2}.thread.md"), "09-00-00.thread.md")],
+                &[],
+            )
+            .unwrap();
+            fi.finish().unwrap();
+        }
+
+        let backend = Backend::Mock { nth_word: 3 };
+        let mut d = Digestive::new(repo, git_ref, 5, Some(&backend), false).unwrap();
+        d = d.with_deadline(std::time::Instant::now());
+        d.run(None, None).await.unwrap();
+        let result = d.finish().unwrap();
+
+        assert_eq!(
+            result.total_processed, 0,
+            "no emails should be summarized when deadline is already past",
+        );
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert!(
+            cat.get_str(&format!("{git_ref}:{E1}.ai.md")).is_none(),
+            "E1 must not have been summarized"
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/06/digest.human.md"))
+                .is_none(),
+            "no daily digest should be written: midnight flush must be \
+             suppressed when the deadline forced an early exit",
+        );
+        assert!(
+            cat.get_str(&format!("{git_ref}:2025/01/07/digest.human.md"))
+                .is_none(),
+            "no daily digest should be written for the partially processed day",
+        );
+    }
+
+    /// A deadline far in the future is a no-op: the pipeline must
+    /// behave identically to a run with no deadline set.  This is the
+    /// `--max-runtime <large>` acceptance criterion: opting in to the
+    /// feature does not change behavior when the deadline does not
+    /// fire.
+    #[tokio::test]
+    async fn run_with_distant_deadline_processes_all_emails() {
+        use crate::ai_backend::Backend;
+
+        const E1: &str = "2025/01/06/09-00-00";
+        const E2: &str = "2025/01/06/10-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+            fi.commit_with_symlinks(
+                "seed",
+                &[
+                    (
+                        &format!("{E1}.md"),
+                        "Subject: A\nFrom: A\nDate: Mon, 6 Jan 2025\n\nbody",
+                    ),
+                    (&format!("{E1}.thread.md"), "# T1"),
+                    (
+                        &format!("{E2}.md"),
+                        "Subject: B\nFrom: B\nDate: Mon, 6 Jan 2025\n\nbody",
+                    ),
+                ],
+                &[(&format!("{E2}.thread.md"), "09-00-00.thread.md")],
+                &[],
+            )
+            .unwrap();
+            fi.finish().unwrap();
+        }
+
+        let backend = Backend::Mock { nth_word: 3 };
+        let mut d = Digestive::new(repo, git_ref, 5, Some(&backend), false).unwrap();
+        d = d.with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        d.run(None, None).await.unwrap();
+        let result = d.finish().unwrap();
+
+        assert_eq!(
+            result.total_processed, 2,
+            "both emails should be summarized when deadline is far in the future",
         );
     }
 }

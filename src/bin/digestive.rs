@@ -32,6 +32,16 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
+    /// Soft deadline for the wall-clock runtime, parsed in humantime
+    /// format (e.g. "50m", "1h30m").  When the deadline is reached
+    /// during the email-summarization loop, `digestive` finishes the
+    /// current iteration, flushes its work, prints a clear notice,
+    /// and exits with status 0.  Intended for hourly workflows that
+    /// want to bound a single run and let the next scheduled run
+    /// resume from the last committed state.
+    #[arg(long)]
+    max_runtime: Option<humantime::Duration>,
+
     #[command(flatten)]
     backend: BackendArgs,
 }
@@ -59,6 +69,16 @@ async fn main() -> Result<()> {
         backend.as_ref(),
         args.dry_run,
     )?;
+
+    if let Some(duration) = args.max_runtime {
+        let duration: std::time::Duration = duration.into();
+        let deadline = std::time::Instant::now() + duration;
+        eprintln!(
+            "[digestive] --max-runtime {} set; will exit cleanly when reached",
+            humantime::format_duration(duration),
+        );
+        d = d.with_deadline(deadline);
+    }
 
     d.run(since.as_deref(), args.until.as_deref()).await?;
     let result = d.finish()?;
