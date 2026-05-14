@@ -421,6 +421,7 @@ async fn chat_api(
         if resp.status().is_server_error()
             || resp.status() == reqwest::StatusCode::BAD_REQUEST
             || resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::REQUEST_TIMEOUT
         {
             attempt += 1;
             let status = resp.status();
@@ -640,6 +641,41 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("recovered")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
+        assert_eq!(result, "recovered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_retries_on_408() {
+        // Azure OpenAI Chat Completions occasionally returns a transient
+        // 408 Request Timeout when the server gives up waiting for or
+        // producing the response.  A single retry typically succeeds;
+        // surfacing it as a hard failure aborts long pipeline runs over
+        // pure infrastructure flakes.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(408))
             .up_to_n_times(1)
             .expect(1)
             .mount(&server)
