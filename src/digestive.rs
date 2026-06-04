@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 
-use crate::ai_backend::Backend;
+use crate::ai_backend::{self, Backend};
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
 use crate::date_util::{add_days, iso_sunday, month_of};
@@ -136,7 +136,23 @@ pub async fn summarize_one(
         label.unwrap_or("summarizing"),
         email.dk
     );
-    let result = summarize::summarize_email(&ctx, backend).await?;
+    let result = match summarize::summarize_email(&ctx, backend).await {
+        Ok(r) => r,
+        Err(e) if ai_backend::is_no_choices(&e) => {
+            // The backend accepted the request but returned no
+            // choices (e.g. the prompt exceeded the model context
+            // window or tripped a content filter).  Skip this one
+            // email rather than aborting the whole pipeline run; the
+            // diagnostic chain printed below preserves the body
+            // snippet so a later run or human can investigate.
+            eprintln!(
+                "[warn] {}.md: backend returned no choices, skipping ({:#})",
+                email.dk, e
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(Some(SummaryFiles {
         dk: email.dk.clone(),
@@ -1075,6 +1091,30 @@ mod tests {
         };
         let ctx = load_email_context(&email, &mut blobs, "main");
         assert!(ctx.is_none(), "missing email should return None");
+    }
+
+    #[tokio::test]
+    async fn summarize_one_soft_skips_on_no_choices() {
+        // Simulate the failure mode observed against the Azure
+        // OpenAI gateway for oversized prompts: the backend returns
+        // HTTP 200 with `choices: []`, which `summarize_email`
+        // surfaces as a `NoChoicesError`.  `summarize_one` must
+        // treat this as a soft skip (Ok(None)) rather than
+        // propagating an error that would abort the pipeline.
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert("main:2025/01/06/10-00-00.md".into(), "email body".into());
+        let email = EmailToSummarize {
+            dk: "2025/01/06/10-00-00".into(),
+            root_dk: "2025/01/06/10-00-00".into(),
+            parent_dk: None,
+        };
+        let backend = Backend::MockNoChoices;
+        let result = summarize_one(&email, &mut blobs, &backend, "main", None)
+            .await
+            .expect("no-choices must be a soft skip, not a hard error");
+        assert!(result.is_none(), "expected Ok(None) on no-choices skip");
     }
 
     #[test]

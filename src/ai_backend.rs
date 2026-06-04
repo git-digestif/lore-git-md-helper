@@ -24,6 +24,40 @@ fn retry_backoff_secs(attempt: u32) -> u64 {
     std::cmp::min(10u64 << (attempt - 1), 120)
 }
 
+/// Returned when the chat API responds with HTTP 200 but no
+/// `choices`.  Azure OpenAI deployments do this when, for example,
+/// the prompt exceeds the model's context window, or a content
+/// filter trips on input that the gateway accepted without an
+/// explicit 400.  Callers can walk the `anyhow::Error::chain()` and
+/// downcast to this type via `is_no_choices()` to recognize the
+/// condition and recover (typically by skipping the offending item)
+/// rather than treating it as a fatal abort.
+#[derive(Debug)]
+pub struct NoChoicesError {
+    pub body_snippet: String,
+}
+
+impl std::fmt::Display for NoChoicesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no choices in API response; body snippet: {}",
+            self.body_snippet
+        )
+    }
+}
+
+impl std::error::Error for NoChoicesError {}
+
+/// Return `true` if `err` (or any error in its source chain) is a
+/// `NoChoicesError`.  Use this in callers that want to convert the
+/// "no choices" failure mode into a soft skip while still propagating
+/// every other failure.
+pub fn is_no_choices(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<NoChoicesError>().is_some())
+}
+
 /// Tracks rate limit state reported by the API via `x-ratelimit-*` headers.
 pub struct RateLimitState {
     pub remaining_requests: Option<u64>,
@@ -81,6 +115,11 @@ pub enum Backend {
     /// the user message (default: every 5th word).
     #[cfg(test)]
     Mock { nth_word: usize },
+    /// Mock that always fails with `NoChoicesError`, simulating an
+    /// API response with `choices: []` (e.g. when the prompt exceeds
+    /// the model context window).
+    #[cfg(test)]
+    MockNoChoices,
 }
 
 impl Backend {
@@ -207,6 +246,10 @@ impl Backend {
             }
             #[cfg(test)]
             Backend::Mock { nth_word } => Ok(mock_summarize(user, *nth_word)),
+            #[cfg(test)]
+            Backend::MockNoChoices => Err(anyhow::Error::new(NoChoicesError {
+                body_snippet: r#"{"choices": []}"#.to_string(),
+            })),
         }
     }
 }
@@ -475,10 +518,11 @@ async fn chat_api(
         })?;
         let content = match parsed.choices.into_iter().next() {
             Some(c) => c.message.content,
-            None => anyhow::bail!(
-                "no choices in API response; body snippet: {}",
-                &body[..body.len().min(500)]
-            ),
+            None => {
+                return Err(anyhow::Error::new(NoChoicesError {
+                    body_snippet: body[..body.len().min(500)].to_string(),
+                }));
+            }
         };
 
         if content.trim().is_empty() {
@@ -820,5 +864,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "three six");
+    }
+
+    #[tokio::test]
+    async fn chat_api_returns_no_choices_error_on_empty_choices() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"{"choices": [], "usage": {"prompt_tokens": 200000}}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        assert!(
+            is_no_choices(&err),
+            "expected NoChoicesError, got: {err:#}"
+        );
+        let nc = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<NoChoicesError>())
+            .expect("downcast NoChoicesError");
+        assert!(
+            nc.body_snippet.contains("prompt_tokens"),
+            "body snippet should preserve response body: {}",
+            nc.body_snippet
+        );
+    }
+
+    #[test]
+    fn is_no_choices_walks_anyhow_context_chain() {
+        // Simulate what summarize::summarize_email does: wrap the
+        // backend error with a context that does not mention "no
+        // choices".  The detector must still find the leaf type.
+        let leaf = anyhow::Error::new(NoChoicesError {
+            body_snippet: "{}".to_string(),
+        });
+        let wrapped = leaf.context("human summary failed");
+        assert!(is_no_choices(&wrapped));
+    }
+
+    #[test]
+    fn is_no_choices_returns_false_for_unrelated_errors() {
+        let err = anyhow::anyhow!("API returned error status");
+        assert!(!is_no_choices(&err));
+    }
+
+    #[tokio::test]
+    async fn mock_no_choices_backend_produces_no_choices_error() {
+        let backend = Backend::MockNoChoices;
+        let err = backend.chat("sys", "usr").await.unwrap_err();
+        assert!(is_no_choices(&err), "expected NoChoicesError, got: {err:#}");
     }
 }
