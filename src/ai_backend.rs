@@ -473,12 +473,13 @@ async fn chat_api(
                 &body[..body.len().min(200)]
             )
         })?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .context("no choices in API response")?;
+        let content = match parsed.choices.into_iter().next() {
+            Some(c) => c.message.content,
+            None => anyhow::bail!(
+                "no choices in API response; body snippet: {}",
+                &body[..body.len().min(500)]
+            ),
+        };
 
         if content.trim().is_empty() {
             attempt += 1;
