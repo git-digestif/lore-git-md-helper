@@ -24,6 +24,27 @@ fn retry_backoff_secs(attempt: u32) -> u64 {
     std::cmp::min(10u64 << (attempt - 1), 120)
 }
 
+/// Return `true` if the `AI_BACKEND_DUMP_HTTP` env var is set to `1`.
+/// When enabled, `chat_api` emits full HTTP response diagnostics
+/// (status, every header, full body) to stderr.  This is a
+/// diagnostic-only knob meant to be toggled per-invocation by tools
+/// like `test-prompt --dump-http`; production runs never set it.
+fn dump_http_enabled() -> bool {
+    matches!(std::env::var("AI_BACKEND_DUMP_HTTP").as_deref(), Ok("1"))
+}
+
+/// Dump status code and every response header to stderr.  Header
+/// values that are not UTF-8 are rendered as `<non-utf8>` rather
+/// than skipped, so the dump is faithful even for binary header
+/// values that no production server should ever send.
+fn dump_response_meta(response: &reqwest::Response) {
+    eprintln!("[dump-http] response status: {}", response.status());
+    for (name, value) in response.headers().iter() {
+        let v = value.to_str().unwrap_or("<non-utf8>");
+        eprintln!("[dump-http] response header: {name}: {v}");
+    }
+}
+
 /// Returned when the chat API responds with HTTP 200 but no
 /// `choices`.  Azure OpenAI deployments do this when, for example,
 /// the prompt exceeds the model's context window, or a content
@@ -484,6 +505,10 @@ async fn chat_api(
             .error_for_status()
             .context("API returned error status")?;
 
+        if dump_http_enabled() {
+            dump_response_meta(&response);
+        }
+
         // Update rate limit state from response headers when available.
         if let Some(rl) = ep.rate_limits {
             let mut state = rl.lock().expect("rate limit lock poisoned");
@@ -510,6 +535,9 @@ async fn chat_api(
             .text()
             .await
             .context("failed to read API response body")?;
+        if dump_http_enabled() {
+            eprintln!("[dump-http] response body ({} bytes):\n{body}", body.len());
+        }
         let parsed: ChatResponse = serde_json::from_str(&body).with_context(|| {
             format!(
                 "failed to parse API response: {}",
@@ -886,10 +914,7 @@ mod tests {
             rate_limits: None,
         };
         let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
-        assert!(
-            is_no_choices(&err),
-            "expected NoChoicesError, got: {err:#}"
-        );
+        assert!(is_no_choices(&err), "expected NoChoicesError, got: {err:#}");
         let nc = err
             .chain()
             .find_map(|c| c.downcast_ref::<NoChoicesError>())

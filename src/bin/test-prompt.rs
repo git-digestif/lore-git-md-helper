@@ -16,6 +16,14 @@ struct Args {
     #[arg(long, short)]
     temperature: Option<f32>,
 
+    /// Dump full HTTP response diagnostics (status, headers, body)
+    /// to stderr.  Useful for triaging gateway-side failures such
+    /// as "no choices" where the visible error tells you little
+    /// about the underlying cause.  Implemented by setting the
+    /// `AI_BACKEND_DUMP_HTTP=1` env var that `chat_api` reads.
+    #[arg(long)]
+    dump_http: bool,
+
     #[command(flatten)]
     backend: BackendArgs,
 }
@@ -31,6 +39,14 @@ fn read_arg(s: &str) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.dump_http {
+        // SAFETY: single-threaded at this point (tokio runtime has
+        // not yet spawned anything that reads env vars).
+        unsafe {
+            std::env::set_var("AI_BACKEND_DUMP_HTTP", "1");
+        }
+    }
 
     let backend = args.backend.resolve()?;
 
