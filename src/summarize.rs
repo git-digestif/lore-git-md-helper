@@ -6,6 +6,22 @@ const EMAIL_AGENT: &str = include_str!("../prompts/git-digest-email.md");
 const THREAD_AGENT: &str = include_str!("../prompts/git-thread-summary.md");
 const PROJECT_CONTEXT: &str = include_str!("../prompts/git-project-context.md");
 
+/// Maximum bytes of email Markdown to include in a summarization
+/// prompt.  Picked to keep total prompt tokens well under the
+/// default `DeepSeek-V3-0324` 128 k context window: 100 kB of email
+/// body is roughly 25 k tokens, plus ~8 k for the system prompt and
+/// a few k for thread/parent context = ~35-40 k total, comfortably
+/// under the window.
+///
+/// Observed in practice on 2026-06-04: an 803 KB `[PATCH 6/6]` (a
+/// mechanical sweep converting ~2800 bare `grep` calls to
+/// `test_grep`) caused Azure OpenAI to return HTTP 200 with
+/// `choices: []`, silently failing after charging ~221 k prompt
+/// tokens against the 250 k-per-minute budget.  `x-ms-rai-invoked`
+/// was `false` so this is a context-window overflow, not content
+/// filtering.
+pub const EMAIL_MD_BUDGET: usize = 100_000;
+
 pub struct EmailContext {
     pub email_md: String,
     pub thread_ai_summary: Option<String>,
@@ -24,10 +40,88 @@ pub fn email_system_prompt() -> String {
     format!("{EMAIL_AGENT}\n\n{PROJECT_CONTEXT}")
 }
 
+/// If `s` exceeds `budget` bytes, return a truncated version that
+/// keeps the header table, cover-letter prose, diffstat, and as
+/// many whole `diff --git` file hunks as fit, followed by a
+/// truncation marker.  Returns `None` if `s` already fits.
+///
+/// The cut is at the last `diff --git ` line whose start offset is
+/// within `budget` when at least one such line fits, so we never
+/// split a file diff in two; otherwise the cut is at the last
+/// newline before `budget` so we never split any line.  Any fenced
+/// code block left open by the cut is closed with a trailing
+/// ```` ``` ```` so the prompt remains well-formed Markdown.
+pub(crate) fn truncate_email_md(s: &str, budget: usize) -> Option<String> {
+    if s.len() <= budget {
+        return None;
+    }
+
+    // Walk every "\ndiff --git " boundary; record the last one whose
+    // start offset still fits within `budget`.  Each boundary
+    // represents the start of a file diff, so the count of boundaries
+    // we passed equals the number of file diffs *plus one* (the one
+    // we will not keep because it sits at or after the cut point).
+    let needle = "\ndiff --git ";
+    let mut cut_at: Option<usize> = None;
+    let mut boundaries_seen: usize = 0;
+    let mut search_from = 0;
+    while let Some(off) = s[search_from..].find(needle) {
+        let abs_line = search_from + off + 1;
+        if abs_line > budget {
+            break;
+        }
+        cut_at = Some(abs_line);
+        boundaries_seen += 1;
+        search_from = abs_line + needle.len() - 1;
+    }
+    let hunks_kept = boundaries_seen.saturating_sub(1);
+
+    let cut_at = match cut_at {
+        Some(pos) => pos,
+        None => {
+            // No "diff --git" boundary fits.  Cut at the last
+            // newline before `budget` so we never split a line.
+            s[..budget.min(s.len())]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        }
+    };
+
+    let mut truncated = s[..cut_at].to_string();
+    while truncated.ends_with('\n') {
+        truncated.pop();
+    }
+
+    // Balance fences: an odd number of lines starting with ``` means
+    // we cut inside an open code block; close it so the Markdown
+    // around the truncation marker stays well-formed.
+    let fence_lines = truncated
+        .split('\n')
+        .filter(|l| l.starts_with("```"))
+        .count();
+    if fence_lines % 2 == 1 {
+        truncated.push_str("\n```");
+    }
+
+    let original_lines = s.lines().count();
+    truncated.push_str(&format!(
+        "\n\n*[Email body truncated for summarization: original was \
+         {} bytes / {} lines; only the header, cover letter, diffstat, \
+         and the first {} file diff(s) are shown.]*\n",
+        s.len(),
+        original_lines,
+        hunks_kept,
+    ));
+    Some(truncated)
+}
+
 /// Build the user message for email summarization.
 ///
 /// Assembles the thread context, parent context, and email body into
-/// the format expected by the email digest prompt.
+/// the format expected by the email digest prompt.  The email body
+/// is truncated to `EMAIL_MD_BUDGET` if it exceeds it, so that the
+/// total prompt fits comfortably in the model's context window.
 pub fn email_user_message(ctx: &EmailContext, mode: &str) -> String {
     let mut msg = format!("Mode: {mode}\n\n");
     if let Some(thread) = &ctx.thread_ai_summary {
@@ -41,7 +135,19 @@ pub fn email_user_message(ctx: &EmailContext, mode: &str) -> String {
         msg.push_str("\n\n---\n\n");
     }
     msg.push_str("Email:\n\n");
-    msg.push_str(&ctx.email_md);
+    match truncate_email_md(&ctx.email_md, EMAIL_MD_BUDGET) {
+        Some(t) => {
+            eprintln!(
+                "[summarize] email body truncated from {} to {} bytes \
+                 for prompt (budget {} bytes)",
+                ctx.email_md.len(),
+                t.len(),
+                EMAIL_MD_BUDGET,
+            );
+            msg.push_str(&t);
+        }
+        None => msg.push_str(&ctx.email_md),
+    }
     msg
 }
 
@@ -356,6 +462,108 @@ mod tests {
             "expected ## heading, got: {out}"
         );
         assert!(!out.contains("**Notable threads**"));
+    }
+
+    #[test]
+    fn truncate_under_budget_returns_none() {
+        let s = "short body";
+        assert!(truncate_email_md(s, 100).is_none());
+    }
+
+    #[test]
+    fn truncate_cuts_at_diff_git_boundary() {
+        let head = "# Subject\n\n| Header | Value |\n|---|---|\n| **From** | A |\n\n---\n\nCover.\n\n```\n stats\n```\n\n```diff\n";
+        let f1 = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let f2 = "diff --git a/y b/y\n@@ -1 +1 @@\n-old\n+new\n";
+        let f3 = "diff --git a/zzz b/zzz\n@@ -1 +1 @@\n-old\n+new\n";
+        let s = format!("{head}{f1}{f2}{f3}```\n");
+        // Budget set so that the boundary search records f3 as a fit
+        // but cuts content right at its start, keeping f1 and f2 in
+        // full but dropping f3.
+        let budget = s.find("diff --git a/zzz").unwrap();
+        let out = truncate_email_md(&s, budget).expect("should truncate");
+        assert!(out.contains("a/x"));
+        assert!(out.contains("a/y"));
+        assert!(!out.contains("a/zzz"), "third file diff must be dropped");
+        assert!(out.contains("first 2 file diff(s)"));
+        assert!(
+            out.matches("```").count().is_multiple_of(2),
+            "fences must be balanced: {out}"
+        );
+    }
+
+    #[test]
+    fn truncate_cover_letter_only_falls_back_to_newline_cut() {
+        let line = "This is a long cover letter line that repeats.\n";
+        let s = line.repeat(50);
+        let budget = 200;
+        let out = truncate_email_md(&s, budget).expect("should truncate");
+        assert!(out.contains("truncated for summarization"));
+        assert!(out.contains("first 0 file diff(s)"));
+        // The truncated content should end on a line boundary (never
+        // split a line in two), and be under the original size.
+        assert!(out.len() < s.len());
+        let body_before_marker = out
+            .split_once("\n\n*[Email body truncated")
+            .map(|(b, _)| b)
+            .unwrap_or(&out);
+        assert!(
+            body_before_marker.lines().all(|l| line.trim_end() == l),
+            "every retained line should be intact: {body_before_marker:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_closes_open_fence() {
+        // The cut lands inside an open ```diff block: the function
+        // must append a closing ``` so the prompt stays well-formed.
+        let head = "Pre\n\n```diff\n";
+        let f1 = "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let f2 = "diff --git a/y b/y\n@@ -1 +1 @@\n-old\n+new\n";
+        let s = format!("{head}{f1}{f2}```\n");
+        let budget = s.find("diff --git a/y").unwrap() - 1;
+        let out = truncate_email_md(&s, budget).expect("should truncate");
+        assert!(
+            out.matches("```").count().is_multiple_of(2),
+            "fences must balance after truncation: {out}"
+        );
+        // The closing fence must sit between the kept diff content
+        // and the truncation marker, not after the marker.
+        let close_pos = out.rfind("```").expect("closing fence present");
+        let marker_pos = out
+            .find("\n\n*[Email body truncated")
+            .expect("marker present");
+        assert!(
+            close_pos < marker_pos,
+            "closing fence must come before marker: {out}"
+        );
+    }
+
+    #[test]
+    fn email_user_message_truncates_oversized_body() {
+        let line = "diff --git a/file b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let big = line.repeat(5000);
+        assert!(
+            big.len() > EMAIL_MD_BUDGET,
+            "sanity: test setup must exceed budget"
+        );
+        let ctx = EmailContext {
+            email_md: big,
+            thread_ai_summary: None,
+            parent_ai_summary: None,
+        };
+        let msg = email_user_message(&ctx, "human");
+        assert!(
+            msg.contains("Email body truncated for summarization"),
+            "expected truncation marker"
+        );
+        // The assembled prompt body should not exceed the budget by more
+        // than a small constant (mode header + marker).
+        assert!(
+            msg.len() < EMAIL_MD_BUDGET + 4096,
+            "assembled message {} bytes should be ~budget, not full size",
+            msg.len()
+        );
     }
 
     #[test]
