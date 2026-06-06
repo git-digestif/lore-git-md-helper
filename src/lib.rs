@@ -16,6 +16,7 @@ pub mod thread;
 pub mod thread_file;
 
 pub mod ai_backend;
+pub mod date_range;
 pub mod date_util;
 pub mod digestive;
 pub mod fast_import;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use regex::Regex;
 use rusqlite::Connection;
+use rusqlite::types::Value;
 use std::sync::OnceLock;
 
 pub struct EmailResult {
@@ -12,8 +13,30 @@ pub struct EmailResult {
     pub body: String,
 }
 
-/// Retrieve up to `limit` emails matching `query` using FTS5 BM25 ranking.
-pub fn retrieve(conn: &Connection, query: &str, limit: usize) -> Result<Vec<EmailResult>> {
+/// Optional lexicographic bounds on `emails.path` used to restrict
+/// retrieval to a date range.  Both bounds are formatted as
+/// `YYYY/MM/DD` (see [`crate::date_range`]); `since` is inclusive
+/// and `until_excl` is exclusive.
+#[derive(Default, Debug, Clone)]
+pub struct DateBounds {
+    pub since: Option<String>,
+    pub until_excl: Option<String>,
+}
+
+impl DateBounds {
+    pub fn is_empty(&self) -> bool {
+        self.since.is_none() && self.until_excl.is_none()
+    }
+}
+
+/// Retrieve up to `limit` emails matching `query` using FTS5 BM25 ranking,
+/// optionally restricted to a date range.
+pub fn retrieve(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    bounds: &DateBounds,
+) -> Result<Vec<EmailResult>> {
     static RE_WORD: OnceLock<Regex> = OnceLock::new();
     let re = RE_WORD.get_or_init(|| Regex::new(r"\w{2,}").unwrap());
 
@@ -28,16 +51,26 @@ pub fn retrieve(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Emai
         return Ok(vec![]);
     }
 
-    let mut stmt = conn.prepare(
+    let mut sql = String::from(
         "SELECT e.path, e.subject, e.author, e.date, e.message_id, e.body
          FROM emails_fts f
          JOIN emails e ON e.id = f.rowid
-         WHERE emails_fts MATCH ?1
-         ORDER BY f.rank
-         LIMIT ?2",
-    )?;
+         WHERE emails_fts MATCH ?1",
+    );
+    let mut params: Vec<Value> = vec![Value::Text(fts_query)];
+    if let Some(s) = &bounds.since {
+        params.push(Value::Text(s.clone()));
+        sql.push_str(&format!(" AND e.path >= ?{}", params.len()));
+    }
+    if let Some(u) = &bounds.until_excl {
+        params.push(Value::Text(u.clone()));
+        sql.push_str(&format!(" AND e.path < ?{}", params.len()));
+    }
+    params.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(" ORDER BY f.rank LIMIT ?{}", params.len()));
 
-    let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
         Ok(EmailResult {
             path: row.get(0)?,
             subject: row.get(1).unwrap_or_default(),
@@ -105,7 +138,7 @@ mod tests {
     #[test]
     fn retrieve_empty_query_returns_nothing() {
         let conn = setup_db();
-        let results = retrieve(&conn, "", 10).unwrap();
+        let results = retrieve(&conn, "", 10, &DateBounds::default()).unwrap();
         assert!(results.is_empty());
     }
 
@@ -119,7 +152,7 @@ mod tests {
             "# Subject\n\n| Header | Value |\n|--|--|\n| **From** | alice |\n\n---\n\nHello world.\n",
         )
         .unwrap();
-        let results = retrieve(&conn, "nonexistent-xyzzy", 10).unwrap();
+        let results = retrieve(&conn, "nonexistent-xyzzy", 10, &DateBounds::default()).unwrap();
         assert!(results.is_empty());
     }
 
@@ -133,9 +166,59 @@ mod tests {
             "# Rebase improvements\n\n| Header | Value |\n|--|--|\n| **From** | alice |\n\n---\n\nDiscussing interactive rebase.\n",
         )
         .unwrap();
-        let results = retrieve(&conn, "interactive rebase", 10).unwrap();
+        let results =
+            retrieve(&conn, "interactive rebase", 10, &DateBounds::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].subject.contains("Rebase"));
+    }
+
+    #[test]
+    fn retrieve_respects_date_bounds() {
+        let conn = setup_db();
+        for path in [
+            "2021/03/15/10-00-00.md",
+            "2021/07/15/10-00-00.md",
+            "2021/12/15/10-00-00.md",
+            "2022/02/15/10-00-00.md",
+        ] {
+            crate::rag_ingest::ingest_str(
+                &conn,
+                path,
+                "sha",
+                "# Rebase topic\n\n| Header | Value |\n|--|--|\n| **From** | alice |\n\n---\n\nrebase content.\n",
+            )
+            .unwrap();
+        }
+        let bounds = DateBounds {
+            since: Some("2021/07/01".into()),
+            until_excl: Some("2022/01/01".into()),
+        };
+        let results = retrieve(&conn, "rebase", 10, &bounds).unwrap();
+        let paths: Vec<_> = results.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"2021/07/15/10-00-00.md"));
+        assert!(paths.contains(&"2021/12/15/10-00-00.md"));
+    }
+
+    #[test]
+    fn retrieve_with_only_since_bound() {
+        let conn = setup_db();
+        for path in ["2021/03/15/10-00-00.md", "2025/03/15/10-00-00.md"] {
+            crate::rag_ingest::ingest_str(
+                &conn,
+                path,
+                "sha",
+                "# Rebase\n\n| Header | Value |\n|--|--|\n| **From** | alice |\n\n---\n\nrebase.\n",
+            )
+            .unwrap();
+        }
+        let bounds = DateBounds {
+            since: Some("2024/01/01".into()),
+            until_excl: None,
+        };
+        let results = retrieve(&conn, "rebase", 10, &bounds).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "2025/03/15/10-00-00.md");
     }
 
     #[test]

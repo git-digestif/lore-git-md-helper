@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use lore_git_md_helper::{ai_backend::BackendArgs, rag_db, rag_ingest, rag_query};
+use lore_git_md_helper::{
+    ai_backend::BackendArgs, date_range, rag_db, rag_ingest, rag_query,
+};
 
 /// RAG over the Git mailing list archive.
 #[derive(Parser)]
@@ -49,6 +51,23 @@ struct QueryArgs {
     /// Print the assembled prompt instead of sending it to a model.
     #[arg(long)]
     print_prompt: bool,
+
+    /// Restrict the search to emails on or after this date.
+    ///
+    /// Accepts `YYYY`, `YYYY-MM`, `YYYY-MM-DD` (with `-` or `/`
+    /// separators), a duration ago (`2w`, `3d`, `1month`, `2years`),
+    /// or one of `today`, `now`, `yesterday`.
+    #[arg(long, value_name = "DATE")]
+    since: Option<String>,
+
+    /// Restrict the search to emails on or before this date.
+    /// Accepts the same forms as `--since`.
+    #[arg(long, value_name = "DATE")]
+    until: Option<String>,
+
+    /// Shorthand for `--since <DURATION>`.  Conflicts with `--since`.
+    #[arg(long, value_name = "DURATION", conflicts_with = "since")]
+    last: Option<String>,
 
     #[command(flatten)]
     backend: BackendArgs,
@@ -113,7 +132,34 @@ async fn main() -> Result<()> {
             let conn = rag_db::open(args.db.to_str().unwrap())?;
             let question = args.question.join(" ");
 
-            let results = rag_query::retrieve(&conn, &question, args.top_k)?;
+            let since_spec = args.last.as_deref().or(args.since.as_deref());
+            let bounds = rag_query::DateBounds {
+                since: since_spec.map(date_range::parse_lower_bound).transpose()?,
+                until_excl: args
+                    .until
+                    .as_deref()
+                    .map(date_range::parse_upper_bound_exclusive)
+                    .transpose()?,
+            };
+            if let (Some(s), Some(u)) = (&bounds.since, &bounds.until_excl)
+                && s >= u
+            {
+                anyhow::bail!(
+                    "--since `{since}` (resolves to {s}) is not before --until `{until}` \
+                     (resolves to exclusive {u})",
+                    since = since_spec.unwrap(),
+                    until = args.until.as_deref().unwrap(),
+                );
+            }
+            if !bounds.is_empty() {
+                eprintln!(
+                    "date filter: [{}, {})",
+                    bounds.since.as_deref().unwrap_or("-infinity"),
+                    bounds.until_excl.as_deref().unwrap_or("+infinity"),
+                );
+            }
+
+            let results = rag_query::retrieve(&conn, &question, args.top_k, &bounds)?;
             if results.is_empty() {
                 eprintln!("no results found");
                 return Ok(());

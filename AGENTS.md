@@ -64,9 +64,12 @@ converted Markdown corpus. It includes:
   for fast incremental change detection and defers FTS5 optimization
   until enough rows have accumulated
 - `rag_query`: FTS5/BM25 retrieval with prompt assembly and Message-ID
-  citations
+  citations, with optional date-range filtering on the email path
 - `rag_git`: `ls_tree` for full tree enumeration and `diff_tree` for
   incremental change detection between commits
+- `date_range`: parser for human-friendly date specs (`2021-07`,
+  `2w`, `today`, …) used by the query CLI's `--since`, `--until`,
+  and `--last` flags
 - `lore-rag` binary: CLI with `ingest` and `query` subcommands
 
 An **AI backend** module (`ai_backend`) provides a shared abstraction
@@ -210,6 +213,8 @@ Run them before and after any change.
 - `src/rag_ingest.rs` — file-based and git-backed ingestion
 - `src/rag_query.rs` — FTS5 retrieval and prompt building
 - `src/rag_git.rs` — `ls_tree` and `diff_tree` for git-backed ingestion
+- `src/date_range.rs` — human-friendly date-spec parser for the
+  query CLI's `--since` / `--until` / `--last` flags
 - `prompts/git-digest-email.md` — email summarization prompt
 - `prompts/git-thread-summary.md` — thread summary prompt
 - `prompts/git-project-context.md` — shared project context
