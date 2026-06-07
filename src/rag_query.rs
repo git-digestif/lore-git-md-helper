@@ -166,8 +166,7 @@ mod tests {
             "# Rebase improvements\n\n| Header | Value |\n|--|--|\n| **From** | alice |\n\n---\n\nDiscussing interactive rebase.\n",
         )
         .unwrap();
-        let results =
-            retrieve(&conn, "interactive rebase", 10, &DateBounds::default()).unwrap();
+        let results = retrieve(&conn, "interactive rebase", 10, &DateBounds::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].subject.contains("Rebase"));
     }

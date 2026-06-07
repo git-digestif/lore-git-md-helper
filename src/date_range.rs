@@ -67,8 +67,8 @@ fn parse_period(spec: &str) -> Result<(Date, Date)> {
     }
 
     if let Ok(dur) = humantime::parse_duration(trimmed) {
-        let secs = i64::try_from(dur.as_secs())
-            .map_err(|_| anyhow!("duration too large: {trimmed}"))?;
+        let secs =
+            i64::try_from(dur.as_secs()).map_err(|_| anyhow!("duration too large: {trimmed}"))?;
         let dt = OffsetDateTime::now_utc() - Duration::seconds(secs);
         let d = dt.date();
         return Ok((d, d + Duration::days(1)));
@@ -135,24 +135,36 @@ mod tests {
     fn month_lower_and_upper() {
         assert_eq!(parse_lower_bound("2021-07").unwrap(), "2021/07/01");
         assert_eq!(parse_lower_bound("2021/07").unwrap(), "2021/07/01");
-        assert_eq!(parse_upper_bound_exclusive("2021-07").unwrap(), "2021/08/01");
+        assert_eq!(
+            parse_upper_bound_exclusive("2021-07").unwrap(),
+            "2021/08/01"
+        );
     }
 
     #[test]
     fn december_rolls_into_next_year() {
-        assert_eq!(parse_upper_bound_exclusive("2021-12").unwrap(), "2022/01/01");
+        assert_eq!(
+            parse_upper_bound_exclusive("2021-12").unwrap(),
+            "2022/01/01"
+        );
     }
 
     #[test]
     fn day_lower_and_upper() {
         assert_eq!(parse_lower_bound("2021-07-15").unwrap(), "2021/07/15");
-        assert_eq!(parse_upper_bound_exclusive("2021-07-15").unwrap(), "2021/07/16");
+        assert_eq!(
+            parse_upper_bound_exclusive("2021-07-15").unwrap(),
+            "2021/07/16"
+        );
         assert_eq!(parse_lower_bound("2021/07/15").unwrap(), "2021/07/15");
     }
 
     #[test]
     fn day_upper_rolls_into_next_month() {
-        assert_eq!(parse_upper_bound_exclusive("2021-07-31").unwrap(), "2021/08/01");
+        assert_eq!(
+            parse_upper_bound_exclusive("2021-07-31").unwrap(),
+            "2021/08/01"
+        );
     }
 
     #[test]
@@ -161,8 +173,14 @@ mod tests {
         let tomorrow = today + Duration::days(1);
         let yesterday = today - Duration::days(1);
         assert_eq!(parse_lower_bound("today").unwrap(), format_day(today));
-        assert_eq!(parse_upper_bound_exclusive("today").unwrap(), format_day(tomorrow));
-        assert_eq!(parse_lower_bound("YESTERDAY").unwrap(), format_day(yesterday));
+        assert_eq!(
+            parse_upper_bound_exclusive("today").unwrap(),
+            format_day(tomorrow)
+        );
+        assert_eq!(
+            parse_lower_bound("YESTERDAY").unwrap(),
+            format_day(yesterday)
+        );
         assert_eq!(parse_lower_bound("now").unwrap(), format_day(today));
     }
 

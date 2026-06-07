@@ -2,9 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use lore_git_md_helper::{
-    ai_backend::BackendArgs, date_range, rag_db, rag_ingest, rag_query,
-};
+use lore_git_md_helper::{ai_backend::BackendArgs, date_range, rag_db, rag_ingest, rag_query};
 
 /// RAG over the Git mailing list archive.
 #[derive(Parser)]
