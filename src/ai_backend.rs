@@ -79,6 +79,58 @@ pub fn is_no_choices(err: &anyhow::Error) -> bool {
         .any(|c| c.downcast_ref::<NoChoicesError>().is_some())
 }
 
+/// Returned when the chat API rejects the request because Azure's
+/// Responsible AI content filter classifies the input or output as
+/// disallowed.  Surfaces as either HTTP 400 with a body containing
+/// `"code":"content_filter"` (input rejection) or HTTP 200 with
+/// `"finish_reason":"content_filter"` (output rejection); both
+/// shapes carry an empty assistant message that no amount of
+/// retrying will populate.  Callers should treat this like
+/// `NoChoicesError`: walk the `anyhow` chain via
+/// `is_content_filter()` and convert to a soft skip.
+///
+/// Observed in practice on the digestive pipeline against entirely
+/// innocuous technical email (a refactor of repository-format
+/// handling in setup.c that happens to call the `die()` helper),
+/// where the gateway returned HTTP 400 and the loop burned ~54 k
+/// tokens across five retries that had zero chance of succeeding.
+#[derive(Debug)]
+pub struct ContentFilterError {
+    pub body_snippet: String,
+}
+
+impl std::fmt::Display for ContentFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "content filter rejected request; body snippet: {}",
+            self.body_snippet
+        )
+    }
+}
+
+impl std::error::Error for ContentFilterError {}
+
+/// Return `true` if `err` (or any error in its source chain) is a
+/// `ContentFilterError`.
+pub fn is_content_filter(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<ContentFilterError>().is_some())
+}
+
+/// Substring check that recognizes Azure's content-filter markers
+/// in a raw response body.  Matches both the snake_case form
+/// (`"code":"content_filter"`, the JSON the documented schema
+/// emits) and the PascalCase form (`ContentFilter` / `Responsible
+/// AI`, which appear in human-readable messages and in some older
+/// deployments' responses).
+fn body_is_content_filter(body: &str) -> bool {
+    body.contains("content_filter")
+        || body.contains("ContentFilter")
+        || body.contains("Responsible AI")
+        || body.contains("ResponsibleAI")
+}
+
 /// Tracks rate limit state reported by the API via `x-ratelimit-*` headers.
 pub struct RateLimitState {
     pub remaining_requests: Option<u64>,
@@ -141,6 +193,10 @@ pub enum Backend {
     /// the model context window).
     #[cfg(test)]
     MockNoChoices,
+    /// Mock that always fails with `ContentFilterError`, simulating
+    /// an Azure Responsible AI content-filter rejection.
+    #[cfg(test)]
+    MockContentFilter,
 }
 
 impl Backend {
@@ -270,6 +326,10 @@ impl Backend {
             #[cfg(test)]
             Backend::MockNoChoices => Err(anyhow::Error::new(NoChoicesError {
                 body_snippet: r#"{"choices": []}"#.to_string(),
+            })),
+            #[cfg(test)]
+            Backend::MockContentFilter => Err(anyhow::Error::new(ContentFilterError {
+                body_snippet: r#"{"choices":[{"finish_reason":"content_filter"}]}"#.to_string(),
             })),
         }
     }
@@ -504,6 +564,18 @@ async fn chat_api(
             if dump_http_enabled() {
                 eprintln!("[dump-http] response body ({} bytes):\n{body}", body.len());
             }
+            // Content-filter rejections (Azure's Responsible AI input
+            // gate) are deterministic: the same input will always be
+            // blocked.  Short-circuit out of the retry loop and return
+            // a typed error so the caller can soft-skip the offending
+            // item the same way it already does for `NoChoicesError`,
+            // instead of burning ~5x the tokens on retries that have
+            // zero chance of succeeding.
+            if status == reqwest::StatusCode::BAD_REQUEST && body_is_content_filter(&body) {
+                return Err(anyhow::Error::new(ContentFilterError {
+                    body_snippet: body[..body.len().min(500)].to_string(),
+                }));
+            }
             if attempt > max_retries {
                 anyhow::bail!(
                     "API returned {status} after {max_retries} retries; \
@@ -574,6 +646,15 @@ async fn chat_api(
         };
 
         if content.trim().is_empty() {
+            // Output-side content-filter rejections sometimes arrive
+            // as HTTP 200 with an empty content string -- the body
+            // still carries the `content_filter` marker.  Soft-skip
+            // these the same way as the 400-shaped input rejection.
+            if body_is_content_filter(&body) {
+                return Err(anyhow::Error::new(ContentFilterError {
+                    body_snippet: body[..body.len().min(500)].to_string(),
+                }));
+            }
             attempt += 1;
             if attempt > max_retries {
                 anyhow::bail!(
@@ -887,6 +968,105 @@ mod tests {
             msg.contains("diagnostic_marker_xyz"),
             "bail message should include the response body: {msg}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_400_content_filter_short_circuits_without_retry() {
+        // Azure's Responsible AI content filter returns HTTP 400 with
+        // `"code":"content_filter"` for input rejections.  The filter
+        // verdict is deterministic, so retries are pure waste; assert
+        // that `chat_api` returns a typed `ContentFilterError`
+        // immediately (exactly one upstream request, no retries).
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter","content_filter_results":{"error":{"code":"content_filter","message":"ResponsibleAI block."}}}]}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .expect(1) // no retries on content filter
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        assert!(
+            is_content_filter(&err),
+            "expected ContentFilterError, got: {err:#}"
+        );
+        let cf = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<ContentFilterError>())
+            .expect("downcast ContentFilterError");
+        assert!(cf.body_snippet.contains("content_filter"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_200_content_filter_short_circuits_without_retry() {
+        // Some output-side filter trips arrive as HTTP 200 with an
+        // empty content string and a `content_filter` marker in the
+        // body.  These must also short-circuit instead of going into
+        // the empty-content retry loop, which would burn five rounds
+        // of tokens on a deterministic rejection.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1) // no retries
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        assert!(
+            is_content_filter(&err),
+            "expected ContentFilterError, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn is_content_filter_walks_anyhow_context_chain() {
+        let leaf = anyhow::Error::new(ContentFilterError {
+            body_snippet: r#"{"code":"content_filter"}"#.to_string(),
+        });
+        let wrapped = leaf.context("human summary failed");
+        assert!(is_content_filter(&wrapped));
+        assert!(!is_no_choices(&wrapped));
+    }
+
+    #[test]
+    fn is_content_filter_returns_false_for_unrelated_errors() {
+        let err = anyhow::anyhow!("API returned 400 after 5 retries");
+        assert!(!is_content_filter(&err));
+    }
+
+    #[test]
+    fn body_is_content_filter_recognizes_snake_and_pascal_case() {
+        assert!(body_is_content_filter(r#"{"code":"content_filter"}"#));
+        assert!(body_is_content_filter(r#"{"name":"ContentFilter"}"#));
+        assert!(body_is_content_filter(
+            "ResponsibleAI result indicated block"
+        ));
+        assert!(body_is_content_filter(
+            "Responsible AI policy returned block"
+        ));
+        assert!(!body_is_content_filter(r#"{"error":"unauthorized"}"#));
+        assert!(!body_is_content_filter(
+            "the body contains no filter marker"
+        ));
     }
 
     #[tokio::test(start_paused = true)]

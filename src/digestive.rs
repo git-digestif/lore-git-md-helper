@@ -140,13 +140,29 @@ pub async fn summarize_one(
         Ok(r) => r,
         Err(e) if ai_backend::is_no_choices(&e) => {
             // The backend accepted the request but returned no
-            // choices (e.g. the prompt exceeded the model context
-            // window or tripped a content filter).  Skip this one
-            // email rather than aborting the whole pipeline run; the
-            // diagnostic chain printed below preserves the body
-            // snippet so a later run or human can investigate.
+            // choices (typically: prompt exceeded the model context
+            // window).  Skip this one email rather than aborting the
+            // whole pipeline run; the diagnostic chain printed below
+            // preserves the body snippet so a later run or human can
+            // investigate.
             eprintln!(
                 "[warn] {}.md: backend returned no choices, skipping ({:#})",
+                email.dk, e
+            );
+            return Ok(None);
+        }
+        Err(e) if ai_backend::is_content_filter(&e) => {
+            // Azure's Responsible AI content filter classifies the
+            // request as disallowed and returns either a 400 with
+            // `"code":"content_filter"` or a 200 with empty content
+            // and `finish_reason: content_filter`.  Either way the
+            // rejection is deterministic; retrying burns ~5x the
+            // tokens for nothing.  Soft-skip with a distinct warning
+            // so the operator can spot filter trips in CI logs and
+            // see which emails were dropped on filter grounds rather
+            // than on context-window grounds.
+            eprintln!(
+                "[warn] {}.md: backend content-filter rejected request, skipping ({:#})",
                 email.dk, e
             );
             return Ok(None);
@@ -1115,6 +1131,32 @@ mod tests {
             .await
             .expect("no-choices must be a soft skip, not a hard error");
         assert!(result.is_none(), "expected Ok(None) on no-choices skip");
+    }
+
+    #[tokio::test]
+    async fn summarize_one_soft_skips_on_content_filter() {
+        // Simulate Azure's Responsible AI content filter rejecting an
+        // entirely innocuous technical email (observed in practice
+        // against `[PATCH 2/9] setup: stop applying repository format
+        // twice`, where the gateway returned HTTP 400 with
+        // `finish_reason: content_filter` and burned ~54 k tokens
+        // across five retries that had zero chance of succeeding).
+        // `summarize_one` must soft-skip this just like the
+        // no-choices case rather than aborting the pipeline.
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert("main:2025/06/10/14-57-08.md".into(), "email body".into());
+        let email = EmailToSummarize {
+            dk: "2025/06/10/14-57-08".into(),
+            root_dk: "2025/06/10/14-57-08".into(),
+            parent_dk: None,
+        };
+        let backend = Backend::MockContentFilter;
+        let result = summarize_one(&email, &mut blobs, &backend, "main", None)
+            .await
+            .expect("content-filter must be a soft skip, not a hard error");
+        assert!(result.is_none(), "expected Ok(None) on content-filter skip");
     }
 
     #[test]
