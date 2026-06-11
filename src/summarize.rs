@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::ai_backend::Backend;
+use crate::rag_parse;
 
 const EMAIL_AGENT: &str = include_str!("../prompts/git-digest-email.md");
 const THREAD_AGENT: &str = include_str!("../prompts/git-thread-summary.md");
@@ -21,6 +22,84 @@ const PROJECT_CONTEXT: &str = include_str!("../prompts/git-project-context.md");
 /// was `false` so this is a context-window overflow, not content
 /// filtering.
 pub const EMAIL_MD_BUDGET: usize = 100_000;
+
+/// Build a mechanical "stub" pair of (human, ai) per-email summaries
+/// for an email whose AI summarization was rejected (typically by a
+/// backend content filter).  The pipeline writes these in place of
+/// the regular `.summary.md` / `.ai.md` so the email still shows up
+/// in downstream digests with at least its subject, author, and the
+/// opening of its cover letter, instead of being silently invisible.
+///
+/// `reason` is the operator-facing one-line explanation of why the
+/// stub was generated (e.g. `"Azure Responsible AI content filter"`);
+/// it is woven into the human stub so a reader can tell at a glance
+/// that the entry is not a real AI summary.
+///
+/// The opening of the cover letter is extracted as the first
+/// paragraph after the `**Thread**:` line of the converted email
+/// Markdown, capped at 1000 bytes so the stub never becomes huge on
+/// long quote-laden replies; if no body is present the stub falls
+/// back to a "(no cover letter text)" placeholder.
+pub fn stub_summary_from_md(email_md: &str, reason: &str) -> (String, String) {
+    let parsed = rag_parse::parse_email(email_md);
+    let subject = if parsed.subject.is_empty() {
+        "(no subject)".to_string()
+    } else {
+        parsed.subject
+    };
+    let author = if parsed.author.is_empty() {
+        "(unknown author)".to_string()
+    } else {
+        parsed.author
+    };
+    let body_excerpt = stub_body_excerpt(&parsed.body);
+
+    let human = format!(
+        "*[Mechanical stub: AI summarization was rejected by {reason}. \
+         The full email content is available in the source repository.]*\n\
+         \n\
+         **{subject}** by {author}.\n\
+         \n\
+         {body_excerpt}\n"
+    );
+    let ai = format!(
+        "Subject: {subject}\n\
+         From: {author}\n\
+         Note: AI summarization was rejected by {reason}; this entry is \
+         a mechanical stub assembled from the email header and the opening \
+         of the cover letter.\n\
+         \n\
+         Cover letter excerpt:\n\
+         {body_excerpt}\n"
+    );
+    (human, ai)
+}
+
+/// Extract the first paragraph of the cover letter from a parsed
+/// email body, capped at 1000 bytes (with a trailing ellipsis if
+/// truncated).  Returns a placeholder if no body is present.
+fn stub_body_excerpt(body: &str) -> String {
+    const MAX: usize = 1000;
+    let body = body.trim();
+    if body.is_empty() {
+        return "(no cover letter text)".to_string();
+    }
+    // Take everything up to the first blank line, which delimits the
+    // first paragraph of the cover letter.  If the body is a single
+    // paragraph, take the whole thing; the byte cap below catches
+    // pathologically long ones.
+    let para = body.split("\n\n").next().unwrap_or(body);
+    if para.len() <= MAX {
+        para.to_string()
+    } else {
+        // Cap on a char boundary so we never produce invalid UTF-8.
+        let mut end = MAX;
+        while end > 0 && !para.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &para[..end])
+    }
+}
 
 pub struct EmailContext {
     pub email_md: String,
@@ -468,6 +547,117 @@ mod tests {
     fn truncate_under_budget_returns_none() {
         let s = "short body";
         assert!(truncate_email_md(s, 100).is_none());
+    }
+
+    fn realistic_email_md() -> String {
+        // Matches the mbox2md output shape: H1 subject, header table,
+        // `---` separator, **Thread**: line, cover-letter paragraph,
+        // a second paragraph (which the excerpt must NOT include).
+        concat!(
+            "# [PATCH 2/9] setup: stop applying repository format twice\n",
+            "\n",
+            "| Header | Value |\n",
+            "|--------|-------|\n",
+            "| **From** | Patrick Steinhardt <ps@pks.im> |\n",
+            "| **To** | git@vger.kernel.org |\n",
+            "| **Date** | 2026-06-10T16:57:08+02:00 |\n",
+            "| **Message-ID** | [20260610-x@pks.im](https://lore.kernel.org/git/20260610-x@pks.im) |\n",
+            "\n",
+            "---\n",
+            "\n",
+            "**Thread**: [thread](14-57-06.thread.md)\n",
+            "\n",
+            "When discovering the repository in setup.c we apply the final\n",
+            "repository format multiple times.\n",
+            "\n",
+            "Second paragraph that should be excluded from the stub excerpt.\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn stub_extracts_subject_author_and_cover_letter_first_paragraph() {
+        let (human, ai) =
+            stub_summary_from_md(&realistic_email_md(), "Azure Responsible AI content filter");
+        // Subject and author must appear in both.
+        for s in [&human, &ai] {
+            assert!(
+                s.contains("[PATCH 2/9] setup: stop applying repository format twice"),
+                "subject missing: {s}"
+            );
+            assert!(s.contains("Patrick Steinhardt"), "author missing: {s}");
+            assert!(
+                s.contains("Azure Responsible AI content filter"),
+                "reason missing: {s}"
+            );
+        }
+        // Cover letter excerpt: first paragraph only.
+        assert!(human.contains("When discovering the repository in setup.c"));
+        assert!(ai.contains("When discovering the repository in setup.c"));
+        assert!(
+            !human.contains("Second paragraph that should be excluded"),
+            "human stub must stop at first blank line"
+        );
+        assert!(
+            !ai.contains("Second paragraph that should be excluded"),
+            "ai stub must stop at first blank line"
+        );
+        // Human stub must clearly mark itself as a mechanical stub.
+        assert!(human.starts_with("*[Mechanical stub:"));
+    }
+
+    #[test]
+    fn stub_handles_missing_subject_and_author_gracefully() {
+        let md = "Body but no subject heading and no metadata table.";
+        let (human, ai) = stub_summary_from_md(md, "test reason");
+        assert!(human.contains("(no subject)"), "{human}");
+        assert!(human.contains("(unknown author)"), "{human}");
+        // The body excerpt should still be present (parse_email falls
+        // back to the line-skipping branch when there's no Thread:
+        // marker), and the test reason should be threaded through.
+        assert!(ai.contains("test reason"));
+    }
+
+    #[test]
+    fn stub_handles_empty_cover_letter() {
+        // Header-only email (cover letter is just the header table
+        // with no body after the `---`).  parse_email returns an
+        // empty body; the stub must not panic and must produce a
+        // visible placeholder.
+        let md =
+            "# Subject\n\n| Header | Value |\n|--------|-------|\n| **From** | Alice |\n\n---\n";
+        let (human, ai) = stub_summary_from_md(md, "test");
+        assert!(human.contains("(no cover letter text)"), "{human}");
+        assert!(ai.contains("(no cover letter text)"), "{ai}");
+    }
+
+    #[test]
+    fn stub_excerpt_caps_pathologically_long_first_paragraph_on_char_boundary() {
+        // A single 5000-byte first paragraph with a 4-byte UTF-8
+        // character at byte 998: the cap (at 1000) must back off to
+        // a char boundary so the result is valid UTF-8 and ends
+        // with "...".
+        let mut body = "a".repeat(998);
+        body.push('\u{1F600}'); // 4-byte char starting at byte 998
+        body.push_str(&"b".repeat(4000));
+        let md = format!(
+            "# S\n\n| Header | Value |\n|---|---|\n| **From** | X |\n\n---\n\n**Thread**: [t](t.md)\n\n{body}\n"
+        );
+        let (human, _ai) = stub_summary_from_md(&md, "test");
+        assert!(
+            human.ends_with("...\n") || human.contains("...\n"),
+            "{human}"
+        );
+        // No panic = char-boundary cap worked; verify the chosen
+        // truncation point is before the 4-byte char to keep the
+        // body excerpt as long as possible without splitting it.
+        let excerpt_start = human.find("**S** by X.").unwrap();
+        let excerpt = &human[excerpt_start..];
+        // Just assert no embedded U+1F600 (we cut before it).
+        assert!(
+            !excerpt.contains('\u{1F600}'),
+            "should have cut before the 4-byte char"
+        );
     }
 
     #[test]
