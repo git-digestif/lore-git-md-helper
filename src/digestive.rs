@@ -72,6 +72,24 @@ fn find_digest_commit(repo_path: &str, refname: &str, day: &str) -> Option<Strin
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Whether the per-email summary was produced by the AI backend or
+/// is a mechanical stub generated locally because the backend
+/// refused to summarize the email (typically content-filter
+/// rejection).  Drives whether `flush_batch` writes the thread
+/// summary files: stubs only write the per-email `.summary.md` and
+/// `.ai.md` so the email becomes visible in downstream digests, but
+/// they do not pollute the cumulative `.thread.summary.md` and
+/// `.thread.ai.md` (those keep their last real AI-generated state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryKind {
+    /// Normal: all four summaries produced by the AI backend.
+    AiGenerated,
+    /// Mechanical stub assembled from the email Markdown itself.
+    /// `thread_human` / `thread_ai` are placeholders that
+    /// `flush_batch` must not write.
+    Stub,
+}
+
 /// Summary artifacts for a single email.
 pub struct SummaryFiles {
     pub dk: String,
@@ -80,6 +98,42 @@ pub struct SummaryFiles {
     pub ai: String,
     pub thread_human: String,
     pub thread_ai: String,
+    pub kind: SummaryKind,
+}
+
+/// Build the (path, content) refs that `flush_batch` commits for a
+/// batch of summarized emails.  Per-email `.human.md` and `.ai.md`
+/// are always emitted; the cumulative `.thread.human.md` and
+/// `.thread.ai.md` are emitted only for `SummaryKind::AiGenerated`
+/// so that stubs do not overwrite real thread state.
+///
+/// Extracted from `flush_batch` so a unit test can assert the
+/// "stubs never write thread files" invariant without round-tripping
+/// through fast-import.
+fn summary_files_to_refs(batch: &[SummaryFiles]) -> Vec<(String, &str)> {
+    batch
+        .iter()
+        .flat_map(|sf| {
+            let per_email = [
+                (format!("{}.human.md", sf.dk), sf.human.as_str()),
+                (format!("{}.ai.md", sf.dk), sf.ai.as_str()),
+            ];
+            let thread = match sf.kind {
+                SummaryKind::Stub => Vec::new(),
+                SummaryKind::AiGenerated => vec![
+                    (
+                        format!("{}.thread.human.md", sf.root_dk),
+                        sf.thread_human.as_str(),
+                    ),
+                    (
+                        format!("{}.thread.ai.md", sf.root_dk),
+                        sf.thread_ai.as_str(),
+                    ),
+                ],
+            };
+            per_email.into_iter().chain(thread)
+        })
+        .collect()
 }
 
 /// Load email content and thread context for a single email.
@@ -157,15 +211,32 @@ pub async fn summarize_one(
             // `"code":"content_filter"` or a 200 with empty content
             // and `finish_reason: content_filter`.  Either way the
             // rejection is deterministic; retrying burns ~5x the
-            // tokens for nothing.  Soft-skip with a distinct warning
-            // so the operator can spot filter trips in CI logs and
-            // see which emails were dropped on filter grounds rather
-            // than on context-window grounds.
+            // tokens for nothing.  Generate a mechanical stub from
+            // the email Markdown itself so the email is still
+            // visible in downstream digests (subject, author, the
+            // opening of the cover letter), while a [warn] line
+            // makes the substitution discoverable in CI logs.
             eprintln!(
-                "[warn] {}.md: backend content-filter rejected request, skipping ({:#})",
+                "[warn] {}.md: backend content-filter rejected request, \
+                 generating mechanical stub ({:#})",
                 email.dk, e
             );
-            return Ok(None);
+            let (human, ai) =
+                summarize::stub_summary_from_md(&ctx.email_md, "the backend content filter");
+            return Ok(Some(SummaryFiles {
+                dk: email.dk.clone(),
+                root_dk: email.root_dk.clone(),
+                human,
+                ai,
+                // Placeholders that flush_batch will skip writing for
+                // SummaryKind::Stub; left non-empty defensively so
+                // that any future code reading these fields without
+                // checking `kind` sees a clearly-marked stub rather
+                // than the empty string.
+                thread_human: String::from("<!-- stub: thread summary not updated -->\n"),
+                thread_ai: String::from("<!-- stub: thread summary not updated -->\n"),
+                kind: SummaryKind::Stub,
+            }));
         }
         Err(e) => return Err(e),
     };
@@ -177,6 +248,7 @@ pub async fn summarize_one(
         ai: result.ai_summary,
         thread_human: result.thread_human_summary,
         thread_ai: result.thread_ai_summary,
+        kind: SummaryKind::AiGenerated,
     }))
 }
 
@@ -345,12 +417,20 @@ impl<'a> Digestive<'a> {
         };
         // Cache the AI summaries so that backfill_thread (and the
         // main loop) can see them without waiting for a fast-import
-        // checkpoint to land.
+        // checkpoint to land.  For stub summaries we cache the
+        // per-email `.ai.md` (so replies see at least subject/author
+        // for parent context) but never the thread summary (which
+        // would otherwise overwrite a real AI-generated thread state
+        // with a placeholder).
         let ai_key = format!("{}:{}.ai.md", self.git_ref, sf.dk);
         self.cached.insert(ai_key, sf.ai.clone());
-        // Old data may contain <!-- ERROR markers from earlier runs;
-        // avoid caching those as valid thread summaries.
-        if !sf.thread_ai.starts_with("<!-- ERROR") {
+        let cache_thread_ai = match sf.kind {
+            // Old data may contain <!-- ERROR markers from earlier
+            // runs; avoid caching those as valid thread summaries.
+            SummaryKind::AiGenerated => !sf.thread_ai.starts_with("<!-- ERROR"),
+            SummaryKind::Stub => false,
+        };
+        if cache_thread_ai {
             let key = format!("{}:{}.thread.ai.md", self.git_ref, sf.root_dk,);
             self.cached.insert(key, sf.thread_ai.clone());
         }
@@ -416,24 +496,7 @@ impl<'a> Digestive<'a> {
         if let Some(ref sc) = self.source_commit {
             msg.push_str(&format!("\nSource-Commit: {sc}"));
         }
-        let files: Vec<_> = self
-            .batch
-            .iter()
-            .flat_map(|sf| {
-                [
-                    (format!("{}.human.md", sf.dk), sf.human.as_str()),
-                    (
-                        format!("{}.thread.human.md", sf.root_dk),
-                        sf.thread_human.as_str(),
-                    ),
-                    (
-                        format!("{}.thread.ai.md", sf.root_dk),
-                        sf.thread_ai.as_str(),
-                    ),
-                    (format!("{}.ai.md", sf.dk), sf.ai.as_str()),
-                ]
-            })
-            .collect();
+        let files = summary_files_to_refs(&self.batch);
         let refs: Vec<_> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
         self.fi
             .as_mut()
@@ -1134,19 +1197,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summarize_one_soft_skips_on_content_filter() {
-        // Simulate Azure's Responsible AI content filter rejecting an
+    async fn summarize_one_generates_stub_on_content_filter() {
+        // Azure's Responsible AI content filter rejecting an
         // entirely innocuous technical email (observed in practice
-        // against `[PATCH 2/9] setup: stop applying repository format
-        // twice`, where the gateway returned HTTP 400 with
-        // `finish_reason: content_filter` and burned ~54 k tokens
-        // across five retries that had zero chance of succeeding).
-        // `summarize_one` must soft-skip this just like the
-        // no-choices case rather than aborting the pipeline.
+        // against `[PATCH 2/9] setup: stop applying repository
+        // format twice`, where the gateway returned HTTP 400 with
+        // `finish_reason: content_filter`).  `summarize_one` must
+        // generate a mechanical stub from the email Markdown so the
+        // email still becomes visible in the per-email .summary.md
+        // and .ai.md (and via .ai.md in downstream digests), but
+        // mark the result as `SummaryKind::Stub` so flush_batch
+        // skips writing thread.*.md.
         let mut blobs = MockBlobs(Default::default());
+        let md = "# [PATCH] test\n\n| Header | Value |\n|---|---|\n| **From** | Tester |\n\n---\n\n**Thread**: [t](t.md)\n\nCover letter paragraph.\n";
         blobs
             .0
-            .insert("main:2025/06/10/14-57-08.md".into(), "email body".into());
+            .insert("main:2025/06/10/14-57-08.md".into(), md.into());
         let email = EmailToSummarize {
             dk: "2025/06/10/14-57-08".into(),
             root_dk: "2025/06/10/14-57-08".into(),
@@ -1155,8 +1221,25 @@ mod tests {
         let backend = Backend::MockContentFilter;
         let result = summarize_one(&email, &mut blobs, &backend, "main", None)
             .await
-            .expect("content-filter must be a soft skip, not a hard error");
-        assert!(result.is_none(), "expected Ok(None) on content-filter skip");
+            .expect("content-filter must produce a stub, not a hard error");
+        let sf = result.expect("expected stub SummaryFiles, got None");
+        assert_eq!(sf.kind, SummaryKind::Stub, "must be marked as a stub");
+        assert!(
+            sf.human.starts_with("*[Mechanical stub:"),
+            "human stub missing marker: {}",
+            sf.human
+        );
+        assert!(sf.ai.contains("[PATCH] test"), "ai stub missing subject");
+        assert!(
+            sf.thread_human.starts_with("<!-- stub:"),
+            "thread_human must be placeholder marker for stubs: {}",
+            sf.thread_human
+        );
+        assert!(
+            sf.thread_ai.starts_with("<!-- stub:"),
+            "thread_ai must be placeholder marker for stubs: {}",
+            sf.thread_ai
+        );
     }
 
     #[test]
@@ -1173,6 +1256,90 @@ mod tests {
         let ctx = load_email_context(&email, &mut blobs, "main").unwrap();
         assert_eq!(ctx.email_md, "email body");
         assert!(ctx.thread_ai_summary.is_none());
+    }
+
+    fn sf_ai(dk: &str, root_dk: &str) -> SummaryFiles {
+        SummaryFiles {
+            dk: dk.to_string(),
+            root_dk: root_dk.to_string(),
+            human: format!("human:{dk}"),
+            ai: format!("ai:{dk}"),
+            thread_human: format!("thread.human:{root_dk}"),
+            thread_ai: format!("thread.ai:{root_dk}"),
+            kind: SummaryKind::AiGenerated,
+        }
+    }
+
+    fn sf_stub(dk: &str, root_dk: &str) -> SummaryFiles {
+        SummaryFiles {
+            dk: dk.to_string(),
+            root_dk: root_dk.to_string(),
+            human: format!("human-stub:{dk}"),
+            ai: format!("ai-stub:{dk}"),
+            thread_human: "<!-- stub -->\n".to_string(),
+            thread_ai: "<!-- stub -->\n".to_string(),
+            kind: SummaryKind::Stub,
+        }
+    }
+
+    #[test]
+    fn summary_files_to_refs_emits_all_four_for_ai_generated() {
+        let batch = [sf_ai("2025/01/06/10-00-00", "2025/01/06/10-00-00")];
+        let refs = summary_files_to_refs(&batch);
+        let paths: Vec<&str> = refs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "2025/01/06/10-00-00.human.md",
+                "2025/01/06/10-00-00.ai.md",
+                "2025/01/06/10-00-00.thread.human.md",
+                "2025/01/06/10-00-00.thread.ai.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_files_to_refs_emits_only_per_email_for_stub() {
+        let batch = [sf_stub("2025/06/10/14-57-08", "2025/06/10/14-57-06")];
+        let refs = summary_files_to_refs(&batch);
+        let paths: Vec<&str> = refs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["2025/06/10/14-57-08.human.md", "2025/06/10/14-57-08.ai.md",],
+            "stubs must not write the cumulative thread.*.md files"
+        );
+    }
+
+    #[test]
+    fn summary_files_to_refs_mixed_batch_preserves_order() {
+        let batch = [
+            sf_ai("2025/06/10/10-00-00", "2025/06/10/10-00-00"),
+            sf_stub("2025/06/10/14-57-08", "2025/06/10/14-57-06"),
+            sf_ai("2025/06/10/15-00-00", "2025/06/10/10-00-00"),
+        ];
+        let refs = summary_files_to_refs(&batch);
+        let paths: Vec<&str> = refs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                // First (AI): all four files.
+                "2025/06/10/10-00-00.human.md",
+                "2025/06/10/10-00-00.ai.md",
+                "2025/06/10/10-00-00.thread.human.md",
+                "2025/06/10/10-00-00.thread.ai.md",
+                // Second (Stub): per-email only.
+                "2025/06/10/14-57-08.human.md",
+                "2025/06/10/14-57-08.ai.md",
+                // Third (AI): all four files again; this email's
+                // thread root happens to be the same as the first
+                // entry's, so the thread.*.md path repeats -- the
+                // last write wins, which is the desired behavior.
+                "2025/06/10/15-00-00.human.md",
+                "2025/06/10/15-00-00.ai.md",
+                "2025/06/10/10-00-00.thread.human.md",
+                "2025/06/10/10-00-00.thread.ai.md",
+            ]
+        );
     }
 
     #[test]
