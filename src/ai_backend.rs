@@ -489,13 +489,33 @@ async fn chat_api(
         {
             attempt += 1;
             let status = resp.status();
+            // Read the body so we can log it (and surface it in the
+            // final bail message when retries are exhausted).  The
+            // previous code dropped `resp` here without reading the
+            // body, leaving CI logs with just the status code and no
+            // gateway-provided explanation for the failure.
+            if dump_http_enabled() {
+                dump_response_meta(&resp);
+            }
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            if dump_http_enabled() {
+                eprintln!("[dump-http] response body ({} bytes):\n{body}", body.len());
+            }
             if attempt > max_retries {
-                anyhow::bail!("API returned {status} after {max_retries} retries");
+                anyhow::bail!(
+                    "API returned {status} after {max_retries} retries; \
+                     last response body: {}",
+                    &body[..body.len().min(500)]
+                );
             }
             let backoff = retry_backoff_secs(attempt);
             eprintln!(
                 "[retry] {status} (attempt {attempt}/{max_retries}), \
-                 sleeping {backoff}s"
+                 body snippet: {}; sleeping {backoff}s",
+                &body[..body.len().min(200)]
             );
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             continue;
@@ -826,6 +846,46 @@ mod tests {
         assert!(
             msg.contains("429") && msg.contains("5 retries"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_400_bail_includes_response_body() {
+        // When the chat API responds with HTTP 400 (a typed failure
+        // mode like Azure's content-filter reject, malformed schema,
+        // or context-length over-budget that the gateway surfaces as
+        // 400 rather than as an empty `choices` array), the previous
+        // code would retry five times and bail with just the status
+        // code, swallowing whatever explanation the gateway provided
+        // in the response body.  The body must survive into the
+        // final error so CI logs are actionable.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body =
+            r#"{"error":{"message":"diagnostic_marker_xyz","code":"context_length_exceeded"}}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .expect(6) // 1 initial + 5 retries
+            .mount(&server)
+            .await;
+
+        let ep = ApiEndpoint {
+            api_url: &server.uri(),
+            model: "test",
+            auth: ApiAuth::None,
+            rate_limits: None,
+        };
+        let err = chat_api(&ep, "sys", "usr", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("400") && msg.contains("5 retries"),
+            "should mention 400 + retry count: {msg}"
+        );
+        assert!(
+            msg.contains("diagnostic_marker_xyz"),
+            "bail message should include the response body: {msg}"
         );
     }
 
