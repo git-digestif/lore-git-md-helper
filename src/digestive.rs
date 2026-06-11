@@ -16,6 +16,7 @@ use crate::date_util::{add_days, iso_sunday, month_of};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
+use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
 use crate::thread_file::{self, ThreadTree};
 
@@ -136,7 +137,102 @@ fn summary_files_to_refs(batch: &[SummaryFiles]) -> Vec<(String, &str)> {
         .collect()
 }
 
-/// Load email content and thread context for a single email.
+/// Compute the path of the content-filter-rejections tracking file
+/// for a given email date-key (`YYYY/MM/DD/HH-MM-SS`).  One file per
+/// calendar day at `content-filter-rejections/YYYY/MM/DD.md`, keeping
+/// the tracking file proportionate to the number of rejections on
+/// that day rather than letting a single monolithic file grow
+/// unboundedly across years.
+fn rejection_tracking_path(dk: &str) -> Option<String> {
+    // Expect "YYYY/MM/DD/HH-MM-SS"; take the first three path parts.
+    let mut parts = dk.split('/');
+    let y = parts.next()?;
+    let m = parts.next()?;
+    let d = parts.next()?;
+    if y.is_empty() || m.is_empty() || d.is_empty() {
+        return None;
+    }
+    Some(format!("content-filter-rejections/{y}/{m}/{d}.md"))
+}
+
+/// Build a `RejectionEntry` from the email Markdown.  Extracts
+/// subject, author, and Message-ID via `rag_parse::parse_email` so
+/// the bullet format stays consistent with the stub summary fields.
+/// Returns `None` if `dk` is malformed (we cannot link to the email
+/// without a usable date-key).
+fn make_rejection_entry(dk: &str, email_md: &str) -> Option<RejectionEntry> {
+    let parsed = rag_parse::parse_email(email_md);
+    let subject = if parsed.subject.is_empty() {
+        "(no subject)".to_string()
+    } else {
+        parsed.subject
+    };
+    let author = if parsed.author.is_empty() {
+        "(unknown author)".to_string()
+    } else {
+        parsed.author
+    };
+    // Relative link from the tracking file (3 levels deep:
+    // content-filter-rejections/YYYY/MM/DD.md) up to the email
+    // (YYYY/MM/DD/HH-MM-SS.md, also 3 levels under repo root).
+    let email_link = format!("../../../{dk}.md");
+    let msgid_line = if parsed.message_id.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n  - Message-ID: [`{0}`](https://lore.kernel.org/git/{0})",
+            parsed.message_id,
+        )
+    };
+    let time = dk.rsplit('/').next().unwrap_or(dk);
+    let bullet = format!("- **{time}** [{subject}]({email_link}) by *{author}*{msgid_line}\n");
+    Some(RejectionEntry {
+        dk: dk.to_string(),
+        bullet,
+    })
+}
+
+/// Merge a list of new rejection entries into the existing tracking
+/// file content (or build a fresh file if `existing` is `None`).
+/// Entries whose `dk` already appears in `existing` are skipped, so
+/// reruns of the same date range never produce duplicate bullets.
+fn merge_rejection_file(
+    date_label: &str,
+    existing: Option<&str>,
+    new: &[RejectionEntry],
+) -> String {
+    let header = format!(
+        "# Content-filter rejections for {date_label}\n\n\
+         Emails whose AI summarization was rejected by the backend's \
+         content filter on this day.  The per-email `.summary.md` and \
+         `.ai.md` for these are mechanical stubs (subject, author, \
+         opening cover-letter paragraph) rather than real AI summaries; \
+         follow the link to read the full message.\n\n"
+    );
+    let existing_body = existing
+        .map(|s| s.trim_start_matches(&header[..]).to_string())
+        .unwrap_or_default();
+    let mut additions = String::new();
+    for entry in new {
+        // Skip if the existing file already contains this exact dk;
+        // we recognize a dk by the leading "- **HH-MM-SS** " and by
+        // the email link "../../../DK.md", but the email-link check
+        // alone is the precise dedup signal.
+        let link_marker = format!("({})", format_args!("../../../{}.md", entry.dk));
+        if existing_body.contains(&link_marker) {
+            continue;
+        }
+        additions.push_str(&entry.bullet);
+    }
+    if additions.is_empty() && existing.is_some() {
+        // No new entries to add and the file is already present;
+        // returning the existing content unchanged means the
+        // fast-import write will be a no-op blob (same OID).
+        return format!("{header}{existing_body}");
+    }
+    format!("{header}{existing_body}{additions}")
+}
+
 ///
 /// Thread AI summaries are looked up via the `BlobRead` implementation,
 /// which may be a `CachedReader` (checking an in-memory cache first,
@@ -312,11 +408,31 @@ pub struct Digestive<'a> {
     total_processed: u64,
     day_summaries: Vec<(String, String, String)>,
     batch: Vec<SummaryFiles>,
+    /// Pending content-filter rejection entries, keyed by tracking
+    /// path ("content-filter-rejections/YYYY/MM/DD.md").  Drained by
+    /// `flush_batch`, which merges them into the existing file (or
+    /// creates one) and includes the result in the same fast-import
+    /// commit as the per-email stub summaries.
+    pending_rejections: HashMap<String, Vec<RejectionEntry>>,
     /// Wall-clock deadline.  When `Some` and `Instant::now()` has
     /// passed this value, the streaming loop in `run` stops at the
     /// next iteration boundary rather than initiating another AI
     /// call.  Set from the `--max-runtime` CLI argument.
     deadline: Option<std::time::Instant>,
+}
+
+/// A single content-filter rejection bullet enqueued for inclusion
+/// in the tracking file at `content-filter-rejections/YYYY/MM/DD.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RejectionEntry {
+    /// Date-key of the rejected email (e.g. `2026/06/10/14-57-08`),
+    /// used for dedup against the existing tracking file content.
+    dk: String,
+    /// Rendered Markdown bullet line, starting with `- ` and ending
+    /// with a single newline.  Includes the subject (linked to the
+    /// email's `.md` blob in the same target repo), the author, and
+    /// a `Message-ID:` sub-bullet linking to lore.kernel.org.
+    bullet: String,
 }
 
 impl<'a> Digestive<'a> {
@@ -363,6 +479,7 @@ impl<'a> Digestive<'a> {
             total_processed: 0,
             day_summaries: Vec::new(),
             batch: Vec::new(),
+            pending_rejections: HashMap::new(),
             deadline: None,
         })
     }
@@ -436,6 +553,18 @@ impl<'a> Digestive<'a> {
         }
         self.day_summaries
             .push((sf.dk.clone(), sf.root_dk.clone(), sf.ai.clone()));
+        if sf.kind == SummaryKind::Stub {
+            // Load the email Markdown for the tracking-file bullet.
+            // Re-reading via the cached reader is cheap: the same
+            // blob was just read by `summarize_one`.
+            let spec = format!("{}:{}.md", self.git_ref, sf.dk);
+            if let Some(email_md) = self.cached.get_str(&spec)
+                && let Some(path) = rejection_tracking_path(&sf.dk)
+                && let Some(entry) = make_rejection_entry(&sf.dk, &email_md)
+            {
+                self.pending_rejections.entry(path).or_default().push(entry);
+            }
+        }
         self.batch.push(sf);
         self.total_processed += 1;
         if self.batch.len() >= self.batch_size {
@@ -497,7 +626,37 @@ impl<'a> Digestive<'a> {
             msg.push_str(&format!("\nSource-Commit: {sc}"));
         }
         let files = summary_files_to_refs(&self.batch);
-        let refs: Vec<_> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+
+        // Merge any pending content-filter rejections into their
+        // per-day tracking files.  We read the existing file via the
+        // CachedReader (which transparently falls through to git
+        // cat-file) and produce merged content that the same
+        // fast-import commit will write back.  The merge dedupes
+        // against any bullet whose email link already appears in
+        // the existing content, so reruns don't accumulate
+        // duplicate entries.
+        let pending = std::mem::take(&mut self.pending_rejections);
+        let mut tracking_files: Vec<(String, String)> = Vec::with_capacity(pending.len());
+        for (path, entries) in pending {
+            let date_label = path
+                .strip_prefix("content-filter-rejections/")
+                .and_then(|s| s.strip_suffix(".md"))
+                .map(|s| s.replace('/', "-"))
+                .unwrap_or_else(|| path.clone());
+            let spec = format!("{}:{path}", self.git_ref);
+            let existing = self.cached.get_str(&spec);
+            let merged = merge_rejection_file(&date_label, existing.as_deref(), &entries);
+            // Update the cache so subsequent rejections on the same
+            // day (within this run, before the fast-import commit
+            // lands) see the merged content.
+            self.cached.insert(spec, merged.clone());
+            tracking_files.push((path, merged));
+        }
+
+        let mut refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        for (p, c) in &tracking_files {
+            refs.push((p.as_str(), c.as_str()));
+        }
         self.fi
             .as_mut()
             .context("fast-import unavailable")?
@@ -1240,6 +1399,112 @@ mod tests {
             "thread_ai must be placeholder marker for stubs: {}",
             sf.thread_ai
         );
+    }
+
+    #[test]
+    fn rejection_tracking_path_takes_day_part_of_dk() {
+        assert_eq!(
+            rejection_tracking_path("2026/06/10/14-57-08").as_deref(),
+            Some("content-filter-rejections/2026/06/10.md")
+        );
+        // Missing date-key parts: no tracking file path.
+        assert!(rejection_tracking_path("2026/06").is_none());
+        assert!(rejection_tracking_path("").is_none());
+        assert!(rejection_tracking_path("//").is_none());
+    }
+
+    #[test]
+    fn make_rejection_entry_includes_subject_author_and_msgid() {
+        let md = "# [PATCH 2/9] setup: stop applying repository format twice\n\n\
+                  | Header | Value |\n|---|---|\n\
+                  | **From** | Patrick Steinhardt <ps@pks.im> |\n\
+                  | **Date** | 2026-06-10T16:57:08+02:00 |\n\
+                  | **Message-ID** | [20260610-x@pks.im](https://lore.kernel.org/git/20260610-x@pks.im) |\n\n\
+                  ---\n\n**Thread**: [t](t.md)\n\nbody\n";
+        let entry = make_rejection_entry("2026/06/10/14-57-08", md).expect("entry");
+        assert_eq!(entry.dk, "2026/06/10/14-57-08");
+        assert!(
+            entry.bullet.starts_with("- **14-57-08**"),
+            "{}",
+            entry.bullet
+        );
+        assert!(
+            entry
+                .bullet
+                .contains("[\\[PATCH 2/9\\] setup: stop applying repository format twice]")
+                || entry
+                    .bullet
+                    .contains("[[PATCH 2/9] setup: stop applying repository format twice]"),
+            "subject missing: {}",
+            entry.bullet
+        );
+        assert!(entry.bullet.contains("../../../2026/06/10/14-57-08.md"));
+        assert!(entry.bullet.contains("Patrick Steinhardt"));
+        assert!(
+            entry
+                .bullet
+                .contains("https://lore.kernel.org/git/20260610-x@pks.im"),
+            "msgid link missing: {}",
+            entry.bullet
+        );
+        assert!(entry.bullet.ends_with('\n'));
+    }
+
+    #[test]
+    fn merge_rejection_file_creates_fresh_when_no_existing() {
+        let entry = RejectionEntry {
+            dk: "2026/06/10/14-57-08".into(),
+            bullet: "- **14-57-08** [Subject](../../../2026/06/10/14-57-08.md) by *X*\n"
+                .to_string(),
+        };
+        let out = merge_rejection_file("2026-06-10", None, &[entry]);
+        assert!(out.starts_with("# Content-filter rejections for 2026-06-10\n\n"));
+        assert!(out.contains("- **14-57-08**"));
+        assert!(out.ends_with("by *X*\n"));
+    }
+
+    #[test]
+    fn merge_rejection_file_appends_to_existing_and_dedupes() {
+        let existing = "# Content-filter rejections for 2026-06-10\n\n\
+             Emails whose AI summarization was rejected by the backend's content filter on this day.  The per-email `.summary.md` and `.ai.md` for these are mechanical stubs (subject, author, opening cover-letter paragraph) rather than real AI summaries; follow the link to read the full message.\n\n\
+             - **14-57-08** [Existing](../../../2026/06/10/14-57-08.md) by *Alice*\n";
+        let new = vec![
+            // Same dk as existing -- must be deduped.
+            RejectionEntry {
+                dk: "2026/06/10/14-57-08".into(),
+                bullet: "- **14-57-08** [Duplicate](../../../2026/06/10/14-57-08.md) by *Bob*\n"
+                    .to_string(),
+            },
+            // New dk -- must be appended.
+            RejectionEntry {
+                dk: "2026/06/10/22-00-00".into(),
+                bullet: "- **22-00-00** [New](../../../2026/06/10/22-00-00.md) by *Carol*\n"
+                    .to_string(),
+            },
+        ];
+        let out = merge_rejection_file("2026-06-10", Some(existing), &new);
+        assert!(out.contains("- **14-57-08** [Existing]"));
+        assert!(
+            !out.contains("by *Bob*"),
+            "duplicate must be dropped: {out}"
+        );
+        assert!(out.contains("- **22-00-00** [New]"));
+        // The header must not be duplicated.
+        assert_eq!(
+            out.matches("# Content-filter rejections for 2026-06-10")
+                .count(),
+            1,
+            "header duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn merge_rejection_file_with_no_new_entries_preserves_existing() {
+        let existing = "# Content-filter rejections for 2026-06-10\n\n\
+             Emails whose AI summarization was rejected by the backend's content filter on this day.  The per-email `.summary.md` and `.ai.md` for these are mechanical stubs (subject, author, opening cover-letter paragraph) rather than real AI summaries; follow the link to read the full message.\n\n\
+             - **14-57-08** [Existing](../../../2026/06/10/14-57-08.md) by *Alice*\n";
+        let out = merge_rejection_file("2026-06-10", Some(existing), &[]);
+        assert_eq!(out, existing, "no-op merge must preserve existing content");
     }
 
     #[test]
