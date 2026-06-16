@@ -1,0 +1,35 @@
+name: Test Azure CLI Auth
+
+on:
+  push:
+    branches:
+      - azure-cli-auth
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-azure-cli-auth:
+    environment: azure-cli-auth
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Azure CLI login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Test azure-cli-auth backend
+        run: |
+          cargo run --bin test-prompt -- \
+            --azure-cli-auth \
+            --azure-openai '${{ secrets.AZURE_OPENAI_ENDPOINT }}' \
+            "Say hello"
