@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DEFAULT_API_URL: &str = "https://models.inference.ai.azure.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
@@ -157,6 +157,119 @@ struct ApiEndpoint<'a> {
     rate_limits: Option<&'a Mutex<RateLimitState>>,
 }
 
+/// How the Azure OpenAI backend authenticates.
+pub enum AzureAuth {
+    /// Static API key sent in the `api-key` header.
+    ApiKey(String),
+    /// Bearer token obtained by shelling out to `az account
+    /// get-access-token`.  The token is cached and refreshed
+    /// automatically when it approaches expiry.
+    AzureCli(Mutex<CachedToken>),
+}
+
+/// A Bearer token with an expiry timestamp, obtained from the Azure
+/// CLI and refreshed on demand.
+pub struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+/// Margin before the nominal expiry at which we proactively refresh
+/// the token, so that a long-running API call does not race against
+/// expiration.
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+impl AzureAuth {
+    /// Return a fresh Bearer token string suitable for a single
+    /// request.  For the `AzureCli` variant this transparently
+    /// refreshes the cached token when it is within
+    /// `TOKEN_REFRESH_MARGIN` of expiry.
+    fn bearer_token(&self) -> Result<Option<String>> {
+        match self {
+            AzureAuth::ApiKey(_) => Ok(None),
+            AzureAuth::AzureCli(cached) => {
+                let needs_refresh = {
+                    let c = cached.lock().expect("token lock poisoned");
+                    c.expires_at.saturating_duration_since(Instant::now())
+                        < TOKEN_REFRESH_MARGIN
+                };
+                if needs_refresh {
+                    let fresh = fetch_azure_cli_token()?;
+                    let mut c = cached.lock().expect("token lock poisoned");
+                    *c = fresh;
+                }
+                let c = cached.lock().expect("token lock poisoned");
+                Ok(Some(c.token.clone()))
+            }
+        }
+    }
+}
+
+/// Shell out to `az account get-access-token` and return the token
+/// string together with an `Instant` at which it expires.
+fn fetch_azure_cli_token() -> Result<CachedToken> {
+    let output = std::process::Command::new("az")
+        .args([
+            "account",
+            "get-access-token",
+            "--resource",
+            "https://cognitiveservices.azure.com",
+            "--output",
+            "json",
+        ])
+        .output()
+        .context("failed to run `az account get-access-token`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`az account get-access-token` failed: {stderr}");
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse az CLI JSON output")?;
+    let token = parsed["accessToken"]
+        .as_str()
+        .context("az CLI output missing `accessToken` field")?
+        .to_string();
+
+    // Extract the expiry from the JWT `exp` claim rather than
+    // parsing the locale-dependent `expiresOn` string.
+    let expires_at = jwt_exp_to_instant(&token)?;
+    eprintln!(
+        "[azure-cli] obtained token, expires in {:.0}s",
+        expires_at.saturating_duration_since(Instant::now()).as_secs_f64()
+    );
+    Ok(CachedToken { token, expires_at })
+}
+
+/// Decode the `exp` claim from a JWT (without verifying the
+/// signature) and convert it to an `Instant`.  The JWT is a
+/// three-segment base64url-encoded string; the middle segment is
+/// the payload containing `{"exp": <unix_seconds>, ...}`.
+fn jwt_exp_to_instant(token: &str) -> Result<Instant> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let payload = token
+        .split('.')
+        .nth(1)
+        .context("JWT has no payload segment")?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("JWT payload is not valid base64url")?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&decoded).context("JWT payload is not valid JSON")?;
+    let exp = claims["exp"]
+        .as_i64()
+        .context("JWT payload missing `exp` claim")?;
+
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let remaining_secs = exp - now_unix;
+    let remaining = if remaining_secs > 0 {
+        Duration::from_secs(remaining_secs as u64)
+    } else {
+        Duration::ZERO
+    };
+    Ok(Instant::now() + remaining)
+}
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -178,11 +291,13 @@ pub enum Backend {
         token: String,
         rate_limits: Mutex<RateLimitState>,
     },
-    /// Azure OpenAI Service — uses `api-key` header for authentication.
+    /// Azure OpenAI Service — authenticates via either a static
+    /// `api-key` header or a Bearer token obtained from the Azure CLI
+    /// (for OIDC / federated credential flows).
     AzureOpenAI {
         api_url: String,
         model: String,
-        api_key: String,
+        auth: AzureAuth,
     },
     /// Deterministic mock for testing.  Returns every Nth word from
     /// the user message (default: every 5th word).
@@ -249,8 +364,21 @@ impl Backend {
         Self::AzureOpenAI {
             api_url,
             model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
-            api_key,
+            auth: AzureAuth::ApiKey(api_key),
         }
+    }
+
+    /// Build an Azure OpenAI backend that obtains Bearer tokens by
+    /// shelling out to `az account get-access-token`.  The first
+    /// token is fetched eagerly so that misconfiguration surfaces
+    /// immediately rather than mid-pipeline.
+    pub fn azure_openai_cli(api_url: String, model: Option<String>) -> Result<Self> {
+        let cached = fetch_azure_cli_token()?;
+        Ok(Self::AzureOpenAI {
+            api_url,
+            model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
+            auth: AzureAuth::AzureCli(Mutex::new(cached)),
+        })
     }
 
     /// Send a system + user message pair and return the assistant reply.
@@ -311,12 +439,18 @@ impl Backend {
             Backend::AzureOpenAI {
                 api_url,
                 model,
-                api_key,
+                auth,
             } => {
+                let bearer = auth.bearer_token()?;
+                let api_auth = match (&auth, &bearer) {
+                    (AzureAuth::ApiKey(k), _) => ApiAuth::ApiKey(k),
+                    (AzureAuth::AzureCli(_), Some(t)) => ApiAuth::Bearer(t),
+                    (AzureAuth::AzureCli(_), None) => unreachable!(),
+                };
                 let ep = ApiEndpoint {
                     api_url,
                     model,
-                    auth: ApiAuth::ApiKey(api_key),
+                    auth: api_auth,
                     rate_limits: None,
                 };
                 chat_api(&ep, system, user, temperature).await
@@ -366,6 +500,12 @@ pub struct BackendArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
+    /// Authenticate to Azure OpenAI via `az account get-access-token`
+    /// instead of a static API key.  Requires a prior `az login`
+    /// (or `azure/login` in GitHub Actions).  Implies --azure-openai.
+    #[arg(long)]
+    pub azure_cli_auth: bool,
+
     /// Model to use (applies to all backends).
     #[arg(long)]
     pub model: Option<String>,
@@ -392,12 +532,25 @@ impl BackendArgs {
             } else {
                 url
             };
-            let api_key = std::env::var("AZURE_OPENAI_API_KEY")
-                .context("AZURE_OPENAI_API_KEY must be set for --azure-openai")?;
             let model = self
                 .model
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
-            Ok(Backend::azure_openai(api_url, model, api_key))
+            if self.azure_cli_auth {
+                Backend::azure_openai_cli(api_url, model)
+            } else {
+                let api_key = std::env::var("AZURE_OPENAI_API_KEY")
+                    .context("AZURE_OPENAI_API_KEY must be set for --azure-openai \
+                              (or use --azure-cli-auth for federated credentials)")?;
+                Ok(Backend::azure_openai(api_url, model, api_key))
+            }
+        } else if self.azure_cli_auth {
+            let api_url = std::env::var("AZURE_OPENAI_ENDPOINT").context(
+                "AZURE_OPENAI_ENDPOINT must be set (or pass the URL to --azure-openai)",
+            )?;
+            let model = self
+                .model
+                .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
+            Backend::azure_openai_cli(api_url, model)
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
@@ -459,9 +612,7 @@ async fn chat_api(
 
     let client = reqwest::Client::new();
     let base = ep.api_url.trim_end_matches('/');
-    let url = if base.ends_with("/chat/completions")
-        || base.contains("/chat/completions?")
-    {
+    let url = if base.ends_with("/chat/completions") || base.contains("/chat/completions?") {
         base.to_string()
     } else {
         format!("{base}/chat/completions")
@@ -1191,5 +1342,29 @@ mod tests {
         let backend = Backend::MockNoChoices;
         let err = backend.chat("sys", "usr").await.unwrap_err();
         assert!(is_no_choices(&err), "expected NoChoicesError, got: {err:#}");
+    }
+
+    #[test]
+    fn jwt_exp_parses_correctly() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // Build a minimal JWT whose `exp` is 3600 seconds from now.
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let exp = now_unix + 3600;
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload =
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        let token = format!("{header}.{payload}.");
+
+        let instant = jwt_exp_to_instant(&token).expect("should parse");
+        let remaining = instant
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        // Should be close to 3600s, allow 5s tolerance for test
+        // execution time.
+        assert!(
+            (3595..=3600).contains(&remaining),
+            "expected ~3600s remaining, got {remaining}s"
+        );
     }
 }

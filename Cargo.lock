@@ -980,6 +980,7 @@ name = "lore-git-md-helper"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "html2text",
  "humantime",
