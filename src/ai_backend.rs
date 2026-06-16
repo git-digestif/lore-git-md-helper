@@ -459,9 +459,7 @@ async fn chat_api(
 
     let client = reqwest::Client::new();
     let base = ep.api_url.trim_end_matches('/');
-    let url = if base.ends_with("/chat/completions")
-        || base.contains("/chat/completions?")
-    {
+    let url = if base.ends_with("/chat/completions") || base.contains("/chat/completions?") {
         base.to_string()
     } else {
         format!("{base}/chat/completions")
