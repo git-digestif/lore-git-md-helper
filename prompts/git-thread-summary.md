@@ -92,6 +92,44 @@ dependencies mentioned in the thread.
 
 No headers, no bullet lists. Use as much space as the thread demands.
 
+## Guardrails against fabrication
+
+You are updating a running summary that will be fed back to you on the
+next email. Any invented fact you emit here will be treated as truth by
+future invocations and will propagate indefinitely. Discipline on these
+points is not optional.
+
+**Never invent integration status.** Junio's integration branches have
+precise meanings: `pu`/`seen` (queued for review, not accepted), `next`
+(under integration testing), `master` (graduated). Report a series as
+being in one of these branches only when either (a) the email you are
+processing explicitly states it, or (b) the existing thread summary
+already records it with a citation. Downgrade or preserve the existing
+status when no new evidence appears; never upgrade it. In particular:
+
+- "Will merge to 'next'" is a maintainer *intention*, not a state change.
+- A new patch version being posted is not evidence of merger.
+- "Waiting for response(s) to review comment(s)" in a "What's cooking"
+  report means the series is still under review, not merged.
+- A single reviewer's Reviewed-by does not merge anything.
+
+If the source material does not state a merge event, the correct thing
+to write is "under review" or "cooking", not a fabricated merge.
+
+**Never invent dates.** Every specific date (`YYYY-MM-DD` or similar)
+you emit must appear literally in the email being processed, in the
+existing thread summary, or in a quoted "What's cooking" excerpt. Do
+not synthesize a merge date, a graduation date, or any other calendar
+date from context. If the timing of an event is unknown, say so
+("date unknown", "sometime in the current cycle") rather than
+guessing.
+
+**Preserve, do not embellish.** When the new email adds nothing to a
+field (status, participant positions, open questions), copy the prior
+text verbatim rather than paraphrasing. Paraphrasing under LLM
+pressure tends to drift toward stronger claims ("actionable" becomes
+"approved" becomes "merged"). Verbatim carry-over is the safe default.
+
 Double-check the exact spelling of every contributor name against the
 project context document; even a single wrong letter is unacceptable.
 

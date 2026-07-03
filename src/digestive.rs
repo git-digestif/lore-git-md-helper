@@ -19,6 +19,7 @@ use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
 use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
 use crate::thread_file::{self, ThreadTree};
+use crate::wc_parse::{self, WcTopic};
 
 /// An email in the date range, with its thread root and summary status.
 pub struct EmailToSummarize {
@@ -724,7 +725,7 @@ impl<'a> Digestive<'a> {
 
         let before = self.resolve_before_oid();
         let (threads, email_count) =
-            build_day_digest_input(&self.day_summaries, &before, &mut self.cached);
+            build_day_digest_input(&self.day_summaries, &before, self.git_ref, &mut self.cached);
         let digest = generate_daily_digest(
             day,
             &threads,
@@ -1208,6 +1209,11 @@ pub struct ThreadDayActivity {
     pub thread_ai_before: Option<String>,
     /// Today's email AI summaries, in chronological order.
     pub email_summaries: Vec<(String, String)>,
+    /// Authoritative status for this thread's topic, extracted from
+    /// today's "What's cooking in git.git" email if one is present.
+    /// `None` when Junio has not published a verdict for this thread,
+    /// or when today has no "What's cooking" email at all.
+    pub wc_status: Option<WcTopic>,
 }
 
 /// Output from daily digest generation.
@@ -1221,9 +1227,15 @@ pub struct DayDigestOutput {
 /// `before_commit` is the ref/sha whose `.thread.ai.md` files represent
 /// the accumulated thread state *before* today's emails.  For each thread
 /// active today, we read the "before" state from that commit.
+///
+/// `git_ref` is the ref at which today's newly imported `.md` blobs
+/// are visible; it is used to load the "What's cooking in git.git"
+/// email (if any) and each thread root's Message-ID for
+/// reconciliation.
 pub fn build_day_digest_input(
     summaries: &[(String, String, String)], // (dk, root_dk, ai_summary)
     before_commit: &str,
+    git_ref: &str,
     cat: &mut impl BlobRead,
 ) -> (Vec<ThreadDayActivity>, usize) {
     use std::collections::BTreeMap;
@@ -1237,21 +1249,63 @@ pub fn build_day_digest_input(
     }
 
     let email_count = summaries.len();
+    let wc_map = load_whats_cooking_map(summaries, git_ref, cat);
 
     let threads: Vec<ThreadDayActivity> = by_thread
         .into_iter()
         .map(|(root_dk, emails)| {
             let spec = format!("{before_commit}:{root_dk}.thread.ai.md");
             let thread_ai_before = cat.get_str(&spec);
+            let wc_status = lookup_wc_status(&root_dk, git_ref, cat, &wc_map);
             ThreadDayActivity {
                 root_dk,
                 thread_ai_before,
                 email_summaries: emails,
+                wc_status,
             }
         })
         .collect();
 
     (threads, email_count)
+}
+
+/// Scan today's summaries for a "What's cooking in git.git" email
+/// and, if found, parse it into a Message-ID -> topic map.  Returns
+/// an empty map when no such email is present.
+fn load_whats_cooking_map(
+    summaries: &[(String, String, String)],
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+) -> HashMap<String, WcTopic> {
+    for (dk, _root, _ai) in summaries {
+        let spec = format!("{git_ref}:{dk}.md");
+        let Some(md) = cat.get_str(&spec) else {
+            continue;
+        };
+        let parsed = rag_parse::parse_email(&md);
+        if parsed.subject.starts_with("What's cooking in git.git") {
+            return wc_parse::parse_whats_cooking(&parsed.body);
+        }
+    }
+    HashMap::new()
+}
+
+/// Look up a thread root's Message-ID in the parsed "What's cooking"
+/// map, returning Junio's authoritative status entry when the thread
+/// corresponds to a topic he has weighed in on.
+fn lookup_wc_status(
+    root_dk: &str,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    wc_map: &HashMap<String, WcTopic>,
+) -> Option<WcTopic> {
+    if wc_map.is_empty() {
+        return None;
+    }
+    let spec = format!("{git_ref}:{root_dk}.md");
+    let md = cat.get_str(&spec)?;
+    let parsed = rag_parse::parse_email(&md);
+    wc_map.get(&parsed.message_id).cloned()
 }
 
 /// Generate a daily digest from thread deltas.
@@ -1266,31 +1320,7 @@ pub async fn generate_daily_digest(
     backend: &Backend,
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
-
-    // Compute the weekday name so the LLM does not have to guess it.
-    let weekday = crate::date_util::parse_day(day)
-        .map(|d| format!("{}", d.weekday()))
-        .unwrap_or_default();
-
-    let mut user_msg = format!(
-        "Date: {day} ({weekday})\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
-    );
-
-    for activity in threads {
-        user_msg.push_str("---\n\n");
-        user_msg.push_str(&format!("Thread root: {}\n\n", activity.root_dk));
-
-        if let Some(ref before) = activity.thread_ai_before {
-            user_msg.push_str("Previous thread state (before today):\n\n");
-            user_msg.push_str(before);
-            user_msg.push_str("\n\n");
-        }
-
-        user_msg.push_str("Today's new emails in this thread:\n\n");
-        for (dk, ai) in &activity.email_summaries {
-            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
-        }
-    }
+    let user_msg = build_daily_digest_user_msg(day, threads, email_count);
 
     eprintln!(
         "[digestive] generating daily digest for {day} ({email_count} emails, {thread_count} threads) ...",
@@ -1312,6 +1342,55 @@ pub async fn generate_daily_digest(
         human: summarize::normalize_headings(&human),
         ai,
     })
+}
+
+/// Assemble the mode-agnostic user message for `generate_daily_digest`.
+///
+/// Extracted so that the "Authoritative status" injection can be
+/// exercised in a unit test without invoking the backend.
+pub(crate) fn build_daily_digest_user_msg(
+    day: &str,
+    threads: &[ThreadDayActivity],
+    email_count: usize,
+) -> String {
+    let thread_count = threads.len();
+
+    // Compute the weekday name so the LLM does not have to guess it.
+    let weekday = crate::date_util::parse_day(day)
+        .map(|d| format!("{}", d.weekday()))
+        .unwrap_or_default();
+
+    let mut user_msg = format!(
+        "Date: {day} ({weekday})\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
+    );
+
+    for activity in threads {
+        user_msg.push_str("---\n\n");
+        user_msg.push_str(&format!("Thread root: {}\n\n", activity.root_dk));
+
+        if let Some(ref wc) = activity.wc_status {
+            user_msg.push_str(&format!(
+                "Authoritative status (from today's \"What's cooking\"):\n\
+                 \x20\x20section: [{}]\n\
+                 \x20\x20topic:   {}\n\
+                 \x20\x20status:  {}\n\n",
+                wc.section, wc.topic, wc.status_line,
+            ));
+        }
+
+        if let Some(ref before) = activity.thread_ai_before {
+            user_msg.push_str("Previous thread state (before today):\n\n");
+            user_msg.push_str(before);
+            user_msg.push_str("\n\n");
+        }
+
+        user_msg.push_str("Today's new emails in this thread:\n\n");
+        for (dk, ai) in &activity.email_summaries {
+            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
+        }
+    }
+
+    user_msg
 }
 
 #[cfg(test)]
@@ -1701,7 +1780,7 @@ mod tests {
             "2025/01/06/10-00-00".into(),
             "email ai".into(),
         )];
-        let (threads, count) = build_day_digest_input(&summaries, "before", &mut blobs);
+        let (threads, count) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
         assert_eq!(count, 1);
         assert_eq!(threads.len(), 1);
         assert!(
@@ -1722,7 +1801,7 @@ mod tests {
             "2025/01/05/09-00-00".into(),
             "reply ai".into(),
         )];
-        let (threads, _) = build_day_digest_input(&summaries, "before", &mut blobs);
+        let (threads, _) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
         assert_eq!(
             threads[0].thread_ai_before.as_deref(),
             Some("prior thread summary")
@@ -1737,7 +1816,7 @@ mod tests {
             "2025/01/05/09-00-00".into(),
             "new reply".into(),
         )];
-        let (threads, _) = build_day_digest_input(&summaries, "before", &mut blobs);
+        let (threads, _) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
         assert!(
             threads[0].thread_ai_before.is_none(),
             "should not see thread summary from a commit after the daily digest"
@@ -1768,7 +1847,7 @@ mod tests {
                 "reply2".into(),
             ),
         ];
-        let (threads, count) = build_day_digest_input(&summaries, "before", &mut blobs);
+        let (threads, count) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
         assert_eq!(count, 3);
         assert_eq!(threads.len(), 2);
 
@@ -1792,6 +1871,100 @@ mod tests {
             "new thread has no prior state"
         );
         assert_eq!(new.email_summaries.len(), 1);
+    }
+
+    /// Populates the "What's cooking" map when a matching email is
+    /// present in today's summaries, and threads the resulting
+    /// status back to the affected thread via the root's Message-ID.
+    #[test]
+    fn test_build_day_digest_reconciles_with_whats_cooking() {
+        const WC_DK: &str = "2026/07/01/23-40-16";
+        const ROOT_DK: &str = "2026/06/26/05-48-11";
+        const ROOT_MSGID: &str = "20260626-toon-git-replay-drop-merges-v5-0-5e120738b9d0@iotcl.com";
+
+        let wc_md = format!(
+            "# What's cooking in git.git (Jul 2026, #01)\n\n\
+            | Header | Value |\n|---|---|\n| **From** | Junio |\n\
+            \n**Thread**: [t](t.md)\n\n\
+            [Cooking]\n\n\
+            * tc/replay-linearize (2026-06-25) 3 commits\n\
+            \x20- replay: offer an option to linearize the commit topology\n\n\
+            \x20git replay learns --linearize option.\n\n\
+            \x20Waiting for response(s) to review comment(s).\n\
+            \x20source: <{ROOT_MSGID}>\n",
+        );
+        let root_md = format!(
+            "# [PATCH v5 1/3] replay: add helper\n\n\
+            | Header | Value |\n|---|---|\n\
+            | **From** | Toon |\n\
+            | **Date** | 2026-06-26T07:48:11+02:00 |\n\
+            | **Message-ID** | [{ROOT_MSGID}](https://lore.kernel.org/git/{ROOT_MSGID}) |\n\
+            \n**Thread**: [t](t.md)\n\n\
+            Patch body.\n",
+        );
+
+        let mut blobs = MockBlobs(Default::default());
+        blobs.0.insert(format!("test:{WC_DK}.md"), wc_md);
+        blobs.0.insert(format!("test:{ROOT_DK}.md"), root_md);
+
+        let summaries = vec![
+            (WC_DK.into(), WC_DK.into(), "wc summary".into()),
+            (ROOT_DK.into(), ROOT_DK.into(), "linearize summary".into()),
+        ];
+        let (threads, _) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
+
+        let linearize = threads.iter().find(|t| t.root_dk == ROOT_DK).unwrap();
+        let wc = linearize
+            .wc_status
+            .as_ref()
+            .expect("linearize thread must get Junio's authoritative status");
+        assert_eq!(wc.section, "Cooking");
+        assert_eq!(wc.topic, "tc/replay-linearize");
+        assert_eq!(
+            wc.status_line,
+            "Waiting for response(s) to review comment(s).",
+        );
+
+        let wc_thread = threads.iter().find(|t| t.root_dk == WC_DK).unwrap();
+        assert!(
+            wc_thread.wc_status.is_none(),
+            "the What's cooking email's own thread must not be marked with itself as a topic",
+        );
+    }
+
+    /// The daily-digest user message must surface Junio's status
+    /// verbatim so the LLM cannot invent a competing claim.
+    #[test]
+    fn test_daily_digest_user_msg_includes_authoritative_status() {
+        let activity = ThreadDayActivity {
+            root_dk: "2026/06/26/05-48-11".into(),
+            thread_ai_before: Some("prior summary claiming merged to master".into()),
+            email_summaries: vec![("2026/07/01/08-50-41".into(), "reply summary".into())],
+            wc_status: Some(WcTopic {
+                section: "Cooking".into(),
+                topic: "tc/replay-linearize".into(),
+                status_line: "Waiting for response(s) to review comment(s).".into(),
+            }),
+        };
+        let msg = build_daily_digest_user_msg("2026/07/01", &[activity], 1);
+
+        assert!(
+            msg.contains("Authoritative status"),
+            "should announce the authoritative block: {msg}",
+        );
+        assert!(msg.contains("section: [Cooking]"), "missing section");
+        assert!(
+            msg.contains("topic:   tc/replay-linearize"),
+            "missing topic"
+        );
+        assert!(
+            msg.contains("status:  Waiting for response(s) to review comment(s)."),
+            "missing status line verbatim",
+        );
+        assert!(
+            msg.contains("prior summary claiming merged to master"),
+            "prior summary must still be visible so the model can note the discrepancy",
+        );
     }
 
     /// Backfill test: a reply to a dormant thread triggers
