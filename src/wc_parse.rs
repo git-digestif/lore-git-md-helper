@@ -175,6 +175,7 @@ fn strip_msgid(rest: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rag_parse;
 
     /// Verbatim excerpt from `2026/07/01/23-40-16.md` (Junio's
     /// "What's cooking in git.git (Jul 2026, #01)"), covering three
@@ -302,5 +303,42 @@ mod tests {
         );
         assert_eq!(parse_section_header("Not a section"), None);
         assert_eq!(parse_section_header("[]"), None);
+    }
+
+    /// Full "What's cooking in git.git (Jul 2026, #01)" report,
+    /// captured from `2026/07/01/23-40-16.md` in the corpus.  This
+    /// is the exact input that, on 2026-07-01, coincided with a
+    /// daily-digest LLM run publishing "git replay --linearize
+    /// merged with post-merge issues identified" -- while Junio had
+    /// in fact placed `tc/replay-linearize` in [Cooking], "Waiting
+    /// for response(s) to review comment(s)."  The parser must
+    /// extract that entry verbatim so downstream reconciliation
+    /// leaves the LLM no room to make up a competing verdict.
+    const REPORT_2026_07_01: &str = include_str!("../tests/fixtures/whats-cooking-2026-07-01.md");
+
+    #[test]
+    fn full_2026_07_01_report_reconciles_linearize_topic() {
+        let body = rag_parse::parse_email(REPORT_2026_07_01).body;
+        let map = parse_whats_cooking(&body);
+
+        let linearize = map
+            .get("20260626-toon-git-replay-drop-merges-v5-0-5e120738b9d0@iotcl.com")
+            .expect("tc/replay-linearize must appear in the parsed map");
+        assert_eq!(linearize.section, "Cooking");
+        assert_eq!(linearize.topic, "tc/replay-linearize");
+        assert_eq!(
+            linearize.status_line, "Waiting for response(s) to review comment(s).",
+            "the exact status line Junio wrote must be preserved verbatim",
+        );
+
+        // Guard against silent whole-section drops: the July 1
+        // report has 70 topic entries across [New Topics] (8),
+        // [Stalled] (4), and [Cooking] (58), all of which carry a
+        // `source:` line and must survive parsing.
+        assert_eq!(
+            map.len(),
+            70,
+            "unexpected topic count -- a section may have been dropped",
+        );
     }
 }
