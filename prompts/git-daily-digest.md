@@ -36,6 +36,29 @@ be included. You should weave that continuity into your account naturally --
 not as a recap section, but as background woven into the paragraph covering
 that thread.
 
+### Authoritative status from "What's cooking"
+
+When today's traffic includes a "What's cooking in git.git" report from
+Junio Hamano, the caller extracts the entry Junio wrote for each active
+topic and attaches it directly to the affected thread as an
+**Authoritative status** block, showing the section (`[Cooking]`,
+`[New Topics]`, `[Stalled]`, `[Graduated to 'master']`, ...), the
+topic short-name, and the one-line status verbatim.
+
+Treat this block as ground truth. It overrides any conflicting merge or
+graduation claim the thread's own summary may contain, whether the claim
+appears in the "Previous thread state" or in today's email briefs. If
+the authoritative status says the topic is `Waiting for response(s) to
+review comment(s).`, do not write that it has been merged, no matter
+what the thread brief asserts; if the status is `Will merge to 'next'.`
+that is a stated intention, not a merge event.
+
+When you cover such a thread, phrase the state in your own words but
+keep the substance faithful to the authoritative line, and prefer
+Junio's short-name (e.g. `tc/replay-linearize`) when referring to the
+topic. If a thread has no authoritative status block, fall back to the
+thread brief as before.
+
 ## Structure
 
 Write the digest as free-flowing prose, divided into natural sections with

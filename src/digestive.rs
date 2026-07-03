@@ -1320,31 +1320,7 @@ pub async fn generate_daily_digest(
     backend: &Backend,
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
-
-    // Compute the weekday name so the LLM does not have to guess it.
-    let weekday = crate::date_util::parse_day(day)
-        .map(|d| format!("{}", d.weekday()))
-        .unwrap_or_default();
-
-    let mut user_msg = format!(
-        "Date: {day} ({weekday})\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
-    );
-
-    for activity in threads {
-        user_msg.push_str("---\n\n");
-        user_msg.push_str(&format!("Thread root: {}\n\n", activity.root_dk));
-
-        if let Some(ref before) = activity.thread_ai_before {
-            user_msg.push_str("Previous thread state (before today):\n\n");
-            user_msg.push_str(before);
-            user_msg.push_str("\n\n");
-        }
-
-        user_msg.push_str("Today's new emails in this thread:\n\n");
-        for (dk, ai) in &activity.email_summaries {
-            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
-        }
-    }
+    let user_msg = build_daily_digest_user_msg(day, threads, email_count);
 
     eprintln!(
         "[digestive] generating daily digest for {day} ({email_count} emails, {thread_count} threads) ...",
@@ -1366,6 +1342,55 @@ pub async fn generate_daily_digest(
         human: summarize::normalize_headings(&human),
         ai,
     })
+}
+
+/// Assemble the mode-agnostic user message for `generate_daily_digest`.
+///
+/// Extracted so that the "Authoritative status" injection can be
+/// exercised in a unit test without invoking the backend.
+pub(crate) fn build_daily_digest_user_msg(
+    day: &str,
+    threads: &[ThreadDayActivity],
+    email_count: usize,
+) -> String {
+    let thread_count = threads.len();
+
+    // Compute the weekday name so the LLM does not have to guess it.
+    let weekday = crate::date_util::parse_day(day)
+        .map(|d| format!("{}", d.weekday()))
+        .unwrap_or_default();
+
+    let mut user_msg = format!(
+        "Date: {day} ({weekday})\nTotal emails today: {email_count}\nActive threads: {thread_count}\n\n",
+    );
+
+    for activity in threads {
+        user_msg.push_str("---\n\n");
+        user_msg.push_str(&format!("Thread root: {}\n\n", activity.root_dk));
+
+        if let Some(ref wc) = activity.wc_status {
+            user_msg.push_str(&format!(
+                "Authoritative status (from today's \"What's cooking\"):\n\
+                 \x20\x20section: [{}]\n\
+                 \x20\x20topic:   {}\n\
+                 \x20\x20status:  {}\n\n",
+                wc.section, wc.topic, wc.status_line,
+            ));
+        }
+
+        if let Some(ref before) = activity.thread_ai_before {
+            user_msg.push_str("Previous thread state (before today):\n\n");
+            user_msg.push_str(before);
+            user_msg.push_str("\n\n");
+        }
+
+        user_msg.push_str("Today's new emails in this thread:\n\n");
+        for (dk, ai) in &activity.email_summaries {
+            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
+        }
+    }
+
+    user_msg
 }
 
 #[cfg(test)]
@@ -1904,6 +1929,41 @@ mod tests {
         assert!(
             wc_thread.wc_status.is_none(),
             "the What's cooking email's own thread must not be marked with itself as a topic",
+        );
+    }
+
+    /// The daily-digest user message must surface Junio's status
+    /// verbatim so the LLM cannot invent a competing claim.
+    #[test]
+    fn test_daily_digest_user_msg_includes_authoritative_status() {
+        let activity = ThreadDayActivity {
+            root_dk: "2026/06/26/05-48-11".into(),
+            thread_ai_before: Some("prior summary claiming merged to master".into()),
+            email_summaries: vec![("2026/07/01/08-50-41".into(), "reply summary".into())],
+            wc_status: Some(WcTopic {
+                section: "Cooking".into(),
+                topic: "tc/replay-linearize".into(),
+                status_line: "Waiting for response(s) to review comment(s).".into(),
+            }),
+        };
+        let msg = build_daily_digest_user_msg("2026/07/01", &[activity], 1);
+
+        assert!(
+            msg.contains("Authoritative status"),
+            "should announce the authoritative block: {msg}",
+        );
+        assert!(msg.contains("section: [Cooking]"), "missing section");
+        assert!(
+            msg.contains("topic:   tc/replay-linearize"),
+            "missing topic"
+        );
+        assert!(
+            msg.contains("status:  Waiting for response(s) to review comment(s)."),
+            "missing status line verbatim",
+        );
+        assert!(
+            msg.contains("prior summary claiming merged to master"),
+            "prior summary must still be visible so the model can note the discrepancy",
         );
     }
 
