@@ -223,6 +223,11 @@ impl ThreadTree {
         self.parents.get(date_key)?.as_deref()
     }
 
+    /// Look up a node's metadata by date-key.
+    pub fn node_of(&self, date_key: &str) -> Option<&ThreadNode> {
+        self.nodes.get(date_key)
+    }
+
     /// Return the date-key of the first root node (depth-0, no parent).
     ///
     /// Well-formed thread files always have exactly one root, but this
