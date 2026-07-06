@@ -255,10 +255,26 @@ pub fn load_email_context(
         cat.get_str(&spec)
     });
 
+    // From: line of the email itself (drives self-attribution of any
+    // unquoted stretch following a quote block).
+    let from = rag_parse::parse_email(&email_md).author;
+    let from = if from.is_empty() { None } else { Some(from) };
+
+    // From: line of the parent email (drives first-level quote-block
+    // attribution).  Only relevant for replies.
+    let parent_from = email.parent_dk.as_ref().and_then(|parent_dk| {
+        let spec = format!("{git_ref}:{parent_dk}.md");
+        let md = cat.get_str(&spec)?;
+        let a = rag_parse::parse_email(&md).author;
+        if a.is_empty() { None } else { Some(a) }
+    });
+
     Some(EmailContext {
         email_md,
         thread_ai_summary,
         parent_ai_summary,
+        from,
+        parent_from,
     })
 }
 
