@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use lore_git_md_helper::ai_backend::BackendArgs;
-use lore_git_md_helper::digestive::{Digestive, redo_daily, resummarize_thread};
+use lore_git_md_helper::digestive::{Digestive, redo_daily, resummarize_email, resummarize_thread};
 use lore_git_md_helper::git_util::last_digest_day;
 
 #[derive(Parser)]
@@ -62,6 +62,15 @@ enum Cmd {
         /// The thread root's date-key (e.g. "2026/06/08/18-37-18").
         root_dk: String,
     },
+    /// Regenerate every per-email `.ai.md` and `.human.md` within one
+    /// thread by re-running the email summarizer on each with fresh
+    /// context.  Use this when a per-email brief itself contains a
+    /// fabricated claim; running `resummarize-thread` alone would
+    /// carry the poisoned input forward.
+    ResummarizeEmail {
+        /// The thread root's date-key (e.g. "2026/06/08/18-37-18").
+        root_dk: String,
+    },
     /// Regenerate `digest.human.md` and `digest.ai.md` for a given
     /// day using the current tip's per-email `.ai.md` files and the
     /// previous day's digest tree as the "before" state.
@@ -114,6 +123,12 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .context("--dry-run is not supported for resummarize-thread")?;
             resummarize_thread(&target_repo, &git_ref, &root_dk, backend).await
+        }
+        Some(Cmd::ResummarizeEmail { root_dk }) => {
+            let backend = backend
+                .as_ref()
+                .context("--dry-run is not supported for resummarize-email")?;
+            resummarize_email(&target_repo, &git_ref, &root_dk, backend).await
         }
         Some(Cmd::RedoDaily { day }) => {
             let backend = backend

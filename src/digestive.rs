@@ -1534,6 +1534,120 @@ pub async fn resummarize_thread(
     Ok(())
 }
 
+/// Regenerate every per-email `.ai.md` and `.human.md` file within
+/// one thread by walking its emails in chronological order and
+/// invoking `summarize::summarize_email` on each with fresh context.
+///
+/// Written for retroactive fixes to threads whose per-email briefs
+/// themselves contain fabricated claims (typically a per-email
+/// summarizer promoting a `seen` topic to "merged").  A subsequent
+/// `resummarize_thread` on the same root will then rebuild the
+/// thread AI/human summaries from clean inputs, and any downstream
+/// `redo_daily` will pick up clean briefs.
+///
+/// Emits a single fast-import commit `digestive: resummarize
+/// per-email briefs in thread <root_dk>` containing all rebuilt
+/// files, plus updated `.thread.ai.md` / `.thread.human.md`
+/// reflecting the final iteration state.
+pub async fn resummarize_email(
+    repo_path: &str,
+    git_ref: &str,
+    root_dk: &str,
+    backend: &Backend,
+) -> Result<()> {
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+    let (found_root, tree) = thread_file::load_from_repo(&mut cat, git_ref, root_dk)
+        .ok_or_else(|| anyhow::anyhow!("no .thread.md found for {root_dk}"))?;
+    if found_root != root_dk {
+        anyhow::bail!("date-key {root_dk} is not a thread root; its root is {found_root}",);
+    }
+
+    let mut dks: Vec<String> = tree.date_keys().map(str::to_string).collect();
+    dks.sort();
+    if dks.is_empty() {
+        anyhow::bail!("thread {root_dk} is empty");
+    }
+
+    let mut prev_thread_ai: Option<String> = None;
+    let mut prev_thread_human: Option<String> = None;
+    // (path, content) pairs to write in the final commit.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for dk in &dks {
+        let md_spec = format!("{git_ref}:{dk}.md");
+        let Some(email_md) = cat.get_str(&md_spec) else {
+            eprintln!("[resummarize-email] skip {dk} (no .md)");
+            continue;
+        };
+
+        let parent_dk = tree.parent_of(dk).map(str::to_string);
+        let from = tree.node_of(dk).map(|n| n.from.clone());
+        let parent_from = parent_dk
+            .as_deref()
+            .and_then(|p| tree.node_of(p).map(|n| n.from.clone()));
+
+        // Parent's per-email brief comes from what we have already
+        // regenerated (freshest) if present in `files`, otherwise
+        // fall back to the on-disk (possibly poisoned) version.
+        let parent_ai_summary = parent_dk.as_deref().and_then(|p| {
+            let want = format!("{p}.ai.md");
+            files.iter().find_map(|(path, content)| {
+                if path == &want {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            })
+        });
+
+        eprintln!(
+            "[resummarize-email] {dk} by {}",
+            from.as_deref().unwrap_or("(unknown)"),
+        );
+
+        let ctx = summarize::EmailContext {
+            email_md,
+            thread_ai_summary: prev_thread_ai.clone(),
+            parent_ai_summary,
+            from,
+            parent_from,
+        };
+        let out = summarize::summarize_email(&ctx, backend)
+            .await
+            .with_context(|| format!("resummarize {dk}"))?;
+
+        files.push((format!("{dk}.human.md"), out.human_summary));
+        files.push((format!("{dk}.ai.md"), out.ai_summary));
+        prev_thread_ai = Some(out.thread_ai_summary.clone());
+        prev_thread_human = Some(out.thread_human_summary.clone());
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("no per-email .md files found in thread");
+    }
+    // Also refresh the thread summaries to the final iteration state.
+    if let (Some(ai), Some(human)) = (prev_thread_ai, prev_thread_human) {
+        files.push((format!("{root_dk}.thread.ai.md"), ai));
+        files.push((format!("{root_dk}.thread.human.md"), human));
+    }
+
+    let mut fi = FastImport::new(repo_path, git_ref)?;
+    if let Some(oid) = resolve_ref(repo_path, git_ref) {
+        fi.set_parent(oid);
+    }
+    let mut msg = format!("digestive: resummarize per-email briefs in thread {root_dk}");
+    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
+        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    fi.commit(&msg, &refs)?;
+    fi.checkpoint()?;
+    fi.finish()?;
+    Ok(())
+}
+
 /// Regenerate the daily digest files (`digest.human.md`, `digest.ai.md`)
 /// for `day` using the current tip's per-email `.ai.md` files and the
 /// previous day's digest tree as the "before" state.
