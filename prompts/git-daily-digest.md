@@ -59,6 +59,25 @@ Junio's short-name (e.g. `tc/replay-linearize`) when referring to the
 topic. If a thread has no authoritative status block, fall back to the
 thread brief as before.
 
+### Attribution rigor
+
+Each per-email brief in the input carries a header of the form
+`[YYYY/MM/DD/HH-MM-SS by <Author Name>]`; the Author Name is the
+author of that email, from its `From:` header, and is the ground
+truth for who wrote every observation, comment, or argument in the
+brief that follows.  Use that Author Name when attributing in your
+prose.  Never let a reply author's contribution slide onto the person
+they were replying to just because the quoted person is more
+prominent in the project.
+
+When you compress several briefs into a short "In brief" bullet or
+into a single "day in brief" sentence, either name the reply author
+explicitly ("Weijie Yuan noted ...", "Patrick Steinhardt objected
+that ...") or use collective phrasing ("the reviewers noted",
+"several participants raised") -- do not use passive constructions
+("the announcement drew attention", "the series raised concerns")
+that hide who was doing the observing.
+
 ## Structure
 
 Write the digest as free-flowing prose, divided into natural sections with
