@@ -59,6 +59,32 @@ Junio's short-name (e.g. `tc/replay-linearize`) when referring to the
 topic. If a thread has no authoritative status block, fall back to the
 thread brief as before.
 
+### Merge status vocabulary
+
+Junio's integration branches have precise meanings.  Only `master`
+counts as *merged*.  Other branches are cooking or proposed:
+
+- **`master`** -- graduated, irrevocably part of the next release.
+  Only content that has explicitly reached `master` may be described
+  as "merged".
+- **`next`** -- integration-tested together, but may still be dropped
+  or rewound.  "In `next`" or "cooking in `next`", never "merged".
+- **`seen`** (formerly `pu`) -- rebuilt from scratch on every rolling
+  update; nothing "stays merged" there.  Never write "merged to
+  'seen'" or "landed in 'seen'"; both are wrong.
+- **`maint`** -- stable maintenance branch for the current release.
+
+When today's Authoritative status from "What's cooking" is present
+for a topic, it is the sole authority on integration state; ignore
+any conflicting phrasing in the "Previous thread state" block.  When
+the Authoritative status is absent for a topic, prefer the language
+today's per-email briefs actually use ("under review", "waiting for
+response", "cooking") over merge language in the previous thread
+state, since the previous thread state may itself carry a fabricated
+merge claim from an earlier iteration.  Never upgrade a prior
+"in `seen`" or "in `next`" note into "merged" without independent
+evidence in today's traffic.
+
 ### Attribution rigor
 
 Each per-email brief in the input carries a header of the form
