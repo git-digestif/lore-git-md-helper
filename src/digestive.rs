@@ -1224,7 +1224,12 @@ pub struct ThreadDayActivity {
     /// Thread AI summary from *before* today's emails (None if new thread).
     pub thread_ai_before: Option<String>,
     /// Today's email AI summaries, in chronological order.
-    pub email_summaries: Vec<(String, String)>,
+    /// Each tuple is `(dk, ai_text, from)`; `from` is the display
+    /// name from the email's `From:` header when known.  Emitted as
+    /// a `[<dk> by <from>]` header in the daily-digest prompt so
+    /// the model can attribute observations without inferring who
+    /// wrote which email.
+    pub email_summaries: Vec<(String, String, Option<String>)>,
     /// Authoritative status for this thread's topic, extracted from
     /// today's "What's cooking in git.git" email if one is present.
     /// `None` when Junio has not published a verdict for this thread,
@@ -1256,12 +1261,13 @@ pub fn build_day_digest_input(
 ) -> (Vec<ThreadDayActivity>, usize) {
     use std::collections::BTreeMap;
 
-    let mut by_thread: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut by_thread: BTreeMap<String, Vec<(String, String, Option<String>)>> = BTreeMap::new();
     for (dk, root_dk, ai) in summaries {
+        let from = author_of(dk, git_ref, cat);
         by_thread
             .entry(root_dk.clone())
             .or_default()
-            .push((dk.clone(), ai.clone()));
+            .push((dk.clone(), ai.clone(), from));
     }
 
     let email_count = summaries.len();
@@ -1283,6 +1289,16 @@ pub fn build_day_digest_input(
         .collect();
 
     (threads, email_count)
+}
+
+/// Load `<git_ref>:<dk>.md` and return the display name from its
+/// `From:` header, or `None` if the blob is missing or the header
+/// is empty.
+fn author_of(dk: &str, git_ref: &str, cat: &mut impl BlobRead) -> Option<String> {
+    let spec = format!("{git_ref}:{dk}.md");
+    let md = cat.get_str(&spec)?;
+    let a = rag_parse::parse_email(&md).author;
+    if a.is_empty() { None } else { Some(a) }
 }
 
 /// Scan today's summaries for a "What's cooking in git.git" email
@@ -1401,8 +1417,11 @@ pub(crate) fn build_daily_digest_user_msg(
         }
 
         user_msg.push_str("Today's new emails in this thread:\n\n");
-        for (dk, ai) in &activity.email_summaries {
-            user_msg.push_str(&format!("[{dk}]\n{ai}\n\n"));
+        for (dk, ai, from) in &activity.email_summaries {
+            match from {
+                Some(f) => user_msg.push_str(&format!("[{dk} by {f}]\n{ai}\n\n")),
+                None => user_msg.push_str(&format!("[{dk}]\n{ai}\n\n")),
+            }
         }
     }
 
@@ -1955,7 +1974,11 @@ mod tests {
         let activity = ThreadDayActivity {
             root_dk: "2026/06/26/05-48-11".into(),
             thread_ai_before: Some("prior summary claiming merged to master".into()),
-            email_summaries: vec![("2026/07/01/08-50-41".into(), "reply summary".into())],
+            email_summaries: vec![(
+                "2026/07/01/08-50-41".into(),
+                "reply summary".into(),
+                Some("Toon Claes".into()),
+            )],
             wc_status: Some(WcTopic {
                 section: "Cooking".into(),
                 topic: "tc/replay-linearize".into(),
@@ -1980,6 +2003,10 @@ mod tests {
         assert!(
             msg.contains("prior summary claiming merged to master"),
             "prior summary must still be visible so the model can note the discrepancy",
+        );
+        assert!(
+            msg.contains("[2026/07/01/08-50-41 by Toon Claes]"),
+            "each per-email brief should announce its author via a `by <Name>` header, got:\n{msg}",
         );
     }
 
