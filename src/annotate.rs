@@ -278,8 +278,7 @@ End.
     #[test]
     fn annotates_unquoted_stretch_after_quote_block() {
         let md = "> quoted from parent\n> more parent text\n\nReply author responds here.\n";
-        let out =
-            annotate_attribution(md, Some("Weijie Yuan <wy@x>"), Some("Junio <j@x>"));
+        let out = annotate_attribution(md, Some("Weijie Yuan <wy@x>"), Some("Junio <j@x>"));
         assert!(out.contains("[Junio wrote:]\n> quoted from parent"));
         assert!(
             out.contains("> more parent text\n\n[Weijie Yuan wrote:]\nReply author responds here."),
@@ -317,8 +316,7 @@ Reply chunk two.
     #[test]
     fn idempotent_self_attribution() {
         let md = "> parent line\n\nWeijie Yuan wrote:\nfollow-up text here\n";
-        let out =
-            annotate_attribution(md, Some("Weijie Yuan <wy@x>"), Some("Junio <j@x>"));
+        let out = annotate_attribution(md, Some("Weijie Yuan <wy@x>"), Some("Junio <j@x>"));
         assert!(
             !out.contains("[Weijie Yuan wrote:]"),
             "self-attribution must be suppressed when a wrote: line already precedes the unquoted stretch, got:\n{out}",

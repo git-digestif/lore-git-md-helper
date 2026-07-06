@@ -1,8 +1,8 @@
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 
 use lore_git_md_helper::ai_backend::BackendArgs;
-use lore_git_md_helper::digestive::Digestive;
+use lore_git_md_helper::digestive::{Digestive, redo_daily, resummarize_thread};
 use lore_git_md_helper::git_util::last_digest_day;
 
 #[derive(Parser)]
@@ -44,33 +44,106 @@ struct Args {
 
     #[command(flatten)]
     backend: BackendArgs,
+
+    /// Optional retroactive-fix subcommand.  When omitted, `digestive`
+    /// runs the batch summarization pipeline as before, preserving
+    /// backward compatibility with existing CI invocations.
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Rebuild one thread's `.thread.ai.md` and `.thread.human.md`
+    /// from scratch by walking its emails in chronological order and
+    /// feeding each per-email `.ai.md` back through the thread agent.
+    /// Discards any confabulation baked into the existing summary.
+    ResummarizeThread {
+        /// The thread root's date-key (e.g. "2026/06/08/18-37-18").
+        root_dk: String,
+    },
+    /// Regenerate `digest.human.md` and `digest.ai.md` for a given
+    /// day using the current tip's per-email `.ai.md` files and the
+    /// previous day's digest tree as the "before" state.
+    RedoDaily {
+        /// The day (e.g. "2026/07/02").
+        day: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let backend = if !args.dry_run {
-        Some(args.backend.resolve()?)
+    // Consume `backend` out of `args` before matching on `cmd`, since
+    // `BackendArgs::resolve` takes ownership.
+    let Args {
+        target_repo,
+        since,
+        until,
+        batch_size,
+        git_ref,
+        dry_run,
+        max_runtime,
+        backend: backend_args,
+        cmd,
+    } = args;
+
+    let backend = if !dry_run {
+        Some(backend_args.resolve()?)
     } else {
         None
     };
 
-    let since = args.since.or_else(|| {
-        let day = last_digest_day(&args.target_repo, &args.git_ref)?;
+    match cmd {
+        None => {
+            run_pipeline(
+                &target_repo,
+                &git_ref,
+                since,
+                until,
+                batch_size,
+                max_runtime,
+                backend.as_ref(),
+                dry_run,
+            )
+            .await
+        }
+        Some(Cmd::ResummarizeThread { root_dk }) => {
+            let backend = backend
+                .as_ref()
+                .context("--dry-run is not supported for resummarize-thread")?;
+            resummarize_thread(&target_repo, &git_ref, &root_dk, backend).await
+        }
+        Some(Cmd::RedoDaily { day }) => {
+            let backend = backend
+                .as_ref()
+                .context("--dry-run is not supported for redo-daily")?;
+            redo_daily(&target_repo, &git_ref, &day, backend).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline(
+    target_repo: &str,
+    git_ref: &str,
+    since: Option<String>,
+    until: Option<String>,
+    batch_size: usize,
+    max_runtime: Option<humantime::Duration>,
+    backend: Option<&lore_git_md_helper::ai_backend::Backend>,
+    dry_run: bool,
+) -> Result<()> {
+    let since = since.or_else(|| {
+        let day = last_digest_day(target_repo, git_ref)?;
         eprintln!("[digestive] resuming after {day}");
         Some(day)
     });
 
-    let mut d = Digestive::new(
-        &args.target_repo,
-        &args.git_ref,
-        args.batch_size,
-        backend.as_ref(),
-        args.dry_run,
-    )?;
+    let mut d = Digestive::new(target_repo, git_ref, batch_size, backend, dry_run)?;
 
-    if let Some(duration) = args.max_runtime {
+    if let Some(duration) = max_runtime {
         let duration: std::time::Duration = duration.into();
         let deadline = std::time::Instant::now() + duration;
         eprintln!(
@@ -80,7 +153,7 @@ async fn main() -> Result<()> {
         d = d.with_deadline(deadline);
     }
 
-    d.run(since.as_deref(), args.until.as_deref()).await?;
+    d.run(since.as_deref(), until.as_deref()).await?;
     let result = d.finish()?;
 
     eprintln!(

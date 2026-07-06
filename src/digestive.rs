@@ -57,8 +57,13 @@ fn resolve_thread_root(
 }
 
 /// Find the commit OID of a daily digest by grepping the commit subject.
+/// Matches both the original `digestive: daily digest for <day>` shape
+/// and the corrective `digestive: redo daily digest for <day>` shape;
+/// with `--date-order -1`, the newest one wins, so a subsequent
+/// `redo-daily` on the following day picks up the freshly-corrected
+/// tree as its "before" state rather than the original poisoned one.
 fn find_digest_commit(repo_path: &str, refname: &str, day: &str) -> Option<String> {
-    let needle = format!("^digestive: daily digest for {day}$");
+    let needle = format!("daily digest for {day}$");
     let s = git_util::git(
         repo_path,
         &[
@@ -1426,6 +1431,181 @@ pub(crate) fn build_daily_digest_user_msg(
     }
 
     user_msg
+}
+
+/// Rebuild one thread's `.thread.ai.md` and `.thread.human.md` from
+/// scratch by walking the thread's emails in chronological order and
+/// feeding each per-email `.ai.md` back through the thread agent.
+///
+/// Written for retroactive fixes to threads whose iterative summaries
+/// drifted (e.g. the `tc/replay-linearize` thread whose 2026-06-26
+/// iteration hallucinated a future merge date that then propagated
+/// into every subsequent update).  The rebuilt summaries start from
+/// an empty prior state, so any confabulation baked into the
+/// existing summary is discarded.
+///
+/// Writes a single fast-import commit `digestive: resummarize thread
+/// <root_dk>` containing the two rebuilt files.
+pub async fn resummarize_thread(
+    repo_path: &str,
+    git_ref: &str,
+    root_dk: &str,
+    backend: &Backend,
+) -> Result<()> {
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+    let (found_root, tree) = thread_file::load_from_repo(&mut cat, git_ref, root_dk)
+        .ok_or_else(|| anyhow::anyhow!("no .thread.md found for {root_dk}"))?;
+    if found_root != root_dk {
+        anyhow::bail!("date-key {root_dk} is not a thread root; its root is {found_root}",);
+    }
+
+    let mut dks: Vec<String> = tree.date_keys().map(str::to_string).collect();
+    dks.sort();
+    if dks.is_empty() {
+        anyhow::bail!("thread {root_dk} is empty");
+    }
+
+    let system = summarize::thread_system_prompt();
+    let mut prev_ai: Option<String> = None;
+    let mut prev_human: Option<String> = None;
+    for dk in &dks {
+        let ai_spec = format!("{git_ref}:{dk}.ai.md");
+        let Some(email_ai) = cat.get_str(&ai_spec) else {
+            eprintln!("[resummarize] skip {dk} (no .ai.md)");
+            continue;
+        };
+        let from = tree.node_of(dk).map(|n| n.from.clone());
+        eprintln!(
+            "[resummarize] {dk} by {}",
+            from.as_deref().unwrap_or("(unknown)"),
+        );
+        let human = backend
+            .chat_with_options(
+                &system,
+                &summarize::thread_user_message(
+                    prev_human.as_deref(),
+                    &email_ai,
+                    from.as_deref(),
+                    "human",
+                ),
+                Some(0.0),
+            )
+            .await
+            .with_context(|| format!("thread human summary failed at {dk}"))?;
+        let ai_out = backend
+            .chat_with_options(
+                &system,
+                &summarize::thread_user_message(
+                    prev_ai.as_deref(),
+                    &email_ai,
+                    from.as_deref(),
+                    "ai",
+                ),
+                Some(0.0),
+            )
+            .await
+            .with_context(|| format!("thread AI summary failed at {dk}"))?;
+        prev_human = Some(summarize::normalize_headings(&human));
+        prev_ai = Some(ai_out);
+    }
+
+    let final_ai = prev_ai.ok_or_else(|| anyhow::anyhow!("no per-email .ai.md found in thread"))?;
+    let final_human = prev_human.expect("populated alongside prev_ai");
+
+    let mut fi = FastImport::new(repo_path, git_ref)?;
+    if let Some(oid) = resolve_ref(repo_path, git_ref) {
+        fi.set_parent(oid);
+    }
+    let mut msg = format!("digestive: resummarize thread {root_dk}");
+    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
+        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+    }
+    let ai_path = format!("{root_dk}.thread.ai.md");
+    let human_path = format!("{root_dk}.thread.human.md");
+    fi.commit(
+        &msg,
+        &[
+            (ai_path.as_str(), final_ai.as_str()),
+            (human_path.as_str(), final_human.as_str()),
+        ],
+    )?;
+    fi.checkpoint()?;
+    fi.finish()?;
+    Ok(())
+}
+
+/// Regenerate the daily digest files (`digest.human.md`, `digest.ai.md`)
+/// for `day` using the current tip's per-email `.ai.md` files and the
+/// previous day's digest tree as the "before" state.
+///
+/// Written for retroactive fixes to daily digests that consumed a
+/// poisoned thread summary: after `resummarize_thread` has cleaned
+/// up the offending thread, this rebuilds the digests that were
+/// generated on top of the poisoned state.
+///
+/// Writes a single fast-import commit `digestive: redo daily digest
+/// for <day>` containing both files.
+pub async fn redo_daily(
+    repo_path: &str,
+    git_ref: &str,
+    day: &str,
+    backend: &Backend,
+) -> Result<()> {
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+
+    let head_oid =
+        resolve_ref(repo_path, git_ref).ok_or_else(|| anyhow::anyhow!("bad ref: {git_ref}"))?;
+    let ls = git_util::git(repo_path, &["ls-tree", "-r", "--name-only", &head_oid, day])
+        .context("ls-tree for day")?;
+    let mut summaries: Vec<(String, String, String)> = Vec::new();
+    for path in ls.lines() {
+        if !path.ends_with(".ai.md") {
+            continue;
+        }
+        if path.contains(".thread.") || path.ends_with("/digest.ai.md") {
+            continue;
+        }
+        let dk = path.trim_end_matches(".ai.md").to_string();
+        let spec = format!("{git_ref}:{dk}.ai.md");
+        let Some(ai) = cat.get_str(&spec) else {
+            continue;
+        };
+        let root_dk = thread_file::load_from_repo(&mut cat, git_ref, &dk)
+            .map(|(r, _)| r)
+            .unwrap_or_else(|| dk.clone());
+        summaries.push((dk, root_dk, ai));
+    }
+    summaries.sort_by(|a, b| a.0.cmp(&b.0));
+    if summaries.is_empty() {
+        anyhow::bail!("no per-email .ai.md files found under {day}");
+    }
+
+    let prev = add_days(day, -1).ok_or_else(|| anyhow::anyhow!("bad day: {day}"))?;
+    let before = find_digest_commit(repo_path, git_ref, &prev).unwrap_or_else(|| head_oid.clone());
+
+    let (threads, email_count) = build_day_digest_input(&summaries, &before, git_ref, &mut cat);
+    let digest = generate_daily_digest(day, &threads, email_count, backend).await?;
+
+    let mut fi = FastImport::new(repo_path, git_ref)?;
+    if let Some(oid) = resolve_ref(repo_path, git_ref) {
+        fi.set_parent(oid);
+    }
+    let mut msg = format!("digestive: redo daily digest for {day}");
+    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
+        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+    }
+    let human_path = format!("{day}/digest.human.md");
+    let ai_path = format!("{day}/digest.ai.md");
+    fi.commit(
+        &msg,
+        &[
+            (human_path.as_str(), digest.human.as_str()),
+            (ai_path.as_str(), digest.ai.as_str()),
+        ],
+    )?;
+    fi.checkpoint()?;
+    fi.finish()?;
+    Ok(())
 }
 
 #[cfg(test)]

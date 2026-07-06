@@ -231,11 +231,8 @@ pub fn email_user_message(ctx: &EmailContext, mode: &str) -> String {
     let email_md_owned;
     let email_md_ref: &str = match ctx.parent_from.as_deref() {
         Some(pf) => {
-            email_md_owned = crate::annotate::annotate_attribution(
-                &ctx.email_md,
-                ctx.from.as_deref(),
-                Some(pf),
-            );
+            email_md_owned =
+                crate::annotate::annotate_attribution(&ctx.email_md, ctx.from.as_deref(), Some(pf));
             &email_md_owned
         }
         None => &ctx.email_md,
