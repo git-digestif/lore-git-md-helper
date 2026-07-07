@@ -107,14 +107,24 @@ processing explicitly states it, or (b) the existing thread summary
 already records it with a citation. Downgrade or preserve the existing
 status when no new evidence appears; never upgrade it. In particular:
 
+- The word "merged" applies to `master` ONLY.  Being in `next` is
+  cooking, not merger; being in `seen` (which Junio rebuilds from
+  scratch on every rolling update) is *proposed*, not merger.  Never
+  write "merged to 'next'" or "merged to 'seen'"; both are wrong.
 - "Will merge to 'next'" is a maintainer *intention*, not a state change.
 - A new patch version being posted is not evidence of merger.
 - "Waiting for response(s) to review comment(s)" in a "What's cooking"
   report means the series is still under review, not merged.
 - A single reviewer's Reviewed-by does not merge anything.
+- If a prior version of the same series was in `master`, that does
+  not carry forward: the new version is still "under review" or
+  "cooking" until Junio's report explicitly graduates it.
 
-If the source material does not state a merge event, the correct thing
-to write is "under review" or "cooking", not a fabricated merge.
+If the source material does not state a merge event to `master`, the
+correct thing to write is "under review" or "cooking", not a
+fabricated merge.  If the prior summary contains the word "merged"
+without a supporting citation, downgrade it in this update rather
+than propagating it.
 
 **Never invent dates.** Every specific date (`YYYY-MM-DD` or similar)
 you emit must appear literally in the email being processed, in the

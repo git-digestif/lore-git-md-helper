@@ -156,6 +156,36 @@ distinct from everything below):
 | security | Hardening, fixing unsafe APIs, TOCTOU races |
 | contributor housekeeping | `.mailmap` updates, coding-guideline alignment, typo fixes in non-doc files |
 
+## Merge status vocabulary
+
+Junio's integration branches have precise meanings.  The word
+"merged" belongs to **exactly one** of them, and using it for any of
+the others is wrong even if the substance seems close:
+
+- `master` -- the only branch on which "merged" is correct.  Topics
+  in `master` are irrevocably part of the next release; describing
+  something as merged requires positive evidence that it reached
+  `master`, typically an explicit statement in the email, or a "merged
+  to 'master' on YYYY-MM-DD at OID" annotation in a "What's cooking"
+  report.
+- `next` -- topics are being cooked (integration-tested together);
+  they may still be dropped or rewound.  This is **not** merger.
+  Describe such a topic as "in `next`" or "cooking in `next`", never
+  "merged".
+- `seen` (formerly `pu`) -- an ephemeral integration branch that
+  Junio rebuilds from scratch on every rolling update.  Being in
+  `seen` implies no commitment whatsoever.  Never write "merged to
+  `seen`"; the phrase is nonsensical since `seen` is discarded and
+  reconstructed each cycle.  Describe such a topic as "in `seen`"
+  or "queued for review".
+- `maint` -- the maintenance branch for the most recent release.
+
+If the email you are summarizing does not name the branch a topic
+has reached, do not guess.  Say "under review", "cooking", or
+whatever wording matches what the email actually states, and never
+promote a "Will merge to X" intention or a reviewer's Ack into a
+merge event.
+
 ## Style guidelines
 
 - Write in present tense, active voice.

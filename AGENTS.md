@@ -187,6 +187,33 @@ a comprehensive integration test that validates the full pipeline
 end-to-end with a mock backend.
 Run them before and after any change.
 
+## Pre-push CI parity (mandatory, not optional)
+
+Every push to a topic branch will run `.github/workflows/ci.yml`,
+which executes exactly:
+
+```sh
+cargo fmt --check
+cargo clippy --features test-support -- -D warnings
+cargo build   --features test-support
+cargo test    --features test-support
+```
+
+**Run all four locally, in that order, before every `git push`.**
+Pushing without a local pass wastes a CI round-trip and the
+maintainer's time; both are far more expensive than the 30 seconds
+these commands take on a warm build cache.  The commands are not
+individually negotiable: `cargo test` alone will let a `cargo fmt`
+diff or a clippy warning slip through and fail CI.
+
+If any of the four fails, fix it locally and re-run the whole
+sequence.  Do not push "and let CI find the rest"; that pattern
+compounds round-trips.
+
+The same rule applies before force-pushing an amended or rebased
+topic branch: run the full sequence again after any commit
+rewrite that could have changed file contents.
+
 ## Key Files
 
 - `src/lib.rs` — converter library (block parser + renderer + tests)

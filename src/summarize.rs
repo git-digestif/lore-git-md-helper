@@ -105,6 +105,17 @@ pub struct EmailContext {
     pub email_md: String,
     pub thread_ai_summary: Option<String>,
     pub parent_ai_summary: Option<String>,
+    /// Display name from the current email's `From:` header (address
+    /// stripped).  Passed through to thread summarization as a
+    /// "From: <Author>" header on the per-email brief so downstream
+    /// LLMs never have to guess which participant made a given
+    /// observation.
+    pub from: Option<String>,
+    /// Display name from the parent email's `From:` header (address
+    /// stripped).  Used to annotate first-level quote blocks in
+    /// `email_md` before summarization; the annotation is in-memory
+    /// only and never written back to the corpus.
+    pub parent_from: Option<String>,
 }
 
 pub struct SummarizationOutput {
@@ -214,18 +225,30 @@ pub fn email_user_message(ctx: &EmailContext, mode: &str) -> String {
         msg.push_str("\n\n---\n\n");
     }
     msg.push_str("Email:\n\n");
-    match truncate_email_md(&ctx.email_md, EMAIL_MD_BUDGET) {
+    // Annotate first-level quotes with the parent's From when known,
+    // so the summarizer never has to guess who wrote the quoted text.
+    // In-memory only: the corpus markdown is untouched.
+    let email_md_owned;
+    let email_md_ref: &str = match ctx.parent_from.as_deref() {
+        Some(pf) => {
+            email_md_owned =
+                crate::annotate::annotate_attribution(&ctx.email_md, ctx.from.as_deref(), Some(pf));
+            &email_md_owned
+        }
+        None => &ctx.email_md,
+    };
+    match truncate_email_md(email_md_ref, EMAIL_MD_BUDGET) {
         Some(t) => {
             eprintln!(
                 "[summarize] email body truncated from {} to {} bytes \
                  for prompt (budget {} bytes)",
-                ctx.email_md.len(),
+                email_md_ref.len(),
                 t.len(),
                 EMAIL_MD_BUDGET,
             );
             msg.push_str(&t);
         }
-        None => msg.push_str(&ctx.email_md),
+        None => msg.push_str(email_md_ref),
     }
     msg
 }
@@ -236,9 +259,15 @@ pub fn thread_system_prompt() -> String {
 }
 
 /// Build the user message for thread summarization.
+///
+/// When `new_email_from` is provided, the per-email brief is
+/// preceded by a `From: <Author>` line so the thread agent can
+/// attribute observations unambiguously without having to infer
+/// the author from prose.
 pub fn thread_user_message(
     existing_thread_ai: Option<&str>,
     new_email_ai: &str,
+    new_email_from: Option<&str>,
     mode: &str,
 ) -> String {
     let mut msg = format!("Mode: {mode}\n\n");
@@ -248,6 +277,9 @@ pub fn thread_user_message(
         msg.push_str("\n\n---\n\n");
     }
     msg.push_str("New email AI summary:\n\n");
+    if let Some(from) = new_email_from {
+        msg.push_str(&format!("From: {from}\n\n"));
+    }
     msg.push_str(new_email_ai);
     msg
 }
@@ -270,7 +302,12 @@ pub async fn summarize_email(ctx: &EmailContext, cfg: &Backend) -> Result<Summar
     let thread_human_summary = cfg
         .chat(
             &thread_system,
-            &thread_user_message(ctx.thread_ai_summary.as_deref(), &ai_summary, "human"),
+            &thread_user_message(
+                ctx.thread_ai_summary.as_deref(),
+                &ai_summary,
+                ctx.from.as_deref(),
+                "human",
+            ),
         )
         .await
         .context("thread human summary failed")?;
@@ -278,7 +315,12 @@ pub async fn summarize_email(ctx: &EmailContext, cfg: &Backend) -> Result<Summar
     let thread_ai_summary = cfg
         .chat(
             &thread_system,
-            &thread_user_message(ctx.thread_ai_summary.as_deref(), &ai_summary, "ai"),
+            &thread_user_message(
+                ctx.thread_ai_summary.as_deref(),
+                &ai_summary,
+                ctx.from.as_deref(),
+                "ai",
+            ),
         )
         .await
         .context("thread AI summary failed")?;
@@ -434,6 +476,8 @@ mod tests {
             email_md: "# [PATCH] Fix the frobnitz\nSigned-off-by: A".into(),
             thread_ai_summary: None,
             parent_ai_summary: None,
+            from: None,
+            parent_from: None,
         }
     }
 
@@ -442,6 +486,8 @@ mod tests {
             email_md: "# [PATCH v2] Fix the frobnitz\nAddresses review".into(),
             thread_ai_summary: Some("Thread discusses frobnitz fix".into()),
             parent_ai_summary: Some("Parent proposed the fix".into()),
+            from: None,
+            parent_from: None,
         }
     }
 
@@ -496,18 +542,24 @@ mod tests {
 
     #[test]
     fn thread_user_message_without_existing_thread() {
-        let msg = thread_user_message(None, "AI summary of email", "human");
+        let msg = thread_user_message(None, "AI summary of email", None, "human");
         assert!(msg.starts_with("Mode: human\n\n"));
         assert!(!msg.contains("Existing AI thread summary:"));
+        assert!(!msg.contains("From:"), "no from means no From: line");
         assert!(msg.contains("New email AI summary:\n\nAI summary of email"));
     }
 
     #[test]
     fn thread_user_message_with_existing_thread() {
-        let msg = thread_user_message(Some("prior thread state"), "new email AI", "ai");
+        let msg = thread_user_message(
+            Some("prior thread state"),
+            "new email AI",
+            Some("Weijie Yuan"),
+            "ai",
+        );
         assert!(msg.starts_with("Mode: ai\n\n"));
         assert!(msg.contains("Existing AI thread summary:\n\nprior thread state"));
-        assert!(msg.contains("New email AI summary:\n\nnew email AI"));
+        assert!(msg.contains("From: Weijie Yuan\n\nnew email AI"));
     }
 
     #[test]
@@ -741,6 +793,8 @@ mod tests {
             email_md: big,
             thread_ai_summary: None,
             parent_ai_summary: None,
+            from: None,
+            parent_from: None,
         };
         let msg = email_user_message(&ctx, "human");
         assert!(
