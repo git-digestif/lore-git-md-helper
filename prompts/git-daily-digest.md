@@ -85,6 +85,21 @@ merge claim from an earlier iteration.  Never upgrade a prior
 "in `seen`" or "in `next`" note into "merged" without independent
 evidence in today's traffic.
 
+Trigger phrases to avoid.  Certain words invite inferential fabrication
+of a merge event and are forbidden unless independently corroborated:
+
+- "post-merge regression", "post-merge fix", "post-merge issue" --
+  each implies the code has been merged.  Do not use them unless the
+  Authoritative status confirms `master` graduation.  Prefer "bug",
+  "issue", "flaw", or "regression in vN" (which describes the version
+  the bug lives in, without implying merger).
+- "(merged in vN)" as a parenthetical -- this is inferential
+  attribution, not evidence.  Never write it; if the merge is not
+  independently confirmed, drop the parenthetical entirely.
+- "landed" -- reserve for graduation to `master` on the same terms
+  as "merged".  A series can be "posted", "queued", "cooking", or
+  "in `next`", but does not "land" until it reaches `master`.
+
 ### Attribution rigor
 
 Each per-email brief in the input carries a header of the form
