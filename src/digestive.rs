@@ -1230,6 +1230,9 @@ pub struct ThreadDayActivity {
     pub root_dk: String,
     /// Thread AI summary from *before* today's emails (None if new thread).
     pub thread_ai_before: Option<String>,
+    /// The thread root author's own unquoted words: source material
+    /// describing what the topic is about, as opposed to generated text.
+    pub root_source_excerpt: Option<String>,
     /// Today's email AI summaries and source excerpts, in chronological order.
     pub email_summaries: Vec<DayEmailEvidence>,
     /// Authoritative status for this thread's topic, extracted from
@@ -1294,10 +1297,12 @@ pub fn build_day_digest_input(
         .map(|(root_dk, emails)| {
             let spec = format!("{before_commit}:{root_dk}.thread.ai.md");
             let thread_ai_before = cat.get_str(&spec);
+            let root_source_excerpt = topic_source_evidence(&root_dk, git_ref, cat);
             let wc_status = lookup_wc_status(&root_dk, git_ref, cat, &wc_map);
             ThreadDayActivity {
                 root_dk,
                 thread_ai_before,
+                root_source_excerpt,
                 email_summaries: emails,
                 wc_status,
             }
@@ -1333,6 +1338,23 @@ fn email_evidence(
         Some(format!("Subject: {}\n\n{excerpt}", parsed.subject)),
         source_is_short,
     )
+}
+
+/// Load the thread root's own email and reduce it to source-grounded
+/// topic context: the root author's unquoted text, bounded so that a
+/// long cover letter cannot crowd out the verified deltas.
+///
+/// This is deliberately *not* an AI summary.  The daily digest editor
+/// needs to know what a thread is about, but any generated text handed
+/// to it as "context" has been observed to leak stale status,
+/// fabricated readiness, and cross-thread contamination into the
+/// published digest.  The root email cannot.
+fn topic_source_evidence(root_dk: &str, git_ref: &str, cat: &mut impl BlobRead) -> Option<String> {
+    let md = cat.get_str(&format!("{git_ref}:{root_dk}.md"))?;
+    let parsed = rag_parse::parse_email(&md);
+    let authored = authored_email_text(&parsed.body);
+    let excerpt = bounded_excerpt(&authored, 2000);
+    Some(format!("Subject: {}\n\n{excerpt}", parsed.subject))
 }
 
 fn authored_email_text(body: &str) -> String {
@@ -2357,6 +2379,58 @@ mod tests {
     }
 
     #[test]
+    fn test_build_day_digest_loads_root_source_evidence() {
+        let root_md = format!(
+            "# [PATCH v2 0/3] pack-objects: teach --stdin-packs a fast path\n\n\
+             | Header | Value |\n|---|---|\n| **From** | Patrick Steinhardt <ps@pks.im> |\n\n\
+             ---\n\n**Thread**: [t](t.md)\n\n\
+             On Monday, a reviewer wrote:\n\
+             > every reroll must stop relying on the_repository\n\n\
+             This series makes `git pack-objects --stdin-packs` avoid the \
+             quadratic lookup over the packfile list.\n{}",
+            "Padding sentence that pushes the root email past the bound. ".repeat(60),
+        );
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert("test:2026/08/13/05-47-56.md".into(), root_md);
+        let summaries = vec![(
+            "2026/08/13/17-35-39".into(),
+            "2026/08/13/05-47-56".into(),
+            "reply ai".into(),
+        )];
+        let (threads, _) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
+
+        let evidence = threads[0]
+            .root_source_excerpt
+            .as_deref()
+            .expect("thread root source must be loaded as topic evidence");
+        assert!(
+            evidence.starts_with(
+                "Subject: [PATCH v2 0/3] pack-objects: teach --stdin-packs a fast path\n\n"
+            ),
+            "evidence must lead with the root subject: {evidence}",
+        );
+        assert!(
+            evidence.contains("avoid the quadratic lookup"),
+            "root author's own words must survive: {evidence}",
+        );
+        assert!(
+            !evidence.contains("stop relying on the_repository"),
+            "quoted text is not the root author's contribution: {evidence}",
+        );
+        assert!(
+            evidence.contains("[... source email truncated ...]"),
+            "an oversized root email must be truncated, not passed whole: {evidence}",
+        );
+        assert!(
+            evidence.chars().count() <= 2200,
+            "evidence must stay bounded, got {} chars",
+            evidence.chars().count(),
+        );
+    }
+
+    #[test]
     fn test_authored_email_text_removes_quote() {
         let email = format!(
             "On Thursday, Junio wrote:\n{}\nIt looks ready to me\n\nThanks",
@@ -2520,6 +2594,7 @@ mod tests {
         let activity = ThreadDayActivity {
             root_dk: "2026/06/26/05-48-11".into(),
             thread_ai_before: Some("prior summary claiming merged to master".into()),
+            root_source_excerpt: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/07/01/08-50-41".into(),
                 ai: "reply summary".into(),
@@ -2586,6 +2661,7 @@ mod tests {
         let activity = ThreadDayActivity {
             root_dk: "2026/05/01/21-35-37".into(),
             thread_ai_before: Some("poisoned prior rationale".into()),
+            root_source_excerpt: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/07/13-09-14".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -2607,6 +2683,7 @@ mod tests {
         let activity = ThreadDayActivity {
             root_dk: "2026/05/01/21-35-37".into(),
             thread_ai_before: Some("poisoned prior rationale".into()),
+            root_source_excerpt: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/07/13-09-14".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -2635,6 +2712,7 @@ mod tests {
                  repository-global state."
                     .into(),
             ),
+            root_source_excerpt: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/13/17-35-39".into(),
                 ai: "Junio agrees to replace the older topic with the corrected revision.".into(),
@@ -2660,6 +2738,7 @@ mod tests {
         let activity = ThreadDayActivity {
             root_dk: "2026/08/12/00-00-00".into(),
             thread_ai_before: Some("An old integration milestone.".into()),
+            root_source_excerpt: Some("Subject: Old topic\n\nOld topic body.".into()),
             email_summaries: Vec::new(),
             wc_status: None,
         };
