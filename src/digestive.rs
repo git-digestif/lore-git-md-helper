@@ -1474,7 +1474,8 @@ pub async fn generate_daily_digest(
     let user_msg = format!(
         "Date: {day}\nTotal emails today: {email_count}\n\
          Active threads before filtering: {thread_count}\n\n\
-         THREAD CONTEXT -- ORIENTATION ONLY; NOT TODAY'S NEWS:\n\n\
+         THREAD CONTEXT -- ORIGINAL THREAD-ROOT SOURCE TEXT; BACKGROUND ONLY, \
+         NEITHER TODAY'S NEWS NOR STATUS:\n\n\
          {context}\n\n\
          VERIFIED THREAD DELTAS:\n\n{deltas}",
     );
@@ -1513,29 +1514,19 @@ fn build_daily_digest_context(threads: &[ThreadDayActivity], deltas: &str) -> St
         if !deltas.lines().any(|line| line.trim() == root_marker) {
             continue;
         }
+        let Some(source) = &thread.root_source_excerpt else {
+            continue;
+        };
 
         context.push_str("---\n");
         context.push_str(&root_marker);
         context.push('\n');
-
-        if let Some(before) = &thread.thread_ai_before {
-            context.push_str("Context accumulated before today:\n\n");
-            context.push_str(before);
-            context.push_str("\n\n");
-        }
-
         context.push_str(
-            "Today's candidate briefs (topic orientation only; not authoritative \
-             for decisions, attribution, review findings, or status):\n\n",
+            "Thread root's own unquoted words -- source material describing \
+             what this topic is, never how it is going:\n\n",
         );
-        for email in &thread.email_summaries {
-            match &email.from {
-                Some(from) => context.push_str(&format!("[{} by {from}]\n", email.dk)),
-                None => context.push_str(&format!("[{}]\n", email.dk)),
-            }
-            context.push_str(&email.ai);
-            context.push_str("\n\n");
-        }
+        context.push_str(source);
+        context.push_str("\n\n");
     }
 
     context
@@ -2704,18 +2695,26 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_digest_context_keeps_topic_background_separate() {
+    fn test_daily_digest_context_exposes_only_root_source() {
         let activity = ThreadDayActivity {
             root_dk: "2026/08/13/05-47-56".into(),
             thread_ai_before: Some(
-                "This refactoring changes object database lookup to avoid \
-                 repository-global state."
+                "The series was merged to master last week and only a commit \
+                 message tweak remains."
                     .into(),
             ),
-            root_source_excerpt: None,
+            root_source_excerpt: Some(
+                "Subject: [PATCH v2 0/3] odb: drop the_repository from lookups\n\n\
+                 This series changes object database lookup so that it no longer \
+                 depends on repository-global state, which currently makes \
+                 submodule callers reach for the wrong object store."
+                    .into(),
+            ),
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/13/17-35-39".into(),
-                ai: "Junio agrees to replace the older topic with the corrected revision.".into(),
+                ai: "The topic is ready to graduate to next and is poised for \
+                     promotion to master."
+                    .into(),
                 from: Some("Junio C Hamano".into()),
                 source_excerpt: Some("Will do.".into()),
                 source_is_short: true,
@@ -2726,11 +2725,65 @@ mod tests {
         let deltas = "---\nThread root: 2026/08/13/05-47-56\nNew today:\n\
                       - [2026/08/13/17-35-39 by Junio C Hamano] Agreed.";
         let context = build_daily_digest_context(&[activity], deltas);
+
         assert!(context.contains("Thread root: 2026/08/13/05-47-56"));
-        assert!(context.contains("Context accumulated before today:"));
-        assert!(context.contains("object database lookup"));
-        assert!(context.contains("Today's candidate briefs (topic orientation only"));
-        assert!(context.contains("[2026/08/13/17-35-39 by Junio C Hamano]"));
+        assert!(
+            context.contains("Thread root's own unquoted words"),
+            "context must announce that it is source material: {context}",
+        );
+        assert!(
+            context.contains("[PATCH v2 0/3] odb: drop the_repository from lookups")
+                && context.contains("no longer depends on repository-global state")
+                && context.contains("submodule callers reach for the wrong object store"),
+            "the root author's topic details must survive: {context}",
+        );
+
+        // Prior generated state used to leak stale integration claims.
+        assert!(
+            !context.contains("merged to master"),
+            "poisoned prior status must not reach the editor: {context}",
+        );
+        assert!(
+            !context.contains("commit message tweak"),
+            "no part of the accumulated thread summary may appear: {context}",
+        );
+        // Today's generated briefs used to leak invented readiness.
+        assert!(
+            !context.contains("ready to graduate") && !context.contains("poised for"),
+            "poisoned candidate readiness must not reach the editor: {context}",
+        );
+        assert!(
+            !context.contains("[2026/08/13/17-35-39 by Junio C Hamano]")
+                && !context.contains("candidate briefs"),
+            "per-email briefs must not appear as context: {context}",
+        );
+    }
+
+    #[test]
+    fn test_daily_digest_context_omits_root_without_source() {
+        let activity = ThreadDayActivity {
+            root_dk: "2026/08/13/05-47-56".into(),
+            thread_ai_before: Some("A summary that must never stand in for source.".into()),
+            root_source_excerpt: None,
+            email_summaries: vec![DayEmailEvidence {
+                dk: "2026/08/13/17-35-39".into(),
+                ai: "A brief that must never stand in for source.".into(),
+                from: Some("Junio C Hamano".into()),
+                source_excerpt: Some("Will do.".into()),
+                source_is_short: true,
+            }],
+            wc_status: None,
+        };
+
+        let context = build_daily_digest_context(
+            &[activity],
+            "---\nThread root: 2026/08/13/05-47-56\nNew today:\n- Agreed.",
+        );
+        assert!(
+            context.is_empty(),
+            "an unreadable thread root yields no context at all, never a \
+             generated substitute: {context}",
+        );
     }
 
     #[test]
