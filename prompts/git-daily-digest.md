@@ -7,10 +7,13 @@ information have already been removed.
 
 The input has two distinct sources:
 
-- `THREAD CONTEXT` explains what each active thread is about. It may contain
-  facts known before today and current-day candidate briefs. Use it to
-  identify the topic, its goal or motivation, the subsystem and kind of
-  change, and its technical or user impact.
+- `THREAD CONTEXT` is the original thread-root author's own unquoted text:
+  the subject of the message that started the thread, followed by an
+  excerpt of that message. It is source material, not a summary, and it
+  predates today. Use it only for what its author actually states: what
+  the topic changes, the problem or goal that motivates it, the subsystem
+  or user-visible behavior it affects, the kind of change it is, and its
+  concrete technical or practical impact.
 - `VERIFIED THREAD DELTAS` contains only developments that happened today.
   Only these may be presented as today's news.
 
@@ -28,12 +31,21 @@ thread's `THREAD CONTEXT` block or to one bullet in `VERIFIED THREAD DELTAS`.
 - Never present a fact found only in `THREAD CONTEXT` as something that
   happened today. In particular, do not resurface an old patch revision,
   review, decision, or integration milestone as a new development.
-- Use current-day candidate briefs in `THREAD CONTEXT` only for stable topic
-  orientation: what is being changed, the problem or goal, the subsystem,
-  the change category, and the practical stakes. Decisions, attribution,
-  review findings, and status must come from `VERIFIED THREAD DELTAS`.
-- Never combine information from different `Thread root` blocks in one
-  paragraph or bullet, even when the topics seem related.
+- `THREAD CONTEXT` never establishes readiness, integration status,
+  positions, review findings, agreement, consensus, controversy, urgency,
+  quality, or any future outcome. Every statement of that kind must come
+  from an explicit bullet in `VERIFIED THREAD DELTAS`, or be omitted. This
+  holds even when the thread root's own text calls the work finished,
+  tested, ready, or urgent.
+- The thread root text may be weeks old and may describe an earlier
+  revision than today's. Never date it, never present it as today's
+  posting, and never infer from it what has happened since.
+- If `THREAD CONTEXT` leaves one of the orientation questions below
+  unanswered, omit the answer. Never fill the gap from memory, from the
+  topic short-name, or from what comparable series usually do.
+- No subsection and no bullet may cover more than one thread root. When two
+  roots look related, they still get separate subsections or bullets, or
+  one of them is left out.
 - Preserve contributor names and attribution exactly as written in each
   `[date-key by Author]` header.
 - When one sentence or bullet combines contributions from multiple authors
@@ -49,6 +61,9 @@ thread's `THREAD CONTEXT` block or to one bullet in `VERIFIED THREAD DELTAS`.
 - Preserve status wording exactly. A review confirmation is not an
   integration event. An intention is not a completed transition. When no
   exact status appears in the delta, omit status.
+- Treat "ready", "complete", "final", "settled", "resolved", "acceptable",
+  "stalled", and "blocked" as status claims. Use them only when a delta
+  says so in those terms about that same thread.
 - Never predict future integration. Do not write "poised for", "headed
   for", "on track for", "appears likely", "expected to graduate", or
   "clears the way for eventual promotion", or equivalent language.
@@ -71,42 +86,63 @@ plainer prose instead of inventing connective context.
 
 Every notable-thread subsection and in-brief item must stand on its own for
 a Git-familiar reader who has not followed the thread. Before describing
-today's exchange, answer as many of these questions as the corresponding
-context supports:
+today's exchange, answer as many of these questions as the thread root's
+own text supports:
 
 - What does the topic or series actually change?
 - What problem or goal motivates it?
 - Which subsystem or user-facing behavior does it affect?
 - Is it a bugfix, feature, refactoring, test, documentation, build/CI, or
   other kind of work?
-- What makes the decision technically important, risky, urgent, or routine?
+- What concrete impact does its author state, for instance on performance,
+  correctness, compatibility, or a user's workflow?
+
+Whether the work is important, risky, urgent, contentious, or routine is
+not an orientation question: state that only when a delta says it.
 
 Do not pad the digest, but do not sacrifice these answers for brevity. A
 paragraph that merely says who asked for, reviewed, acknowledged, or agreed
 to something is not informative enough. Generic headings such as "Topic
 integration shuffle" are forbidden; name the actual work and subsystem.
-If the supplied context does not answer an important question, say so
-briefly rather than guessing.
+If the context does not answer a question, silently leave that answer out;
+do not guess it, and do not spend words remarking on its absence.
 
 ## Human mode
 
-Write a 500-900 word digest with these sections:
+Write 500-900 words. This range is absolute. Count the words of the draft;
+if it exceeds 900, compress the prose and drop the least consequential
+topics until it fits. Never overrun it in order to cover one more thread.
+
+Use exactly these sections, in this order, at these heading levels:
 
 1. `# Git mailing list daily digest for <date>`
 2. `## The day in brief` -- two or three sentences naming the most
    consequential new developments.
-3. `## Notable threads` -- three to six subsections. Each subsection covers
-   exactly one thread root in one or two short paragraphs.
+3. `## Notable threads` -- at least three and at most six `###`
+   subsections. Each subsection covers exactly one thread root in one or
+   two short paragraphs.
 4. `## In brief` -- one bullet per remaining thread worth mentioning. Each
-   bullet must draw from exactly one thread root.
+   bullet draws from exactly one thread root, and no thread root appears
+   both here and under `## Notable threads`.
+
+Add no other sections at any level. Inside a `## Notable threads`
+subsection, write prose only: no nested headings such as `### Key
+technical details`, `### Key developments`, `### Impact` or `### Status`,
+and no numbered lists. Never repeat the same `###` heading text.
 
 Select and compress; do not mention every delta merely to fill space.
 
 ## AI mode
 
-Use the same section structure, but preserve all technically consequential
-deltas in dense prose suitable as input to a weekly digest. Keep each thread
-root separate. Aim for 800-1400 words.
+Use exactly the same sections and heading levels as human mode, in the
+same order, under the same one-root-per-subsection and one-root-per-bullet
+rules. Add nothing else: there is no integration status section, no topic
+roundup, and no statistics section. Within that structure, preserve all
+technically consequential deltas in dense prose suitable as input to a
+weekly digest, keeping each thread root separate.
+
+Write 800-1400 words. This range is hard: compress or drop the least
+consequential material rather than overrunning it.
 
 ## Style
 
