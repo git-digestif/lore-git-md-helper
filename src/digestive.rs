@@ -1447,10 +1447,13 @@ pub async fn generate_daily_digest(
         .filter(|delta| !delta.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+    let context = build_daily_digest_context(threads, &deltas);
 
     let user_msg = format!(
         "Date: {day}\nTotal emails today: {email_count}\n\
          Active threads before filtering: {thread_count}\n\n\
+         THREAD CONTEXT -- ORIENTATION ONLY; NOT TODAY'S NEWS:\n\n\
+         {context}\n\n\
          VERIFIED THREAD DELTAS:\n\n{deltas}",
     );
 
@@ -1478,6 +1481,42 @@ pub async fn generate_daily_digest(
         human: strip_digest_links(&summarize::normalize_headings(&human)),
         ai: strip_digest_links(&ai),
     })
+}
+
+fn build_daily_digest_context(threads: &[ThreadDayActivity], deltas: &str) -> String {
+    let mut context = String::new();
+
+    for thread in threads {
+        let root_marker = format!("Thread root: {}", thread.root_dk);
+        if !deltas.lines().any(|line| line.trim() == root_marker) {
+            continue;
+        }
+
+        context.push_str("---\n");
+        context.push_str(&root_marker);
+        context.push('\n');
+
+        if let Some(before) = &thread.thread_ai_before {
+            context.push_str("Context accumulated before today:\n\n");
+            context.push_str(before);
+            context.push_str("\n\n");
+        }
+
+        context.push_str(
+            "Today's candidate briefs (topic orientation only; not authoritative \
+             for decisions, attribution, review findings, or status):\n\n",
+        );
+        for email in &thread.email_summaries {
+            match &email.from {
+                Some(from) => context.push_str(&format!("[{} by {from}]\n", email.dk)),
+                None => context.push_str(&format!("[{}]\n", email.dk)),
+            }
+            context.push_str(&email.ai);
+            context.push_str("\n\n");
+        }
+    }
+
+    context
 }
 
 fn strip_digest_links(md: &str) -> String {
@@ -2585,6 +2624,51 @@ mod tests {
         assert!(short.contains("It looks ready to me"));
         assert!(!short.contains("poisoned prior rationale"));
         assert!(!short.contains("poisoned candidate rationale"));
+    }
+
+    #[test]
+    fn test_daily_digest_context_keeps_topic_background_separate() {
+        let activity = ThreadDayActivity {
+            root_dk: "2026/08/13/05-47-56".into(),
+            thread_ai_before: Some(
+                "This refactoring changes object database lookup to avoid \
+                 repository-global state."
+                    .into(),
+            ),
+            email_summaries: vec![DayEmailEvidence {
+                dk: "2026/08/13/17-35-39".into(),
+                ai: "Junio agrees to replace the older topic with the corrected revision.".into(),
+                from: Some("Junio C Hamano".into()),
+                source_excerpt: Some("Will do.".into()),
+                source_is_short: true,
+            }],
+            wc_status: None,
+        };
+
+        let deltas = "---\nThread root: 2026/08/13/05-47-56\nNew today:\n\
+                      - [2026/08/13/17-35-39 by Junio C Hamano] Agreed.";
+        let context = build_daily_digest_context(&[activity], deltas);
+        assert!(context.contains("Thread root: 2026/08/13/05-47-56"));
+        assert!(context.contains("Context accumulated before today:"));
+        assert!(context.contains("object database lookup"));
+        assert!(context.contains("Today's candidate briefs (topic orientation only"));
+        assert!(context.contains("[2026/08/13/17-35-39 by Junio C Hamano]"));
+    }
+
+    #[test]
+    fn test_daily_digest_context_omits_threads_without_deltas() {
+        let activity = ThreadDayActivity {
+            root_dk: "2026/08/12/00-00-00".into(),
+            thread_ai_before: Some("An old integration milestone.".into()),
+            email_summaries: Vec::new(),
+            wc_status: None,
+        };
+
+        let context = build_daily_digest_context(
+            &[activity],
+            "---\nThread root: 2026/08/13/05-47-56\nNew today:\n- New work.",
+        );
+        assert!(context.is_empty());
     }
 
     #[test]
