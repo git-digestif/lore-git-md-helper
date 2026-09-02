@@ -1542,7 +1542,8 @@ async fn generate_digest_mode(
             .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
             .await
             .with_context(|| format!("daily digest ({label}) failed"))?;
-        let digest = strip_digest_links(&summarize::normalize_headings(&raw));
+        let digest =
+            normalize_typography(&strip_digest_links(&summarize::normalize_headings(&raw)));
         if is_mock(backend) {
             return Ok(digest);
         }
@@ -1609,6 +1610,23 @@ fn is_mock(backend: &Backend) -> bool {
 #[cfg(not(test))]
 fn is_mock(_backend: &Backend) -> bool {
     false
+}
+
+fn normalize_typography(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    for ch in md.chars() {
+        match ch {
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201c}' | '\u{201d}' => out.push('"'),
+            '\u{2013}' => out.push('-'),
+            '\u{2014}' => out.push_str("--"),
+            '\u{2192}' => out.push_str("->"),
+            '\u{2026}' => out.push_str("..."),
+            '\u{00b2}' => out.push_str("^2"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn label_key(text: &str) -> String {
@@ -3196,6 +3214,14 @@ Prose about completing subcommands of the new history command.
              ```",
         );
         assert!(validate_digest(&md, &HUMAN_DIGEST_MODE).is_empty());
+        let raw = "Steinhardt\u{2019}s \u{201c}fast path\u{201d} cut O(N\u{00b2}) work \
+                   \u{2013} 0.4s \u{2192} 4.5s \u{2014} and more\u{2026}";
+        assert_eq!(
+            normalize_typography(raw),
+            "Steinhardt's \"fast path\" cut O(N^2) work - 0.4s -> 4.5s -- and more...",
+        );
+        let names = "Ren\u{e9} Scharfe and Jean-Noe\u{308}l Avila reviewed it.";
+        assert_eq!(normalize_typography(names), names);
 
         let block = correction_block(&["word count is 977; too long".to_string()]);
         assert!(block.contains("word count is 977; too long"), "{block}");
