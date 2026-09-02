@@ -30,6 +30,21 @@ Background is not news, but it is still essential. A reader should never
 need to recognize a topic short-name or remember yesterday's discussion to
 understand why today's development matters.
 
+## Provenance tags
+
+Every level-3 heading must begin with the topic ID of the packet it is
+written from, and every `## In brief` bullet must do the same:
+
+    ### [T03] packfile lookup fast path
+    - [T07] Jeff King reports a leak in `revision.c`.
+
+A topic ID may appear exactly once in the whole digest. A topic is either
+a notable-thread subsection or an in-brief bullet, never both and never
+twice. Use only the IDs that appear in the evidence; never invent one.
+
+These tags are internal bookkeeping and are removed before publication.
+Write the surrounding prose as if they were not there.
+
 ## Absolute rules
 
 Every factual statement must be directly traceable to the `BACKGROUND` or
@@ -60,6 +75,9 @@ to one delta bullet of the *same* packet as the section it appears in.
 - If `BACKGROUND` leaves one of the orientation questions below
   unanswered, omit the answer. Never fill the gap from memory, from the
   topic short-name, or from what comparable series usually do.
+- Never write that a topic saw no new developments, was quiet, or had
+  nothing to report. A topic you have nothing to say about is simply
+  left out, silently.
 - Preserve contributor names and attribution exactly as written in each
   `[date-key by Author]` header. That header is input bookkeeping: take the
   author's name from it and never print the date-key itself.
@@ -137,15 +155,15 @@ Use exactly these sections, in this order, at these heading levels:
 
 1. `# Git mailing list daily digest for <date>`
 2. `## The day in brief` -- two or three sentences naming the most
-   consequential new developments. It may summarize only topics the
-   digest goes on to cover, and may not state a fact that is absent from
-   those topics' packets.
+   consequential new developments. It carries no topic tags of its own,
+   may summarize only topics the digest goes on to cover, and may not
+   state a fact that is absent from those topics' packets.
 3. `## Notable threads` -- at least three and at most six `###`
    subsections. Each subsection covers exactly one topic packet in one or
-   two short paragraphs.
+   two short paragraphs, and its heading begins `### [TNN] `.
 4. `## In brief` -- one bullet per remaining topic worth mentioning. Each
-   bullet draws from exactly one packet, and no packet appears both here
-   and under `## Notable threads`.
+   bullet begins `- [TNN] `, draws from exactly one packet, and no topic
+   ID appears both here and under `## Notable threads`.
 
 Add no other sections at any level. Inside a `## Notable threads`
 subsection, write prose only: no nested headings such as `### Key
@@ -156,8 +174,8 @@ Select and compress; do not mention every delta merely to fill space.
 
 ## AI mode
 
-Use exactly the same sections and heading levels as human mode, in the
-same order, under the same one-packet-per-subsection and
+Use exactly the same sections, heading levels, and `[TNN]` tags as human
+mode, in the same order, under the same one-packet-per-subsection and
 one-packet-per-bullet rules. Add nothing else: there is no integration
 status section, no topic roundup, and no statistics section. Within that
 structure, preserve all technically consequential deltas in dense prose

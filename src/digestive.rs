@@ -1468,6 +1468,7 @@ pub async fn generate_daily_digest(
         .filter(|delta| !delta.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+
     // The deterministic test mock cannot emit extractor syntax, so under
     // it every active thread simply carries the raw mock output.
     let root_deltas = if is_mock(backend) {
@@ -1486,19 +1487,22 @@ pub async fn generate_daily_digest(
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
     }
     let evidence = render_topic_packets(&packets);
+    let ids: Vec<&str> = packets.iter().map(|packet| packet.id.as_str()).collect();
 
     let user_msg = format!(
         "Date: {day}\nTotal emails today: {email_count}\n\
-         Active threads before filtering: {thread_count}\n\n\
+         Active threads before filtering: {thread_count}\n\
+         Topics you may write about: {}\n\n\
          EVIDENCE -- ONE SELF-CONTAINED PACKET PER TOPIC. EVERYTHING YOU \
          WRITE ABOUT A TOPIC MUST COME FROM THAT TOPIC'S OWN PACKET AND \
          FROM NO OTHER PACKET:\n\n{evidence}",
+        ids.join(", "),
     );
 
     eprintln!("[digestive] generating daily digest for {day} ...");
 
-    let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, backend).await?;
-    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, backend).await?;
+    let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &ids, backend).await?;
+    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &ids, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
 }
@@ -1669,6 +1673,7 @@ async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
     user_msg: &str,
+    ids: &[&str],
     backend: &Backend,
 ) -> Result<String> {
     let label = mode.label;
@@ -1678,7 +1683,7 @@ async fn generate_digest_mode(
     for _ in 0..2 {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
-            output_contract(mode),
+            output_contract(mode, ids),
         );
         let raw = backend
             .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
@@ -1687,11 +1692,11 @@ async fn generate_digest_mode(
         let digest =
             normalize_typography(&strip_digest_links(&summarize::normalize_headings(&raw)));
         if is_mock(backend) {
-            return Ok(digest);
+            return Ok(strip_topic_tags(&digest));
         }
-        issues = validate_digest(&digest, mode);
+        issues = validate_digest(&digest, mode, ids);
         if issues.is_empty() {
-            return Ok(digest);
+            return Ok(strip_topic_tags(&digest));
         }
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
@@ -1707,7 +1712,7 @@ async fn generate_digest_mode(
     )
 }
 
-fn output_contract(mode: &DigestMode) -> String {
+fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
     format!(
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
          - Length: {}-{} words. Count them, and compress or drop the least \
@@ -1717,6 +1722,17 @@ fn output_contract(mode: &DigestMode) -> String {
          - Exactly three to six level-3 headings, all between \
          `## Notable threads` and `## In brief`, each naming one thread's \
          actual work and subsystem, and no two alike.\n\
+         - Provenance: every level-3 heading begins `### [TNN] ` and every \
+         `## In brief` bullet begins `- [TNN] `, where `TNN` is the ID of \
+         the one topic packet that section is written from. The only valid \
+         IDs are: {}.\n\
+         - Each topic ID appears exactly once in the whole digest: a topic \
+         is either a notable-thread subsection or an in-brief bullet, never \
+         both, and never twice. Cover every topic packet unless it has \
+         nothing worth reporting, in which case leave it out silently.\n\
+         - Never write `no new developments`, `nothing new`, or any other \
+         inactivity phrase. A topic you have nothing to say about is left \
+         out; it is never described as quiet.\n\
          - Inside `## Notable threads`: prose only. No deeper headings, no \
          numbered lists, and no label headings or bold pseudo-labels such as \
          `Key details`, `Key developments`, `Status`, `Impact`, \
@@ -1724,7 +1740,9 @@ fn output_contract(mode: &DigestMode) -> String {
          - Print no date other than the one in the title, and never print a \
          `Thread root:` marker or a date-key such as `2026/05/22`.\n\
          - Add no statistics, roundup, integration-status or outlook section.",
-        mode.min_words, mode.max_words,
+        mode.min_words,
+        mode.max_words,
+        ids.join(", "),
     )
 }
 
@@ -1742,8 +1760,8 @@ fn correction_block(issues: &[String]) -> String {
     )
 }
 
-/// The deterministic test mock cannot produce a contract-conforming
-/// digest; pipeline tests exercise plumbing only.
+/// The deterministic test mock can emit neither extractor syntax nor a
+/// contract-conforming digest; pipeline tests exercise plumbing only.
 #[cfg(test)]
 fn is_mock(backend: &Backend) -> bool {
     matches!(backend, Backend::Mock { .. })
@@ -1752,6 +1770,53 @@ fn is_mock(backend: &Backend) -> bool {
 #[cfg(not(test))]
 fn is_mock(_backend: &Backend) -> bool {
     false
+}
+
+/// Split a leading `[TNN]` provenance tag off a heading's or bullet's
+/// text, returning the ID and the text that follows it.
+fn split_topic_tag(text: &str) -> (Option<&str>, &str) {
+    let text = text.trim();
+    let Some((id, rest)) = text.strip_prefix('[').and_then(|t| t.split_once(']')) else {
+        return (None, text);
+    };
+    match id.strip_prefix('T') {
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (Some(id), rest.trim_start())
+        }
+        _ => (None, text),
+    }
+}
+
+/// Split a line into its Markdown marker (`###` or `-`, plus the space
+/// after it) and the text that follows, for lines that carry one.
+fn split_marker(line: &str) -> Option<(&str, &str)> {
+    let indent = line.len() - line.trim_start().len();
+    let body = &line[indent..];
+    let marker = match body.as_bytes().first()? {
+        b'#' => body.find(|c| c != '#')?,
+        b'-' => 1,
+        _ => return None,
+    };
+    let rest = body[marker..].strip_prefix(' ')?;
+    Some((&line[..indent + marker + 1], rest.trim_start()))
+}
+
+/// Remove the internal `[TNN]` provenance tags, which exist only so
+/// that validation can bind each section to one evidence packet.
+/// Published digests never carry them.
+fn strip_topic_tags(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    for line in md.lines() {
+        match split_marker(line).map(|(lead, rest)| (lead, split_topic_tag(rest))) {
+            Some((lead, (Some(_), text))) => {
+                out.push_str(lead);
+                out.push_str(text);
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn normalize_typography(md: &str) -> String {
@@ -1786,17 +1851,37 @@ fn is_generic_label(text: &str) -> bool {
     GENERIC_LABELS.contains(&key.strip_suffix(" today").unwrap_or(&key))
 }
 
-fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
+/// Sorted, de-duplicated, comma-joined ID list for a validation message.
+fn joined<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    let mut list: Vec<&str> = ids.collect();
+    list.sort_unstable();
+    list.dedup();
+    list.join(", ")
+}
+
+const INACTIVITY_PHRASES: [&str; 6] = [
+    "no new developments",
+    "no notable developments",
+    "no noteworthy developments",
+    "no significant developments",
+    "no new activity",
+    "nothing new to report",
+];
+
+fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
     static NUMBERED_RE: OnceLock<Regex> = OnceLock::new();
     static DATE_RE: OnceLock<Regex> = OnceLock::new();
     static BOLD_RE: OnceLock<Regex> = OnceLock::new();
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
     let numbered_re = NUMBERED_RE.get_or_init(|| Regex::new(r"^ {0,3}\d+[.)]\s").unwrap());
     let date_re = DATE_RE.get_or_init(|| Regex::new(r"\d{4}/\d{2}/\d{2}").unwrap());
     let bold_re = BOLD_RE.get_or_init(|| Regex::new(r"^\*\*([^*]+)\*\*:?").unwrap());
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"\[T\d+\]").unwrap());
 
     let (mut words, mut deep, mut outside, mut generic) = (0, 0, 0, 0);
-    let (mut numbered, mut roots, mut dated) = (0, 0, 0);
-    let (mut h2, mut h3): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let (mut numbered, mut roots, mut dated, mut untagged) = (0, 0, 0, 0);
+    let (mut h2, mut h3, mut tags): (Vec<String>, Vec<String>, Vec<&str>) =
+        (Vec::new(), Vec::new(), Vec::new());
     let mut section = 0;
     let mut fenced = false;
 
@@ -1828,9 +1913,14 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
                 h2.push(key);
             }
             3 => {
-                h3.push(label_key(text));
+                let (tag, named) = split_topic_tag(text);
+                match tag {
+                    Some(id) => tags.push(id),
+                    None => untagged += 1,
+                }
+                h3.push(label_key(named));
                 outside += usize::from(section != 1);
-                generic += usize::from(is_generic_label(text));
+                generic += usize::from(is_generic_label(named));
             }
             0 if section == 1 => {
                 numbered += usize::from(numbered_re.is_match(line));
@@ -1839,6 +1929,14 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
                         .captures(line)
                         .is_some_and(|caps| is_generic_label(&caps[1])),
                 );
+            }
+            0 if section == 2 => {
+                if let Some(item) = line.strip_prefix("- ") {
+                    match split_topic_tag(item).0 {
+                        Some(id) => tags.push(id),
+                        None => untagged += 1,
+                    }
+                }
             }
             0 => {}
             _ => deep += 1,
@@ -1850,6 +1948,13 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
     let mut unique = h3.clone();
     unique.sort();
     unique.dedup();
+    let unknown = joined(tags.iter().filter(|id| !ids.contains(*id)).copied());
+    let repeated = joined(
+        tags.iter()
+            .enumerate()
+            .filter(|(n, id)| tags[..*n].contains(id))
+            .map(|(_, id)| *id),
+    );
 
     let mut issues = Vec::new();
     if !(mode.min_words..=mode.max_words).contains(&words) {
@@ -1870,6 +1975,36 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
         issues.push(format!(
             "there are {} level-3 headings; there must be three to six",
             h3.len(),
+        ));
+    }
+    if untagged > 0 {
+        issues.push(format!(
+            "{untagged} level-3 heading(s) or `## In brief` bullet(s) do not \
+             start with the `[TNN]` ID of the topic packet they are written \
+             from",
+        ));
+    }
+    if !unknown.is_empty() {
+        issues.push(format!(
+            "topic ID(s) {unknown} are not in the evidence; the only valid \
+             IDs are {}",
+            ids.join(", "),
+        ));
+    }
+    if !repeated.is_empty() {
+        issues.push(format!(
+            "topic ID(s) {repeated} appear more than once; each topic gets \
+             exactly one subsection or one bullet, never both",
+        ));
+    }
+    let lower = md.to_lowercase();
+    if let Some(phrase) = INACTIVITY_PHRASES
+        .iter()
+        .find(|phrase| lower.contains(**phrase))
+    {
+        issues.push(format!(
+            "the draft writes `{phrase}`; a topic with nothing worth \
+             reporting is left out, never reported as quiet",
         ));
     }
     for (count, message) in [
@@ -1903,6 +2038,14 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
             dated,
             "line(s) outside the title print a `YYYY/MM/DD` date; a thread \
              root's date is not the date of today's development",
+        ),
+        (
+            // Whatever survives stripping is a tag the publication step
+            // cannot remove.
+            tag_re.find_iter(&strip_topic_tags(md)).count(),
+            "stray `[TNN]` topic ID(s) sit outside a level-3 heading's or \
+             an in-brief bullet's leading position; the ID belongs there \
+             and nowhere else",
         ),
     ] {
         if count > 0 {
@@ -3223,6 +3366,9 @@ mod tests {
         );
     }
 
+    /// The topic IDs the fixture digest below is bound to.
+    const VALID_IDS: [&str; 4] = ["T01", "T02", "T03", "T04"];
+
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
         let skeleton = "\
 # Git mailing list daily digest for 2026/08/13
@@ -3233,21 +3379,21 @@ Two series moved forward and one performance regression was diagnosed.
 
 ## Notable threads
 
-### packfile lookup fast path
+### [T01] packfile lookup fast path
 
 Prose about the packfile lookup fast path.
 
-### object database plumbing
+### [T02] object database plumbing
 
 Prose about passing an explicit repository into the object database.
 
-### completion for git history
+### [T03] completion for git history
 
 Prose about completing subcommands of the new history command.
 
 ## In brief
 
-- One remaining thread saw a small test fix.
+- [T04] One remaining thread saw a small test fix.
 ";
         let target = if words == 0 {
             (mode.min_words + mode.max_words) / 2
@@ -3268,17 +3414,17 @@ Prose about completing subcommands of the new history command.
     fn test_validate_digest_word_contracts() {
         for mode in [&HUMAN_DIGEST_MODE, &AI_DIGEST_MODE] {
             for words in [mode.min_words, mode.max_words] {
-                assert!(validate_digest(&valid_digest(mode, words), mode).is_empty());
+                assert!(validate_digest(&valid_digest(mode, words), mode, &VALID_IDS).is_empty());
             }
             for words in [mode.min_words - 1, mode.max_words + 1] {
                 assert!(
-                    validate_digest(&valid_digest(mode, words), mode)[0]
+                    validate_digest(&valid_digest(mode, words), mode, &VALID_IDS)[0]
                         .contains(&format!("word count is {words}"))
                 );
             }
             let range = format!("{}-{} words", mode.min_words, mode.max_words);
             assert!(DAILY_DIGEST_AGENT.contains(&range));
-            assert!(output_contract(mode).contains(&range));
+            assert!(output_contract(mode, &VALID_IDS).contains(&range));
         }
     }
 
@@ -3287,12 +3433,12 @@ Prose about completing subcommands of the new history command.
         let base = valid_digest(&HUMAN_DIGEST_MODE, 0);
         let prose = "Prose about the packfile lookup fast path.";
         let subsections: String = (0..27)
-            .map(|i| format!("### extra {i}\n\nProse.\n\n"))
+            .map(|i| format!("### [T01] extra {i}\n\nProse.\n\n"))
             .collect();
 
         for (md, expected) in [
             (
-                format!("{base}\n## Integration status\n\n- A queued topic.\n"),
+                format!("{base}\n## Integration status\n\n- [T01] A queued topic.\n"),
                 "level-2 headings",
             ),
             (
@@ -3300,7 +3446,7 @@ Prose about completing subcommands of the new history command.
                 "level-2 headings",
             ),
             (
-                base.replace("### completion for git history", "Prose."),
+                base.replace("### [T03] completion for git history", "Prose."),
                 "there are 2 level-3 headings",
             ),
             (
@@ -3308,13 +3454,13 @@ Prose about completing subcommands of the new history command.
                 "there are 30 level-3 headings",
             ),
             (
-                format!("{base}\n### an afterword\n\nProse.\n"),
+                format!("{base}\n### [T01] an afterword\n\nProse.\n"),
                 "1 level-3 heading(s) sit outside",
             ),
             (
                 base.replace(
-                    "### object database plumbing",
-                    "### packfile lookup fast path",
+                    "### [T02] object database plumbing",
+                    "### [T02] packfile lookup fast path",
                 ),
                 "1 level-3 heading(s) repeat",
             ),
@@ -3323,7 +3469,10 @@ Prose about completing subcommands of the new history command.
                 "deeper than level 3",
             ),
             (
-                base.replace("### object database plumbing", "### Key developments today"),
+                base.replace(
+                    "### [T02] object database plumbing",
+                    "### [T02] Key developments today",
+                ),
                 "1 generic label heading(s)",
             ),
             (
@@ -3346,7 +3495,7 @@ Prose about completing subcommands of the new history command.
                 "`YYYY/MM/DD` date",
             ),
         ] {
-            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE);
+            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS);
             assert!(
                 issues.iter().any(|issue| issue.contains(expected)),
                 "expected `{expected}`, got {issues:?}",
@@ -3354,6 +3503,86 @@ Prose about completing subcommands of the new history command.
             assert!(issues.len() <= MAX_ISSUES);
             assert!(issues.iter().all(|issue| !issue.contains("afterword")));
         }
+    }
+
+    /// Provenance binding: every notable heading and in-brief bullet
+    /// must name exactly one supplied topic packet, and no topic may be
+    /// reported as quiet instead of being left out.
+    #[test]
+    fn test_validate_digest_requires_bound_topic_ids() {
+        let base = valid_digest(&HUMAN_DIGEST_MODE, 0);
+
+        for (md, expected) in [
+            (
+                base.replace(
+                    "### [T02] object database plumbing",
+                    "### object database plumbing",
+                ),
+                "do not start with the `[TNN]` ID",
+            ),
+            (
+                base.replace("- [T04] One remaining", "- One remaining"),
+                "do not start with the `[TNN]` ID",
+            ),
+            (
+                base.replace("### [T02] object", "### [T09] object"),
+                "topic ID(s) T09 are not in the evidence",
+            ),
+            (
+                base.replace("- [T04] One remaining", "- [T01] One remaining"),
+                "topic ID(s) T01 appear more than once",
+            ),
+            (
+                base.replace(
+                    "Prose about the packfile lookup fast path.",
+                    "Prose mentioning [T02] inline.",
+                ),
+                "stray `[TNN]` topic ID(s)",
+            ),
+            (
+                base.replace(
+                    "Prose about the packfile lookup fast path.",
+                    "There were no new developments here.",
+                ),
+                "the draft writes `no new developments`",
+            ),
+        ] {
+            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS);
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "expected `{expected}`, got {issues:?}",
+            );
+            assert!(issues.len() <= MAX_ISSUES);
+            assert!(
+                issues
+                    .iter()
+                    .all(|issue| !issue.contains("object database")),
+                "validation issues must never quote the rejected draft: {issues:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_topic_tags_preserves_headings_and_bullets() {
+        let tagged = "## Notable threads\n\n\
+                      ### [T01] packfile lookup fast path\n\n\
+                      Jeff King measured a [T99] token in prose.\n\n\
+                      ## In brief\n\n\
+                      - [T12] A small test fix landed.\n\
+                      - An untagged bullet.\n";
+        assert_eq!(
+            strip_topic_tags(tagged),
+            "## Notable threads\n\n\
+             ### packfile lookup fast path\n\n\
+             Jeff King measured a [T99] token in prose.\n\n\
+             ## In brief\n\n\
+             - A small test fix landed.\n\
+             - An untagged bullet.\n",
+        );
+        assert!(
+            !strip_topic_tags(&valid_digest(&HUMAN_DIGEST_MODE, 0)).contains("[T0"),
+            "no topic ID may survive into a published digest",
+        );
     }
 
     #[test]
@@ -3368,7 +3597,7 @@ Prose about completing subcommands of the new history command.
              Thread root: 2026/05/22\n\
              ```",
         );
-        assert!(validate_digest(&md, &HUMAN_DIGEST_MODE).is_empty());
+        assert!(validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS).is_empty());
         let raw = "Steinhardt\u{2019}s \u{201c}fast path\u{201d} cut O(N\u{00b2}) work \
                    \u{2013} 0.4s \u{2192} 4.5s \u{2014} and more\u{2026}";
         assert_eq!(
