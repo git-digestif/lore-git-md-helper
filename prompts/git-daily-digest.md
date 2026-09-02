@@ -48,6 +48,10 @@ thread's `THREAD CONTEXT` block or to one bullet in `VERIFIED THREAD DELTAS`.
   one of them is left out.
 - Preserve contributor names and attribution exactly as written in each
   `[date-key by Author]` header.
+- Never print a `Thread root:` line, a date-key, or a bracketed or bold
+  date label such as `**[2026/05/22]**`. A thread root's date is not the
+  date of today's development, and the only date the digest states is the
+  one in its title.
 - When one sentence or bullet combines contributions from multiple authors
   in the same thread, give each contribution its own explicit author clause.
   Never let one author's name grammatically govern another author's finding.

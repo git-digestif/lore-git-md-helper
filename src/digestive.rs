@@ -1482,28 +1482,275 @@ pub async fn generate_daily_digest(
 
     eprintln!("[digestive] generating daily digest for {day} ...");
 
-    let human = backend
-        .chat_with_options(
-            DAILY_DIGEST_AGENT,
-            &format!("Mode: human\n\n{user_msg}"),
-            Some(0.0),
-        )
-        .await
-        .context("daily digest (human) failed")?;
+    let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, backend).await?;
+    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, backend).await?;
 
-    let ai = backend
-        .chat_with_options(
-            DAILY_DIGEST_AGENT,
-            &format!("Mode: ai\n\n{user_msg}"),
-            Some(0.0),
-        )
-        .await
-        .context("daily digest (AI) failed")?;
+    Ok(DayDigestOutput { human, ai })
+}
 
-    Ok(DayDigestOutput {
-        human: strip_digest_links(&summarize::normalize_headings(&human)),
-        ai: strip_digest_links(&ai),
-    })
+struct DigestMode {
+    label: &'static str,
+    min_words: usize,
+    max_words: usize,
+}
+
+const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
+    label: "human",
+    min_words: 500,
+    max_words: 900,
+};
+
+const AI_DIGEST_MODE: DigestMode = DigestMode {
+    label: "ai",
+    min_words: 800,
+    max_words: 1400,
+};
+
+const DIGEST_H2_SEQUENCE: [&str; 3] = ["the day in brief", "notable threads", "in brief"];
+
+const GENERIC_LABELS: [&str; 10] = [
+    "key details",
+    "key technical details",
+    "key developments",
+    "key improvements",
+    "status",
+    "impact",
+    "what changed",
+    "why it matters",
+    "review highlights",
+    "current status",
+];
+
+const MAX_ISSUES: usize = 8;
+
+async fn generate_digest_mode(
+    day: &str,
+    mode: &DigestMode,
+    user_msg: &str,
+    backend: &Backend,
+) -> Result<String> {
+    let label = mode.label;
+    let mut correction = String::new();
+    let mut issues = Vec::new();
+
+    for _ in 0..2 {
+        let prompt = format!(
+            "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
+            output_contract(mode),
+        );
+        let raw = backend
+            .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
+            .await
+            .with_context(|| format!("daily digest ({label}) failed"))?;
+        let digest = strip_digest_links(&summarize::normalize_headings(&raw));
+        if is_mock(backend) {
+            return Ok(digest);
+        }
+        issues = validate_digest(&digest, mode);
+        if issues.is_empty() {
+            return Ok(digest);
+        }
+        eprintln!(
+            "[digestive] {day} {label} digest rejected:\n{}",
+            issues.join("\n"),
+        );
+        correction = format!("\n\n{}", correction_block(&issues));
+    }
+
+    anyhow::bail!(
+        "daily digest ({label}) for {day} failed validation after one \
+         corrective retry:\n{}",
+        issues.join("\n"),
+    )
+}
+
+fn output_contract(mode: &DigestMode) -> String {
+    format!(
+        "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
+         - Length: {}-{} words. Count them, and compress or drop the least \
+         consequential topics rather than overrun.\n\
+         - Exactly these level-2 headings, in this order and no others: \
+         `## The day in brief`, `## Notable threads`, `## In brief`.\n\
+         - Exactly three to six level-3 headings, all between \
+         `## Notable threads` and `## In brief`, each naming one thread's \
+         actual work and subsystem, and no two alike.\n\
+         - Inside `## Notable threads`: prose only. No deeper headings, no \
+         numbered lists, and no label headings or bold pseudo-labels such as \
+         `Key details`, `Key developments`, `Status`, `Impact`, \
+         `What changed` or `Why it matters`.\n\
+         - Print no date other than the one in the title, and never print a \
+         `Thread root:` marker or a date-key such as `2026/05/22`.\n\
+         - Add no statistics, roundup, integration-status or outlook section.",
+        mode.min_words, mode.max_words,
+    )
+}
+
+fn correction_block(issues: &[String]) -> String {
+    format!(
+        "MANDATORY CORRECTION -- THE PREVIOUS DRAFT WAS REJECTED:\n{}\n\
+         Write the digest again from the evidence above, from scratch. The \
+         rejected draft is not shown to you and none of its shape may be \
+         reused. Satisfy every point of the FINAL OUTPUT CONTRACT above.",
+        issues
+            .iter()
+            .map(|issue| format!("- {issue}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The deterministic test mock cannot produce a contract-conforming
+/// digest; pipeline tests exercise plumbing only.
+#[cfg(test)]
+fn is_mock(backend: &Backend) -> bool {
+    matches!(backend, Backend::Mock { .. })
+}
+
+#[cfg(not(test))]
+fn is_mock(_backend: &Backend) -> bool {
+    false
+}
+
+fn label_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '*' | '`' | '#'))
+        .collect::<String>()
+        .trim()
+        .trim_end_matches([':', '.'])
+        .trim()
+        .to_lowercase()
+}
+
+fn is_generic_label(text: &str) -> bool {
+    let key = label_key(text);
+    GENERIC_LABELS.contains(&key.strip_suffix(" today").unwrap_or(&key))
+}
+
+fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
+    static NUMBERED_RE: OnceLock<Regex> = OnceLock::new();
+    static DATE_RE: OnceLock<Regex> = OnceLock::new();
+    static BOLD_RE: OnceLock<Regex> = OnceLock::new();
+    let numbered_re = NUMBERED_RE.get_or_init(|| Regex::new(r"^ {0,3}\d+[.)]\s").unwrap());
+    let date_re = DATE_RE.get_or_init(|| Regex::new(r"\d{4}/\d{2}/\d{2}").unwrap());
+    let bold_re = BOLD_RE.get_or_init(|| Regex::new(r"^\*\*([^*]+)\*\*:?").unwrap());
+
+    let (mut words, mut deep, mut outside, mut generic) = (0, 0, 0, 0);
+    let (mut numbered, mut roots, mut dated) = (0, 0, 0);
+    let (mut h2, mut h3): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut section = 0;
+    let mut fenced = false;
+
+    for line in md.lines().map(str::trim) {
+        if line.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        words += line
+            .split_whitespace()
+            .filter(|token| token.chars().any(char::is_alphanumeric))
+            .count();
+        if fenced {
+            continue;
+        }
+
+        let level = line.chars().take_while(|c| *c == '#').count();
+        let text = line[level..].trim();
+        match level {
+            // The title is the one place a date belongs.
+            1 => continue,
+            2 => {
+                let key = label_key(text);
+                section = match key.as_str() {
+                    "notable threads" => 1,
+                    "in brief" => 2,
+                    _ => section,
+                };
+                h2.push(key);
+            }
+            3 => {
+                h3.push(label_key(text));
+                outside += usize::from(section != 1);
+                generic += usize::from(is_generic_label(text));
+            }
+            0 if section == 1 => {
+                numbered += usize::from(numbered_re.is_match(line));
+                generic += usize::from(
+                    bold_re
+                        .captures(line)
+                        .is_some_and(|caps| is_generic_label(&caps[1])),
+                );
+            }
+            0 => {}
+            _ => deep += 1,
+        }
+        roots += usize::from(line.to_lowercase().contains("thread root:"));
+        dated += usize::from(date_re.is_match(line));
+    }
+
+    let mut unique = h3.clone();
+    unique.sort();
+    unique.dedup();
+
+    let mut issues = Vec::new();
+    if !(mode.min_words..=mode.max_words).contains(&words) {
+        issues.push(format!(
+            "word count is {words}; the {} digest must contain {}-{} words",
+            mode.label, mode.min_words, mode.max_words,
+        ));
+    }
+    if h2 != DIGEST_H2_SEQUENCE {
+        issues.push(format!(
+            "there are {} level-2 headings; they must be exactly \
+             `## The day in brief`, `## Notable threads` and `## In brief`, \
+             in that order and nothing else",
+            h2.len(),
+        ));
+    }
+    if !(3..=6).contains(&h3.len()) {
+        issues.push(format!(
+            "there are {} level-3 headings; there must be three to six",
+            h3.len(),
+        ));
+    }
+    for (count, message) in [
+        (
+            outside,
+            "level-3 heading(s) sit outside `## Notable threads`",
+        ),
+        (
+            h3.len() - unique.len(),
+            "level-3 heading(s) repeat an earlier heading",
+        ),
+        (
+            deep,
+            "heading(s) are deeper than level 3; write prose instead",
+        ),
+        (
+            generic,
+            "generic label heading(s) such as `Status` or `Key developments`; \
+             name the actual work and subsystem instead",
+        ),
+        (
+            numbered,
+            "numbered list item(s) inside `## Notable threads`; write prose there",
+        ),
+        (
+            roots,
+            "line(s) print a `Thread root:` marker; that is input bookkeeping, \
+             never digest text",
+        ),
+        (
+            dated,
+            "line(s) outside the title print a `YYYY/MM/DD` date; a thread \
+             root's date is not the date of today's development",
+        ),
+    ] {
+        if count > 0 {
+            issues.push(format!("{count} {message}"));
+        }
+    }
+    issues.truncate(MAX_ISSUES);
+    issues
 }
 
 fn build_daily_digest_context(threads: &[ThreadDayActivity], deltas: &str) -> String {
@@ -2801,6 +3048,159 @@ mod tests {
             "---\nThread root: 2026/08/13/05-47-56\nNew today:\n- New work.",
         );
         assert!(context.is_empty());
+    }
+
+    fn valid_digest(mode: &DigestMode, words: usize) -> String {
+        let skeleton = "\
+# Git mailing list daily digest for 2026/08/13
+
+## The day in brief
+
+Two series moved forward and one performance regression was diagnosed.
+
+## Notable threads
+
+### packfile lookup fast path
+
+Prose about the packfile lookup fast path.
+
+### object database plumbing
+
+Prose about passing an explicit repository into the object database.
+
+### completion for git history
+
+Prose about completing subcommands of the new history command.
+
+## In brief
+
+- One remaining thread saw a small test fix.
+";
+        let target = if words == 0 {
+            (mode.min_words + mode.max_words) / 2
+        } else {
+            words
+        };
+        let have = skeleton
+            .split_whitespace()
+            .filter(|token| token.chars().any(char::is_alphanumeric))
+            .count();
+        format!(
+            "{skeleton}\n{}\n",
+            vec!["alpha"; target.saturating_sub(have)].join(" "),
+        )
+    }
+
+    #[test]
+    fn test_validate_digest_word_contracts() {
+        for mode in [&HUMAN_DIGEST_MODE, &AI_DIGEST_MODE] {
+            for words in [mode.min_words, mode.max_words] {
+                assert!(validate_digest(&valid_digest(mode, words), mode).is_empty());
+            }
+            for words in [mode.min_words - 1, mode.max_words + 1] {
+                assert!(
+                    validate_digest(&valid_digest(mode, words), mode)[0]
+                        .contains(&format!("word count is {words}"))
+                );
+            }
+            let range = format!("{}-{} words", mode.min_words, mode.max_words);
+            assert!(DAILY_DIGEST_AGENT.contains(&range));
+            assert!(output_contract(mode).contains(&range));
+        }
+    }
+
+    #[test]
+    fn test_validate_digest_rejects_broken_shape() {
+        let base = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let prose = "Prose about the packfile lookup fast path.";
+        let subsections: String = (0..27)
+            .map(|i| format!("### extra {i}\n\nProse.\n\n"))
+            .collect();
+
+        for (md, expected) in [
+            (
+                format!("{base}\n## Integration status\n\n- A queued topic.\n"),
+                "level-2 headings",
+            ),
+            (
+                base.replace("## The day in brief", "## Overview"),
+                "level-2 headings",
+            ),
+            (
+                base.replace("### completion for git history", "Prose."),
+                "there are 2 level-3 headings",
+            ),
+            (
+                base.replace("## In brief", &format!("{subsections}## In brief")),
+                "there are 30 level-3 headings",
+            ),
+            (
+                format!("{base}\n### an afterword\n\nProse.\n"),
+                "1 level-3 heading(s) sit outside",
+            ),
+            (
+                base.replace(
+                    "### object database plumbing",
+                    "### packfile lookup fast path",
+                ),
+                "1 level-3 heading(s) repeat",
+            ),
+            (
+                base.replace(prose, "#### Status\n\nProse."),
+                "deeper than level 3",
+            ),
+            (
+                base.replace("### object database plumbing", "### Key developments today"),
+                "1 generic label heading(s)",
+            ),
+            (
+                base.replace(prose, "**Impact**: The series unblocks the reroll."),
+                "1 generic label heading(s)",
+            ),
+            (
+                base.replace(
+                    prose,
+                    "1. Jeff King measured it.\n2. Patrick Steinhardt agreed.",
+                ),
+                "2 numbered list item(s)",
+            ),
+            (
+                base.replace(prose, "Thread root: 2026/05/22/21-35-37"),
+                "`Thread root:` marker",
+            ),
+            (
+                base.replace(prose, "**[2026/05/22]** The series was posted."),
+                "`YYYY/MM/DD` date",
+            ),
+        ] {
+            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE);
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "expected `{expected}`, got {issues:?}",
+            );
+            assert!(issues.len() <= MAX_ISSUES);
+            assert!(issues.iter().all(|issue| !issue.contains("afterword")));
+        }
+    }
+
+    #[test]
+    fn test_digest_validation_helpers() {
+        let md = valid_digest(&HUMAN_DIGEST_MODE, 0).replace(
+            "Prose about the packfile lookup fast path.",
+            "Prose about the fast path.\n\n\
+             ```\n\
+             ### not a heading\n\
+             1. not a list item\n\
+             **Status**: not a label\n\
+             Thread root: 2026/05/22\n\
+             ```",
+        );
+        assert!(validate_digest(&md, &HUMAN_DIGEST_MODE).is_empty());
+
+        let block = correction_block(&["word count is 977; too long".to_string()]);
+        assert!(block.contains("word count is 977; too long"), "{block}");
+        assert!(!block.contains("UNIQUE_DRAFT_PROSE"));
+        assert!(block.contains("not shown to you"));
     }
 
     #[test]
