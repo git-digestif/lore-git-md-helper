@@ -4,6 +4,7 @@
 //! summaries via an AI backend, and writes results back to the
 //! repository via fast-import.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -1272,8 +1273,6 @@ pub fn build_day_digest_input(
     git_ref: &str,
     cat: &mut impl BlobRead,
 ) -> (Vec<ThreadDayActivity>, usize) {
-    use std::collections::BTreeMap;
-
     let mut by_thread: BTreeMap<String, Vec<DayEmailEvidence>> = BTreeMap::new();
     for (dk, root_dk, ai) in summaries {
         let (from, source_excerpt, source_is_short) = email_evidence(dk, git_ref, cat);
@@ -1469,15 +1468,31 @@ pub async fn generate_daily_digest(
         .filter(|delta| !delta.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let context = build_daily_digest_context(threads, &deltas);
+    // The deterministic test mock cannot emit extractor syntax, so under
+    // it every active thread simply carries the raw mock output.
+    let root_deltas = if is_mock(backend) {
+        threads
+            .iter()
+            .map(|thread| RootDelta {
+                root_dk: thread.root_dk.clone(),
+                bullets: vec![deltas.clone()],
+            })
+            .collect()
+    } else {
+        parse_root_deltas(&deltas, threads)?
+    };
+    let packets = build_topic_packets(threads, &root_deltas);
+    if packets.is_empty() {
+        anyhow::bail!("no same-day thread delta survived extraction for {day}");
+    }
+    let evidence = render_topic_packets(&packets);
 
     let user_msg = format!(
         "Date: {day}\nTotal emails today: {email_count}\n\
          Active threads before filtering: {thread_count}\n\n\
-         THREAD CONTEXT -- ORIGINAL THREAD-ROOT SOURCE TEXT; BACKGROUND ONLY, \
-         NEITHER TODAY'S NEWS NOR STATUS:\n\n\
-         {context}\n\n\
-         VERIFIED THREAD DELTAS:\n\n{deltas}",
+         EVIDENCE -- ONE SELF-CONTAINED PACKET PER TOPIC. EVERYTHING YOU \
+         WRITE ABOUT A TOPIC MUST COME FROM THAT TOPIC'S OWN PACKET AND \
+         FROM NO OTHER PACKET:\n\n{evidence}",
     );
 
     eprintln!("[digestive] generating daily digest for {day} ...");
@@ -1486,6 +1501,133 @@ pub async fn generate_daily_digest(
     let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
+}
+
+/// One thread root's same-day delta bullets, recovered from the merged
+/// output of the two delta extractors.
+#[derive(Debug, PartialEq)]
+struct RootDelta {
+    root_dk: String,
+    bullets: Vec<String>,
+}
+
+/// One topic as the final editor sees it: an opaque ID, the thread root
+/// author's own background words, and today's delta bullets, colocated
+/// so that no cross-topic lookup is possible.
+struct TopicPacket {
+    id: String,
+    background: Option<String>,
+    bullets: Vec<String>,
+}
+
+/// Recover per-root delta records from the merged extractor output.
+///
+/// Tolerates Markdown fences, `---` separators, either extractor's
+/// "no deltas" sentinel, wrapped bullets, and a root reported by both
+/// extractors (the bullets are merged).  Anything else is an error:
+/// silently dropping extractor output would let the final editor write
+/// about a topic from nothing but its background.
+fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<RootDelta>> {
+    let mut by_thread: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut current: Option<usize> = None;
+
+    for line in raw.lines().map(str::trim) {
+        if line.is_empty()
+            || line.starts_with("```")
+            || line.chars().all(|c| c == '-')
+            || is_delta_sentinel(line)
+        {
+            continue;
+        }
+        if let Some(dk) = line.strip_prefix("Thread root:") {
+            let dk = dk.trim();
+            let index = threads
+                .iter()
+                .position(|thread| thread.root_dk == dk)
+                .with_context(|| format!("delta extractor named unknown thread root `{dk}`"))?;
+            by_thread.entry(index).or_default();
+            current = Some(index);
+            continue;
+        }
+        if line.eq_ignore_ascii_case("New today:") {
+            continue;
+        }
+        let bullets = current
+            .and_then(|index| by_thread.get_mut(&index))
+            .with_context(|| format!("delta extractor output has no root before `{line}`"))?;
+        match line.strip_prefix("- ") {
+            Some(bullet) => bullets.push(bullet.trim().to_string()),
+            None => {
+                let last = bullets
+                    .last_mut()
+                    .with_context(|| format!("delta extractor emitted stray line `{line}`"))?;
+                last.push(' ');
+                last.push_str(line);
+            }
+        }
+    }
+
+    Ok(by_thread
+        .into_iter()
+        .map(|(index, bullets)| RootDelta {
+            root_dk: threads[index].root_dk.clone(),
+            bullets,
+        })
+        .collect())
+}
+
+fn is_delta_sentinel(line: &str) -> bool {
+    let line = line.strip_prefix("- ").unwrap_or(line);
+    line.starts_with("No noteworthy") && line.ends_with("deltas.")
+}
+
+/// Pair each root that has same-day deltas with its root author's
+/// background and an opaque, deterministic topic ID.  A root without
+/// deltas has no packet, and therefore no way into the digest.
+fn build_topic_packets(threads: &[ThreadDayActivity], deltas: &[RootDelta]) -> Vec<TopicPacket> {
+    deltas
+        .iter()
+        .filter(|delta| !delta.bullets.is_empty())
+        .enumerate()
+        .map(|(n, delta)| TopicPacket {
+            id: format!("T{:02}", n + 1),
+            background: threads
+                .iter()
+                .find(|thread| thread.root_dk == delta.root_dk)
+                .and_then(|thread| thread.root_source_excerpt.clone()),
+            bullets: delta.bullets.clone(),
+        })
+        .collect()
+}
+
+fn render_topic_packets(packets: &[TopicPacket]) -> String {
+    let mut out = String::new();
+    for TopicPacket {
+        id,
+        background,
+        bullets,
+    } in packets
+    {
+        out.push_str(&format!("---\nTOPIC {id}\n\n"));
+        match background {
+            Some(background) => out.push_str(&format!(
+                "BACKGROUND FOR {id} -- THE THREAD ROOT AUTHOR'S OWN WORDS, \
+                 WRITTEN BEFORE TODAY. THEY SAY WHAT THIS TOPIC IS; THEY ARE \
+                 NEVER TODAY'S NEWS AND NEVER A STATUS:\n\n{background}\n\n",
+            )),
+            None => out.push_str(&format!(
+                "NO BACKGROUND FOR {id} -- WRITE ONLY FROM ITS DELTAS.\n\n",
+            )),
+        }
+        out.push_str(&format!(
+            "TODAY'S VERIFIED DELTAS FOR {id}, IN CHRONOLOGICAL ORDER:\n",
+        ));
+        for bullet in bullets {
+            out.push_str(&format!("- {bullet}\n"));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 struct DigestMode {
@@ -1769,32 +1911,6 @@ fn validate_digest(md: &str, mode: &DigestMode) -> Vec<String> {
     }
     issues.truncate(MAX_ISSUES);
     issues
-}
-
-fn build_daily_digest_context(threads: &[ThreadDayActivity], deltas: &str) -> String {
-    let mut context = String::new();
-
-    for thread in threads {
-        let root_marker = format!("Thread root: {}", thread.root_dk);
-        if !deltas.lines().any(|line| line.trim() == root_marker) {
-            continue;
-        }
-        let Some(source) = &thread.root_source_excerpt else {
-            continue;
-        };
-
-        context.push_str("---\n");
-        context.push_str(&root_marker);
-        context.push('\n');
-        context.push_str(
-            "Thread root's own unquoted words -- source material describing \
-             what this topic is, never how it is going:\n\n",
-        );
-        context.push_str(source);
-        context.push_str("\n\n");
-    }
-
-    context
 }
 
 fn strip_digest_links(md: &str) -> String {
@@ -2959,113 +3075,152 @@ mod tests {
         assert!(!short.contains("poisoned candidate rationale"));
     }
 
-    #[test]
-    fn test_daily_digest_context_exposes_only_root_source() {
-        let activity = ThreadDayActivity {
-            root_dk: "2026/08/13/05-47-56".into(),
+    fn thread_activity(root_dk: &str, source: Option<&str>) -> ThreadDayActivity {
+        ThreadDayActivity {
+            root_dk: root_dk.into(),
             thread_ai_before: Some(
-                "The series was merged to master last week and only a commit \
-                 message tweak remains."
-                    .into(),
+                "A generated baseline that must never reach the final editor.".into(),
             ),
-            root_source_excerpt: Some(
-                "Subject: [PATCH v2 0/3] odb: drop the_repository from lookups\n\n\
-                 This series changes object database lookup so that it no longer \
-                 depends on repository-global state, which currently makes \
-                 submodule callers reach for the wrong object store."
-                    .into(),
-            ),
-            email_summaries: vec![DayEmailEvidence {
-                dk: "2026/08/13/17-35-39".into(),
-                ai: "The topic is ready to graduate to next and is poised for \
-                     promotion to master."
-                    .into(),
-                from: Some("Junio C Hamano".into()),
-                source_excerpt: Some("Will do.".into()),
-                source_is_short: true,
-            }],
-            wc_status: None,
-        };
-
-        let deltas = "---\nThread root: 2026/08/13/05-47-56\nNew today:\n\
-                      - [2026/08/13/17-35-39 by Junio C Hamano] Agreed.";
-        let context = build_daily_digest_context(&[activity], deltas);
-
-        assert!(context.contains("Thread root: 2026/08/13/05-47-56"));
-        assert!(
-            context.contains("Thread root's own unquoted words"),
-            "context must announce that it is source material: {context}",
-        );
-        assert!(
-            context.contains("[PATCH v2 0/3] odb: drop the_repository from lookups")
-                && context.contains("no longer depends on repository-global state")
-                && context.contains("submodule callers reach for the wrong object store"),
-            "the root author's topic details must survive: {context}",
-        );
-
-        // Prior generated state used to leak stale integration claims.
-        assert!(
-            !context.contains("merged to master"),
-            "poisoned prior status must not reach the editor: {context}",
-        );
-        assert!(
-            !context.contains("commit message tweak"),
-            "no part of the accumulated thread summary may appear: {context}",
-        );
-        // Today's generated briefs used to leak invented readiness.
-        assert!(
-            !context.contains("ready to graduate") && !context.contains("poised for"),
-            "poisoned candidate readiness must not reach the editor: {context}",
-        );
-        assert!(
-            !context.contains("[2026/08/13/17-35-39 by Junio C Hamano]")
-                && !context.contains("candidate briefs"),
-            "per-email briefs must not appear as context: {context}",
-        );
-    }
-
-    #[test]
-    fn test_daily_digest_context_omits_root_without_source() {
-        let activity = ThreadDayActivity {
-            root_dk: "2026/08/13/05-47-56".into(),
-            thread_ai_before: Some("A summary that must never stand in for source.".into()),
-            root_source_excerpt: None,
-            email_summaries: vec![DayEmailEvidence {
-                dk: "2026/08/13/17-35-39".into(),
-                ai: "A brief that must never stand in for source.".into(),
-                from: Some("Junio C Hamano".into()),
-                source_excerpt: Some("Will do.".into()),
-                source_is_short: true,
-            }],
-            wc_status: None,
-        };
-
-        let context = build_daily_digest_context(
-            &[activity],
-            "---\nThread root: 2026/08/13/05-47-56\nNew today:\n- Agreed.",
-        );
-        assert!(
-            context.is_empty(),
-            "an unreadable thread root yields no context at all, never a \
-             generated substitute: {context}",
-        );
-    }
-
-    #[test]
-    fn test_daily_digest_context_omits_threads_without_deltas() {
-        let activity = ThreadDayActivity {
-            root_dk: "2026/08/12/00-00-00".into(),
-            thread_ai_before: Some("An old integration milestone.".into()),
-            root_source_excerpt: Some("Subject: Old topic\n\nOld topic body.".into()),
+            root_source_excerpt: source.map(str::to_string),
             email_summaries: Vec::new(),
             wc_status: None,
-        };
+        }
+    }
 
-        let context = build_daily_digest_context(
-            &[activity],
-            "---\nThread root: 2026/08/13/05-47-56\nNew today:\n- New work.",
+    /// The two extractors' outputs arrive concatenated, optionally
+    /// fenced, and may both report the same root; the parser has to
+    /// recover exactly one record per root, in thread order.
+    #[test]
+    fn test_parse_root_deltas_merges_extractor_outputs() {
+        let threads = [
+            thread_activity("2026/08/12/00-00-00", None),
+            thread_activity("2026/08/13/05-47-56", None),
+        ];
+        let raw = "```markdown\n\
+                   ---\n\
+                   Thread root: 2026/08/13/05-47-56\n\
+                   New today:\n\
+                   - [2026/08/13/09-00-00 by Patrick Steinhardt] Posted v3, which\n\
+                   drops the extra allocation.\n\
+                   ```\n\n\
+                   ---\n\
+                   Thread root: 2026/08/12/00-00-00\n\
+                   New today:\n\
+                   - [2026/08/13/10-00-00 by Jeff King] Reported a leak in `revision.c`.\n\
+                   ---\n\
+                   Thread root: 2026/08/13/05-47-56\n\
+                   New today:\n\
+                   - [2026/08/13/17-35-39 by Junio C Hamano] Said it looked good.\n\
+                   No noteworthy short-reply deltas.\n";
+
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap(),
+            vec![
+                RootDelta {
+                    root_dk: "2026/08/12/00-00-00".into(),
+                    bullets: vec![
+                        "[2026/08/13/10-00-00 by Jeff King] Reported a leak in `revision.c`."
+                            .into(),
+                    ],
+                },
+                RootDelta {
+                    root_dk: "2026/08/13/05-47-56".into(),
+                    bullets: vec![
+                        "[2026/08/13/09-00-00 by Patrick Steinhardt] Posted v3, which \
+                         drops the extra allocation."
+                            .into(),
+                        "[2026/08/13/17-35-39 by Junio C Hamano] Said it looked good.".into(),
+                    ],
+                },
+            ],
         );
-        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_parse_root_deltas_rejects_malformed_output() {
+        let threads = [thread_activity("2026/08/13/05-47-56", None)];
+
+        assert!(
+            parse_root_deltas("No noteworthy thread deltas.", &threads)
+                .unwrap()
+                .is_empty(),
+            "the sentinel is not malformed; it simply carries no delta",
+        );
+
+        for (raw, expected) in [
+            (
+                "---\nThread root: 2026/01/01/00-00-00\nNew today:\n- Something.",
+                "unknown thread root",
+            ),
+            ("Today the list discussed several series.", "no root before"),
+        ] {
+            let err = parse_root_deltas(raw, &threads).unwrap_err().to_string();
+            assert!(err.contains(expected), "expected `{expected}`, got `{err}`");
+        }
+    }
+
+    #[test]
+    fn test_topic_packets_colocate_background_with_own_deltas() {
+        let threads = [
+            thread_activity(
+                "2026/08/13/05-47-56",
+                Some(
+                    "Subject: [PATCH v2 0/3] odb: drop the_repository from lookups\n\n\
+                     This series changes object database lookup so that it no \
+                     longer depends on repository-global state.",
+                ),
+            ),
+            thread_activity(
+                "2026/08/12/00-00-00",
+                Some("Subject: Old topic\n\nUNRELATED BACKGROUND."),
+            ),
+            thread_activity("2026/08/11/00-00-00", None),
+        ];
+        let deltas = vec![
+            RootDelta {
+                root_dk: "2026/08/13/05-47-56".into(),
+                bullets: vec!["[2026/08/13/17-35-39 by Junio C Hamano] Agreed.".into()],
+            },
+            // A root the extractor named but left without any bullet.
+            RootDelta {
+                root_dk: "2026/08/12/00-00-00".into(),
+                bullets: Vec::new(),
+            },
+            RootDelta {
+                root_dk: "2026/08/11/00-00-00".into(),
+                bullets: vec!["[2026/08/13/10-00-00 by Jeff King] Found a leak.".into()],
+            },
+        ];
+
+        let packets = build_topic_packets(&threads, &deltas);
+        assert_eq!(packets.len(), 2, "a root without deltas gets no packet");
+        assert_eq!(packets[0].id, "T01");
+        assert_eq!(packets[1].id, "T02");
+        assert!(
+            packets[1].background.is_none(),
+            "an unreadable thread root yields no background, never a substitute",
+        );
+
+        let rendered = render_topic_packets(&packets);
+        let second = rendered.find("TOPIC T02").expect("T02 packet");
+        assert!(
+            rendered[..second].contains("no longer depends on repository-global state")
+                && rendered[..second].contains("Agreed."),
+            "T01's background and deltas must sit together: {rendered}",
+        );
+        assert!(
+            rendered[second..].contains("NO BACKGROUND FOR T02")
+                && rendered[second..].contains("Found a leak."),
+            "T02 must carry its own deltas and nothing else: {rendered}",
+        );
+        assert!(
+            !rendered.contains("UNRELATED BACKGROUND"),
+            "a root without deltas must not smuggle in background: {rendered}",
+        );
+        assert!(
+            !rendered.contains("2026/08/13/05-47-56") && !rendered.contains("must never reach"),
+            "roots are named by opaque ID only, never by date-key or baseline: {rendered}",
+        );
     }
 
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
