@@ -1222,6 +1222,7 @@ pub async fn run_pipeline(
 }
 
 const DAILY_DIGEST_AGENT: &str = include_str!("../prompts/git-daily-digest.md");
+const DAILY_DIGEST_AUDIT_AGENT: &str = include_str!("../prompts/git-daily-digest-audit.md");
 const DAILY_DELTA_AGENT: &str = include_str!("../prompts/git-daily-delta.md");
 const DAILY_SHORT_DELTA_AGENT: &str = include_str!("../prompts/git-daily-short-delta.md");
 
@@ -1501,8 +1502,10 @@ pub async fn generate_daily_digest(
 
     eprintln!("[digestive] generating daily digest for {day} ...");
 
-    let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &ids, backend).await?;
-    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &ids, backend).await?;
+    let human =
+        generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &evidence, &ids, backend).await?;
+    let ai =
+        generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &evidence, &ids, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
 }
@@ -1673,6 +1676,7 @@ async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
     user_msg: &str,
+    evidence: &str,
     ids: &[&str],
     backend: &Backend,
 ) -> Result<String> {
@@ -1696,7 +1700,10 @@ async fn generate_digest_mode(
         }
         issues = validate_digest(&digest, mode, ids);
         if issues.is_empty() {
-            return Ok(strip_topic_tags(&digest));
+            issues = audit_digest(&digest, evidence, backend).await?;
+            if issues.is_empty() {
+                return Ok(strip_topic_tags(&digest));
+            }
         }
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
@@ -1706,10 +1713,44 @@ async fn generate_digest_mode(
     }
 
     anyhow::bail!(
-        "daily digest ({label}) for {day} failed validation after one \
-         corrective retry:\n{}",
+        "daily digest ({label}) for {day} failed validation or factual audit \
+         after one corrective retry:\n{}",
         issues.join("\n"),
     )
+}
+
+/// Check a structurally valid, tagged draft against the exact evidence
+/// packets it was written from.  Returns the auditor's issue lines, or
+/// an empty vector when it accepts the draft.
+async fn audit_digest(digest: &str, evidence: &str, backend: &Backend) -> Result<Vec<String>> {
+    let user_msg =
+        format!("EVIDENCE PACKETS:\n\n{evidence}\n---\n\nTAGGED DRAFT TO AUDIT:\n\n{digest}");
+    let verdict = backend
+        .chat_with_options(DAILY_DIGEST_AUDIT_AGENT, &user_msg, Some(0.0))
+        .await
+        .context("daily digest factual audit failed")?;
+    Ok(parse_audit_verdict(&verdict))
+}
+
+/// Only a bare `OK` accepts the draft.  An auditor that answers in prose
+/// has found something it could not phrase as a verdict, so its whole
+/// answer becomes rejection issues rather than an implicit pass.
+fn parse_audit_verdict(verdict: &str) -> Vec<String> {
+    if verdict.trim() == "OK" {
+        return Vec::new();
+    }
+    let mut issues: Vec<String> = verdict
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .map(|line| line.trim().trim_start_matches(['-', '*', ' ']).trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if issues.is_empty() {
+        issues.push("the factual auditor rejected the draft without naming an issue".into());
+    }
+    issues.truncate(MAX_ISSUES);
+    issues
 }
 
 fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
@@ -1802,8 +1843,8 @@ fn split_marker(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Remove the internal `[TNN]` provenance tags, which exist only so
-/// that validation can bind each section to one evidence packet.
-/// Published digests never carry them.
+/// that validation and the factual audit can bind each section to one
+/// evidence packet.  Published digests never carry them.
 fn strip_topic_tags(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     for line in md.lines() {
@@ -3583,6 +3624,27 @@ Prose about completing subcommands of the new history command.
             !strip_topic_tags(&valid_digest(&HUMAN_DIGEST_MODE, 0)).contains("[T0"),
             "no topic ID may survive into a published digest",
         );
+    }
+
+    #[test]
+    fn test_parse_audit_verdict_accepts_only_a_bare_ok() {
+        assert!(parse_audit_verdict("OK").is_empty());
+        assert!(parse_audit_verdict("  OK\n").is_empty());
+        assert_eq!(
+            parse_audit_verdict("Okay, this looks fine to me."),
+            vec!["Okay, this looks fine to me.".to_string()],
+            "hedged prose is a rejection, never an implicit pass",
+        );
+        assert_eq!(
+            parse_audit_verdict("```\n- T01: claims an unstated integration state.\n```"),
+            vec!["T01: claims an unstated integration state.".to_string()],
+        );
+        assert_eq!(parse_audit_verdict("\n \n").len(), 1);
+
+        let many: String = (1..=20)
+            .map(|n| format!("- T{n:02}: unsupported claim.\n"))
+            .collect();
+        assert_eq!(parse_audit_verdict(&many).len(), MAX_ISSUES);
     }
 
     #[test]
