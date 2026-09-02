@@ -1224,7 +1224,6 @@ pub async fn run_pipeline(
 const DAILY_DIGEST_AGENT: &str = include_str!("../prompts/git-daily-digest.md");
 const DAILY_DIGEST_AUDIT_AGENT: &str = include_str!("../prompts/git-daily-digest-audit.md");
 const DAILY_DELTA_AGENT: &str = include_str!("../prompts/git-daily-delta.md");
-const DAILY_SHORT_DELTA_AGENT: &str = include_str!("../prompts/git-daily-short-delta.md");
 
 /// Per-thread data accumulated for a single day's digest.
 pub struct ThreadDayActivity {
@@ -1235,7 +1234,7 @@ pub struct ThreadDayActivity {
     /// The thread root author's own unquoted words: source material
     /// describing what the topic is about, as opposed to generated text.
     pub root_source_excerpt: Option<String>,
-    /// Today's email AI summaries and source excerpts, in chronological order.
+    /// Today's emails and complete source text, in chronological order.
     pub email_summaries: Vec<DayEmailEvidence>,
     /// Authoritative status for this thread's topic, extracted from
     /// today's "What's cooking in git.git" email if one is present.
@@ -1330,12 +1329,10 @@ fn email_evidence(
     } else {
         Some(parsed.author)
     };
-    let authored = authored_email_text(&parsed.body);
-    let source_is_short = authored.chars().count() <= 300;
-    let excerpt = bounded_excerpt(&authored, 500);
+    let source_is_short = authored_email_text(&parsed.body).chars().count() <= 300;
     (
         author,
-        Some(format!("Subject: {}\n\n{excerpt}", parsed.subject)),
+        Some(format!("Subject: {}\n\n{}", parsed.subject, parsed.body)),
         source_is_short,
     )
 }
@@ -1424,9 +1421,8 @@ fn lookup_wc_status(
 
 /// Generate a daily digest from thread deltas.
 ///
-/// For each thread active today, the AI receives the "before" thread
-/// summary and today's individual email summaries, letting it compute
-/// the delta.
+/// Extract developments from each thread's complete same-day source
+/// before presenting the resulting topic packets to the editor.
 pub async fn generate_daily_digest(
     day: &str,
     threads: &[ThreadDayActivity],
@@ -1434,78 +1430,16 @@ pub async fn generate_daily_digest(
     backend: &Backend,
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
-    let delta_input = build_daily_digest_user_msg(day, threads, email_count);
-    let short_delta_input = build_short_daily_delta_user_msg(day, threads);
-    let regular_count = threads
-        .iter()
-        .flat_map(|thread| &thread.email_summaries)
-        .filter(|email| !email.source_is_short)
-        .count();
-    let short_count = email_count - regular_count;
 
     eprintln!(
         "[digestive] extracting daily deltas for {day} \
          ({email_count} emails, {thread_count} threads) ...",
     );
 
-    let mut extraction_correction = String::new();
-    let mut extraction_attempt = 0;
-    let root_deltas = loop {
-        extraction_attempt += 1;
-        let regular_prompt = format!("{delta_input}{extraction_correction}");
-        let short_prompt = format!("{short_delta_input}{extraction_correction}");
-        trace_digest_attempt("regular", extraction_attempt, "input.txt", &regular_prompt)?;
-        trace_digest_attempt("short", extraction_attempt, "input.txt", &short_prompt)?;
-        let regular_deltas = if regular_count == 0 {
-            String::new()
-        } else {
-            backend
-                .chat_with_options(DAILY_DELTA_AGENT, &regular_prompt, Some(0.0))
-                .await
-                .context("daily delta extraction failed")?
-        };
-        let short_deltas = if short_count == 0 {
-            String::new()
-        } else {
-            backend
-                .chat_with_options(DAILY_SHORT_DELTA_AGENT, &short_prompt, Some(0.0))
-                .await
-                .context("short daily delta extraction failed")?
-        };
-        trace_digest_attempt("regular", extraction_attempt, "output.txt", &regular_deltas)?;
-        trace_digest_attempt("short", extraction_attempt, "output.txt", &short_deltas)?;
-        let deltas = [regular_deltas.trim(), short_deltas.trim()]
-            .into_iter()
-            .filter(|delta| !delta.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        // The deterministic test mock cannot emit extractor syntax, so under
-        // it every active thread simply carries the raw mock output.
-        if is_mock(backend) {
-            break threads
-                .iter()
-                .map(|thread| RootDelta {
-                    root_dk: thread.root_dk.clone(),
-                    bullets: vec![deltas.clone()],
-                })
-                .collect();
-        }
-        match parse_root_deltas(&deltas, threads) {
-            Ok(root_deltas) => break root_deltas,
-            Err(err) if extraction_attempt == 1 => {
-                eprintln!("[digestive] {day} delta extraction rejected: {err:#}");
-                extraction_correction = format!(
-                    "\n\nMANDATORY FORMAT CORRECTION:\n\
-                     The previous output was rejected: {err:#}\n\
-                     Emit only the requested bullets. Copy each email's \
-                     date-key exactly from its input header; never \
-                     construct or alter a date-key.\n",
-                );
-            }
-            Err(err) => return Err(err),
-        }
-    };
+    let mut root_deltas = Vec::new();
+    for thread in threads {
+        root_deltas.extend(extract_thread_deltas(day, thread, backend).await?);
+    }
     let packets = build_topic_packets(threads, &root_deltas);
     if packets.is_empty() {
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
@@ -1532,6 +1466,57 @@ pub async fn generate_daily_digest(
         generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &evidence, &ids, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
+}
+
+async fn extract_thread_deltas(
+    day: &str,
+    thread: &ThreadDayActivity,
+    backend: &Backend,
+) -> Result<Vec<RootDelta>> {
+    for email in &thread.email_summaries {
+        anyhow::ensure!(
+            email.source_excerpt.is_some(),
+            "missing source email {} for daily delta extraction",
+            email.dk,
+        );
+    }
+    let threads = std::slice::from_ref(thread);
+    let input = build_daily_digest_user_msg(day, threads, thread.email_summaries.len());
+    let label = format!("thread-{}", thread.root_dk.replace('/', "-"));
+    let mut correction = String::new();
+    for attempt in 1..=2 {
+        let prompt = format!("{input}{correction}");
+        trace_digest_attempt(&label, attempt, "input.txt", &prompt)?;
+        let deltas = backend
+            .chat_with_options(DAILY_DELTA_AGENT, &prompt, Some(0.0))
+            .await
+            .with_context(|| format!("daily delta extraction failed for {}", thread.root_dk))?;
+        trace_digest_attempt(&label, attempt, "output.txt", &deltas)?;
+        if is_mock(backend) {
+            return Ok(vec![RootDelta {
+                root_dk: thread.root_dk.clone(),
+                bullets: vec![deltas],
+            }]);
+        }
+        match parse_root_deltas(&deltas, threads) {
+            Ok(deltas) => return Ok(deltas),
+            Err(err) if attempt == 1 => {
+                eprintln!(
+                    "[digestive] {day} {} extraction rejected: {err:#}",
+                    thread.root_dk
+                );
+                correction = format!(
+                    "\n\nMANDATORY FORMAT CORRECTION:\n\
+                     The previous output was rejected: {err:#}\n\
+                     Emit only the requested bullets. Copy each email's \
+                     date-key exactly from its input header; never \
+                     construct or alter a date-key.\n",
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the bounded extraction loop always returns")
 }
 
 /// One thread root's same-day delta bullets, recovered from the merged
@@ -1682,9 +1667,9 @@ fn render_topic_packets(packets: &[TopicPacket]) -> String {
         out.push_str(&format!("---\nTOPIC {id}\n\n"));
         match background {
             Some(background) => out.push_str(&format!(
-                "BACKGROUND FOR {id} -- THE THREAD ROOT AUTHOR'S OWN WORDS, \
-                 WRITTEN BEFORE TODAY. THEY SAY WHAT THIS TOPIC IS; THEY ARE \
-                 NEVER TODAY'S NEWS AND NEVER A STATUS:\n\n{background}\n\n",
+                "BACKGROUND FOR {id} -- THE THREAD ROOT AUTHOR'S OWN WORDS. \
+                 THEY SAY WHAT THIS TOPIC IS, NOT WHAT CHANGED TODAY OR \
+                 HOW IT IS GOING:\n\n{background}\n\n",
             )),
             None => out.push_str(&format!(
                 "NO BACKGROUND FOR {id} -- WRITE ONLY FROM ITS DELTAS.\n\n",
@@ -2288,21 +2273,16 @@ pub(crate) fn build_daily_digest_user_msg(
     let mut user_msg = format!(
         "Date: {day} ({weekday})\nTotal emails today: {email_count}\n\
          Active threads: {thread_count}\n\n\
-         MANDATORY DIFFERENTIAL TASK:\n\
-         Each existing thread contains an EXCLUSION BASELINE followed by \
-         TODAY'S CANDIDATE BRIEFS and their SOURCE EMAIL evidence. Report only \
-         facts or changes introduced today that are absent from the baseline \
-         and directly supported by the source email. A candidate brief may \
-         repeat, strengthen, or embellish old facts; that does not make them \
-         new. Quoted text is context, not today's author's contribution. This \
-         is not a request for a current-state recap.\n\n",
+         Extract today's developments from the source emails below. \
+         Quoted passages identify earlier proposals and referents; they \
+         are not new contributions by the current message's author.\n\n",
     );
 
     for activity in threads {
         if !activity
             .email_summaries
             .iter()
-            .any(|email| !email.source_is_short)
+            .any(|email| email.source_excerpt.is_some())
         {
             continue;
         }
@@ -2319,79 +2299,38 @@ pub(crate) fn build_daily_digest_user_msg(
             ));
         }
 
-        if let Some(ref before) = activity.thread_ai_before {
-            user_msg.push_str(
-                "EXCLUSION BASELINE -- FACTS KNOWN BEFORE TODAY; \
-                 DO NOT REPORT THEM AS TODAY'S NEWS:\n\n",
-            );
-            user_msg.push_str(before);
+        if let Some(background) = &activity.root_source_excerpt {
+            user_msg.push_str("THREAD BACKGROUND -- ROOT SOURCE, NOT TODAY'S DEVELOPMENTS:\n\n");
+            user_msg.push_str(background);
             user_msg.push_str("\n\n");
-        } else {
-            user_msg.push_str("NO EXCLUSION BASELINE -- this thread is new today.\n\n");
         }
 
         user_msg.push_str(
-            "TODAY'S CANDIDATE BRIEFS -- KEEP ONLY INFORMATION \
-             NOT ALREADY IN THE EXCLUSION BASELINE:\n\n",
+            "TODAY'S SOURCE EMAILS -- COMPLETE TEXT, INCLUDING QUOTED \
+             CONTEXT. ATTRIBUTE ONLY UNQUOTED CONTRIBUTIONS TO THE \
+             CURRENT AUTHOR:\n\n",
         );
         for email in &activity.email_summaries {
-            if email.source_is_short {
+            let Some(source) = &email.source_excerpt else {
                 continue;
-            }
+            };
             match &email.from {
                 Some(f) => user_msg.push_str(&format!("[{} by {f}]\n", email.dk)),
                 None => user_msg.push_str(&format!("[{}]\n", email.dk)),
             }
-            user_msg.push_str(&email.ai);
+            user_msg.push_str(source);
             user_msg.push_str("\n\n");
-            if let Some(source) = &email.source_excerpt {
-                user_msg.push_str("SOURCE EMAIL -- AUTHOR'S UNQUOTED TEXT; GROUND TRUTH:\n\n");
-                user_msg.push_str(source);
-                user_msg.push_str("\n\n");
-            }
         }
     }
 
     user_msg.push_str(
         "---\n\n\
          FINAL MANDATORY CHECK BEFORE WRITING:\n\
-         For every claimed development, identify the specific information \
-         in TODAY'S CANDIDATE BRIEFS that was absent from that thread's \
-         EXCLUSION BASELINE, then verify it against the author's unquoted \
-         SOURCE EMAIL text. Remove the claim if it is unsupported by that \
-         text or only repeats quoted context. In particular, never announce \
-         an integration state already named in the baseline, even when \
-         today's briefs repeat it.\n",
+         Every development must be stated in today's unquoted source text. \
+         Distinguish a new revision's changelog from unchanged features. \
+         Keep later corrections and retractions, and preserve the current \
+         subject when it differs from the older thread root's title.\n",
     );
-
-    user_msg
-}
-
-fn build_short_daily_delta_user_msg(day: &str, threads: &[ThreadDayActivity]) -> String {
-    let mut user_msg = format!(
-        "Date: {day}\n\n\
-         The following source-only records contain short replies written \
-         today. Quoted text, AI briefs, and prior thread summaries are \
-         deliberately absent.\n\n",
-    );
-
-    for activity in threads {
-        for email in &activity.email_summaries {
-            if !email.source_is_short {
-                continue;
-            }
-            user_msg.push_str("---\n");
-            user_msg.push_str(&format!("Thread root: {}\n", activity.root_dk));
-            match &email.from {
-                Some(f) => user_msg.push_str(&format!("[{} by {f}]\n", email.dk)),
-                None => user_msg.push_str(&format!("[{}]\n", email.dk)),
-            }
-            if let Some(source) = &email.source_excerpt {
-                user_msg.push_str(source);
-                user_msg.push_str("\n\n");
-            }
-        }
-    }
 
     user_msg
 }
@@ -3319,7 +3258,7 @@ mod tests {
             root_source_excerpt: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/07/01/08-50-41".into(),
-                ai: "reply summary".into(),
+                ai: "poisoned candidate rationale".into(),
                 from: Some("Toon Claes".into()),
                 source_excerpt: Some("The source reply.".into()),
                 source_is_short: false,
@@ -3346,31 +3285,24 @@ mod tests {
             "missing status line verbatim",
         );
         assert!(
-            msg.contains("prior summary claiming merged to master"),
-            "prior summary must still be visible so the model can note the discrepancy",
+            !msg.contains("prior summary claiming merged to master"),
+            "generated thread state must not reach source extraction",
         );
         assert!(
-            msg.contains("[2026/07/01/08-50-41 by Toon Claes]"),
-            "each per-email brief should announce its author via a `by <Name>` header, got:\n{msg}",
+            msg.contains("[2026/07/01/08-50-41 by Toon Claes]\nThe source reply."),
+            "each authored excerpt should follow a `by <Name>` header, got:\n{msg}",
         );
         assert!(
-            msg.contains("MANDATORY DIFFERENTIAL TASK"),
-            "missing differential task framing",
+            !msg.contains("poisoned candidate rationale"),
+            "the per-email AI brief must never reach the extractor: {msg}",
         );
         assert!(
-            msg.contains("EXCLUSION BASELINE -- FACTS KNOWN BEFORE TODAY"),
-            "prior state should be marked as an exclusion baseline",
+            !msg.contains("EXCLUSION BASELINE"),
+            "extraction must not depend on generated baselines",
         );
         assert!(
-            msg.contains("TODAY'S CANDIDATE BRIEFS"),
-            "today's summaries should be marked as candidates, not facts",
-        );
-        assert!(
-            msg.contains(
-                "SOURCE EMAIL -- AUTHOR'S UNQUOTED TEXT; GROUND TRUTH:\n\n\
-                 The source reply.",
-            ),
-            "source evidence should be separated from the untrusted summary",
+            msg.contains("TODAY'S SOURCE EMAILS -- COMPLETE TEXT"),
+            "today's contributions must retain their source context",
         );
         assert!(
             msg.contains("FINAL MANDATORY CHECK BEFORE WRITING"),
@@ -3379,8 +3311,8 @@ mod tests {
     }
 
     #[test]
-    fn test_short_daily_delta_input_excludes_summaries_and_baseline() {
-        let activity = ThreadDayActivity {
+    fn test_delta_inputs_exclude_ai_briefs_but_keep_authored_source() {
+        let activity = |source_is_short| ThreadDayActivity {
             root_dk: "2026/05/01/21-35-37".into(),
             thread_ai_before: Some("poisoned prior rationale".into()),
             root_source_excerpt: None,
@@ -3393,36 +3325,134 @@ mod tests {
                      It looks ready to me\n\nThanks\n\nPhillip"
                         .into(),
                 ),
-                source_is_short: true,
+                source_is_short,
             }],
             wc_status: None,
         };
 
-        let regular = build_daily_digest_user_msg("2026/08/07", &[activity], 1);
-        assert!(!regular.contains("poisoned prior rationale"));
-        assert!(!regular.contains("poisoned candidate rationale"));
+        for source_is_short in [false, true] {
+            let input = build_daily_digest_user_msg("2026/08/07", &[activity(source_is_short)], 1);
+            assert!(input.contains("It looks ready to me"));
+            assert!(!input.contains("poisoned prior rationale"));
+            assert!(!input.contains("poisoned candidate rationale"));
+        }
+    }
 
-        let activity = ThreadDayActivity {
-            root_dk: "2026/05/01/21-35-37".into(),
-            thread_ai_before: Some("poisoned prior rationale".into()),
-            root_source_excerpt: None,
-            email_summaries: vec![DayEmailEvidence {
-                dk: "2026/08/07/13-09-14".into(),
-                ai: "poisoned candidate rationale".into(),
-                from: Some("Phillip Wood".into()),
-                source_excerpt: Some(
-                    "Subject: Re: [PATCH v25 0/7] branch: delete-merged\n\n\
-                     It looks ready to me\n\nThanks\n\nPhillip"
-                        .into(),
-                ),
-                source_is_short: true,
-            }],
-            wc_status: None,
+    #[test]
+    fn test_email_evidence_preserves_complete_source() {
+        let body = format!(
+            "> Earlier proposal: first move the sources into lib/.\n\n\
+             Initially I agreed.\n{}\n\
+             After considering it, I favor smaller conceptual groups instead.\n\
+             Changes since v2: preserve the new conclusion and rationale.\n{}\n",
+            "Discussion leading to a different conclusion. ".repeat(30),
+            "Supporting example. ".repeat(30),
+        );
+        let mut blobs = MockBlobs(Default::default());
+        blobs.0.insert(
+            "source:2026/08/13/19-04-52.md".into(),
+            format!("# Layout discussion\n\n**Thread**: [thread](thread.md)\n\n{body}"),
+        );
+        let (_, source, _) = email_evidence("2026/08/13/19-04-52", "source", &mut blobs);
+        assert_eq!(
+            source.unwrap(),
+            format!("Subject: Layout discussion\n\n{body}")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_thread_deltas_isolates_complete_source() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut threads = [
+            delta_activity("2026/08/12/00-00-00", &[("2026/08/13/09-00-00", "Alice")]),
+            delta_activity("2026/08/12/01-00-00", &[("2026/08/13/10-00-00", "Bob")]),
+        ];
+        for (index, thread) in threads.iter_mut().enumerate() {
+            thread.email_summaries[0].source_is_short = index == 1;
+            thread.email_summaries[0].source_excerpt = Some(format!(
+                "COMPLETE-SOURCE-{index}\n{}",
+                "source ".repeat(100)
+            ));
+            Mock::given(method("POST"))
+                .and(body_string_contains(format!("Thread root: {}", thread.root_dk)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": format!("- [{}] Posted a correction.", thread.email_summaries[0].dk)
+                    }}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
         };
-        let short = build_short_daily_delta_user_msg("2026/08/07", &[activity]);
-        assert!(short.contains("It looks ready to me"));
-        assert!(!short.contains("poisoned prior rationale"));
-        assert!(!short.contains("poisoned candidate rationale"));
+        for thread in &threads {
+            let deltas = extract_thread_deltas("2026/08/13", thread, &backend)
+                .await
+                .unwrap();
+            assert_eq!(deltas.len(), 1);
+            assert_eq!(deltas[0].root_dk, thread.root_dk);
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let input = body["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                input.contains(
+                    threads[index].email_summaries[0]
+                        .source_excerpt
+                        .as_ref()
+                        .unwrap()
+                )
+            );
+            assert!(!input.contains(&format!("COMPLETE-SOURCE-{}", 1 - index)));
+            assert!(!input.contains("A generated baseline"));
+            assert!(!input.contains("Untrusted brief."));
+        }
+        threads[0].email_summaries[0].source_excerpt = None;
+        assert!(
+            extract_thread_deltas("2026/08/13", &threads[0], &backend)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("missing source email")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_thread_deltas_rejects_cross_thread_citations() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "- [2026/08/13/10-00-00] Unrelated."
+                }}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        let thread = delta_activity("2026/08/12/00-00-00", &[("2026/08/13/09-00-00", "Alice")]);
+        let err = extract_thread_deltas("2026/08/13", &thread, &backend)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown source email"));
     }
 
     fn thread_activity(root_dk: &str, source: Option<&str>) -> ThreadDayActivity {
