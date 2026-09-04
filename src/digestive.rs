@@ -1699,8 +1699,9 @@ async fn generate_digest_mode(
             .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
             .await
             .with_context(|| format!("daily digest ({label}) failed"))?;
-        let digest =
-            normalize_typography(&strip_digest_links(&summarize::normalize_headings(&raw)));
+        let digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
+            &summarize::normalize_headings(&raw),
+        )));
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
@@ -1846,6 +1847,30 @@ fn split_marker(line: &str) -> Option<(&str, &str)> {
     };
     let rest = body[marker..].strip_prefix(' ')?;
     Some((&line[..indent + marker + 1], rest.trim_start()))
+}
+
+fn normalize_topic_tags(md: &str) -> String {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"\[T\d+\]\s*").unwrap());
+    let mut out = String::with_capacity(md.len());
+
+    for line in md.lines() {
+        let keep_leading =
+            split_marker(line).is_some_and(|(_, rest)| split_topic_tag(rest).0.is_some());
+        if keep_leading {
+            let (lead, rest) = split_marker(line).expect("checked above");
+            let (tag, text) = split_topic_tag(rest);
+            out.push_str(lead);
+            out.push('[');
+            out.push_str(tag.expect("checked above"));
+            out.push_str("] ");
+            out.push_str(&tag_re.replace_all(text, ""));
+        } else {
+            out.push_str(&tag_re.replace_all(line, ""));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Remove the internal `[TNN]` provenance tags, which exist only so
@@ -3640,6 +3665,27 @@ Prose about completing subcommands of the new history command.
         assert!(
             !strip_topic_tags(&valid_digest(&HUMAN_DIGEST_MODE, 0)).contains("[T0"),
             "no topic ID may survive into a published digest",
+        );
+    }
+
+    #[test]
+    fn test_normalize_topic_tags_keeps_only_leading_provenance() {
+        let tagged = "## The day in brief\n\n\
+                      [T01] A fast path was refined.\n\n\
+                      ## Notable threads\n\n\
+                      ### [T01] packfile [T02] lookup fast path\n\n\
+                      Prose mentioning [T03] internal bookkeeping.\n\n\
+                      ## In brief\n\n\
+                      - [T04] A small [T05] test fix.\n";
+        assert_eq!(
+            normalize_topic_tags(tagged),
+            "## The day in brief\n\n\
+             A fast path was refined.\n\n\
+             ## Notable threads\n\n\
+             ### [T01] packfile lookup fast path\n\n\
+             Prose mentioning internal bookkeeping.\n\n\
+             ## In brief\n\n\
+             - [T04] A small test fix.\n",
         );
     }
 
