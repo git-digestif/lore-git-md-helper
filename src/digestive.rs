@@ -1689,6 +1689,7 @@ async fn generate_digest_mode(
     let label = mode.label;
     let mut correction = String::new();
     let mut issues = Vec::new();
+    let mut corrections = Vec::new();
 
     for _ in 0..3 {
         let prompt = format!(
@@ -1716,7 +1717,12 @@ async fn generate_digest_mode(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
         );
-        correction = format!("\n\n{}", correction_block(&issues));
+        for issue in &issues {
+            if !corrections.contains(issue) {
+                corrections.push(issue.clone());
+            }
+        }
+        correction = format!("\n\n{}", correction_block(&corrections));
     }
 
     anyhow::bail!(
