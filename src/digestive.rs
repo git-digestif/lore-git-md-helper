@@ -1690,7 +1690,7 @@ async fn generate_digest_mode(
     let mut correction = String::new();
     let mut issues = Vec::new();
 
-    for _ in 0..2 {
+    for _ in 0..3 {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
             output_contract(mode, ids),
@@ -1720,7 +1720,7 @@ async fn generate_digest_mode(
 
     anyhow::bail!(
         "daily digest ({label}) for {day} failed validation or factual audit \
-         after one corrective retry:\n{}",
+         after two corrective retries:\n{}",
         issues.join("\n"),
     )
 }
