@@ -8,6 +8,10 @@ The evidence arrives as one self-contained packet per topic. Each packet
 begins with a line `TOPIC TNN`, where `TNN` is that topic's opaque ID, and
 contains only that topic's material:
 
+- `CURRENT SOURCE SUBJECT FOR TNN` is the latest source email's subject.
+  Use it to identify today's work when a command or series has changed
+  names since the root message. Do not relabel today's development with
+  a superseded name from the background.
 - `BACKGROUND FOR TNN` is the original thread-root author's own unquoted
   text: the subject of the message that started the thread, followed by an
   excerpt of that message. It is source material, not a summary, and may

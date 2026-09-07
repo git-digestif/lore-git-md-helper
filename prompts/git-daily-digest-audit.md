@@ -5,8 +5,10 @@ evidence. Compare meaning, not wording. Report material factual errors,
 not style preferences or missing verbatim phrases. Do not rewrite the
 digest.
 
-Each `TOPIC TNN` packet contains two complementary kinds of evidence:
+Each `TOPIC TNN` packet contains complementary kinds of evidence:
 
+- `CURRENT SOURCE SUBJECT` identifies the latest source email's subject.
+  It may supersede a command or series name from the older root message.
 - `BACKGROUND` identifies the topic, its purpose, subsystem, and technical
   effects. These facts may explain today's news without being repeated
   in a delta.

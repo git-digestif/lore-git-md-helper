@@ -1532,6 +1532,7 @@ struct RootDelta {
 /// so that no cross-topic lookup is possible.
 struct TopicPacket {
     id: String,
+    current_subject: Option<String>,
     background: Option<String>,
     bullets: Vec<String>,
 }
@@ -1645,13 +1646,26 @@ fn build_topic_packets(threads: &[ThreadDayActivity], deltas: &[RootDelta]) -> V
         .iter()
         .filter(|delta| !delta.bullets.is_empty())
         .enumerate()
-        .map(|(n, delta)| TopicPacket {
-            id: format!("T{:02}", n + 1),
-            background: threads
+        .map(|(n, delta)| {
+            let thread = threads
                 .iter()
-                .find(|thread| thread.root_dk == delta.root_dk)
-                .and_then(|thread| thread.root_source_excerpt.clone()),
-            bullets: delta.bullets.clone(),
+                .find(|thread| thread.root_dk == delta.root_dk);
+            TopicPacket {
+                id: format!("T{:02}", n + 1),
+                current_subject: thread.and_then(|thread| {
+                    thread.email_summaries.iter().rev().find_map(|email| {
+                        email
+                            .source_excerpt
+                            .as_deref()?
+                            .lines()
+                            .next()?
+                            .strip_prefix("Subject: ")
+                            .map(str::to_string)
+                    })
+                }),
+                background: thread.and_then(|thread| thread.root_source_excerpt.clone()),
+                bullets: delta.bullets.clone(),
+            }
         })
         .collect()
 }
@@ -1660,11 +1674,15 @@ fn render_topic_packets(packets: &[TopicPacket]) -> String {
     let mut out = String::new();
     for TopicPacket {
         id,
+        current_subject,
         background,
         bullets,
     } in packets
     {
         out.push_str(&format!("---\nTOPIC {id}\n\n"));
+        if let Some(subject) = current_subject {
+            out.push_str(&format!("CURRENT SOURCE SUBJECT FOR {id}: {subject}\n\n"));
+        }
         match background {
             Some(background) => out.push_str(&format!(
                 "BACKGROUND FOR {id} -- THE THREAD ROOT AUTHOR'S OWN WORDS. \
@@ -3697,6 +3715,33 @@ mod tests {
             !rendered.contains("2026/08/13/05-47-56") && !rendered.contains("must never reach"),
             "roots are named by opaque ID only, never by date-key or baseline: {rendered}",
         );
+    }
+
+    #[test]
+    fn test_topic_packet_retains_current_subject_after_rename() {
+        let mut thread = delta_activity(
+            "2026/06/14/19-25-39",
+            &[("2026/08/13/21-52-53", "Junio C Hamano")],
+        );
+        thread.root_source_excerpt =
+            Some("Subject: rebase: add --fixup\n\nOriginal proposal.".into());
+        thread.email_summaries[0].source_excerpt = Some(
+            "Subject: Re: [PATCH v13 7/8] history: create squashed commits without editing\n\n\
+             Queued a test fix."
+                .into(),
+        );
+        let deltas = vec![RootDelta {
+            root_dk: thread.root_dk.clone(),
+            bullets: vec!["[2026/08/13/21-52-53 by Junio C Hamano] Queued a test fix.".into()],
+        }];
+        let packets = build_topic_packets(&[thread], &deltas);
+        assert_eq!(
+            packets[0].current_subject.as_deref(),
+            Some("Re: [PATCH v13 7/8] history: create squashed commits without editing"),
+        );
+        let rendered = render_topic_packets(&packets);
+        assert!(rendered.contains("CURRENT SOURCE SUBJECT FOR T01: Re: [PATCH v13 7/8] history:"));
+        assert!(rendered.contains("Subject: rebase: add --fixup"));
     }
 
     /// The topic IDs the fixture digest below is bound to.
