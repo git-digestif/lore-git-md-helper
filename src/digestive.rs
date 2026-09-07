@@ -1454,6 +1454,8 @@ pub async fn generate_daily_digest(
         extraction_attempt += 1;
         let regular_prompt = format!("{delta_input}{extraction_correction}");
         let short_prompt = format!("{short_delta_input}{extraction_correction}");
+        trace_digest_attempt("regular", extraction_attempt, "input.txt", &regular_prompt)?;
+        trace_digest_attempt("short", extraction_attempt, "input.txt", &short_prompt)?;
         let regular_deltas = if regular_count == 0 {
             String::new()
         } else {
@@ -1470,6 +1472,8 @@ pub async fn generate_daily_digest(
                 .await
                 .context("short daily delta extraction failed")?
         };
+        trace_digest_attempt("regular", extraction_attempt, "output.txt", &regular_deltas)?;
+        trace_digest_attempt("short", extraction_attempt, "output.txt", &short_deltas)?;
         let deltas = [regular_deltas.trim(), short_deltas.trim()]
             .into_iter()
             .filter(|delta| !delta.is_empty())
@@ -1507,6 +1511,7 @@ pub async fn generate_daily_digest(
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
     }
     let evidence = render_topic_packets(&packets);
+    trace_digest_attempt("editor", 0, "evidence.txt", &evidence)?;
     let ids: Vec<&str> = packets.iter().map(|packet| packet.id.as_str()).collect();
 
     let user_msg = format!(
@@ -1716,6 +1721,7 @@ async fn generate_digest_mode(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
             output_contract(mode, ids),
         );
+        trace_digest_attempt(label, attempt, "input.txt", &prompt)?;
         let raw = backend
             .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
             .await
@@ -1723,7 +1729,7 @@ async fn generate_digest_mode(
         let digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
             &summarize::normalize_headings(&raw),
         )));
-        trace_digest_attempt(mode, attempt, "draft.md", &digest)?;
+        trace_digest_attempt(label, attempt, "draft.md", &digest)?;
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
@@ -1738,7 +1744,7 @@ async fn generate_digest_mode(
             issues = structural_issues;
             None
         };
-        trace_digest_attempt(mode, attempt, "issues.txt", &issues.join("\n"))?;
+        trace_digest_attempt(label, attempt, "issues.txt", &issues.join("\n"))?;
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
@@ -1758,22 +1764,14 @@ async fn generate_digest_mode(
     )
 }
 
-fn trace_digest_attempt(
-    mode: &DigestMode,
-    attempt: usize,
-    suffix: &str,
-    content: &str,
-) -> Result<()> {
+fn trace_digest_attempt(label: &str, attempt: usize, suffix: &str, content: &str) -> Result<()> {
     let Some(dir) = std::env::var_os("DIGESTIVE_TRACE_DIR") else {
         return Ok(());
     };
     let dir = std::path::Path::new(&dir);
     std::fs::create_dir_all(dir).context("create daily digest trace directory")?;
-    std::fs::write(
-        dir.join(format!("{}-{attempt}-{suffix}", mode.label)),
-        content,
-    )
-    .context("write daily digest trace")
+    std::fs::write(dir.join(format!("{label}-{attempt}-{suffix}")), content)
+        .context("write daily digest trace")
 }
 
 /// Check a structurally valid, tagged draft against the exact evidence
