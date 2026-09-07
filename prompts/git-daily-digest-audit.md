@@ -53,10 +53,10 @@ fence, no leading or trailing prose.
 Otherwise reply with one line per problem, at most eight lines, each in
 this exact shape:
 
-- TNN: <what is wrong>
+- TNN ||| LNNNN ||| <what is wrong>
 
-Identify the location by topic ID only. Do not quote the draft, do not
-name headings, and do not print date-keys. Describe the violation
-itself, for example `- T04: claims the series is ready to graduate,
-which no delta bullet states`. Never use a topic ID that does not appear
-in the evidence. Use only ASCII characters.
+Every draft line is prefixed with an ID such as `L0042`. The middle field
+must be the ID of the shortest line that demonstrates the problem. This
+grounds the finding; never invent a line ID. Identify the packet by topic
+ID, and describe the violation in the final field. Never use a topic ID
+that does not appear in the evidence. Use only ASCII characters.

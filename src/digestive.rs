@@ -1779,34 +1779,79 @@ fn trace_digest_attempt(
 /// packets it was written from.  Returns the auditor's issue lines, or
 /// an empty vector when it accepts the draft.
 async fn audit_digest(digest: &str, evidence: &str, backend: &Backend) -> Result<Vec<String>> {
-    let user_msg =
-        format!("EVIDENCE PACKETS:\n\n{evidence}\n---\n\nTAGGED DRAFT TO AUDIT:\n\n{digest}");
-    let verdict = backend
-        .chat_with_options(DAILY_DIGEST_AUDIT_AGENT, &user_msg, Some(0.0))
-        .await
-        .context("daily digest factual audit failed")?;
-    Ok(parse_audit_verdict(&verdict))
+    let numbered_draft = digest
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("L{:04} {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let base = format!(
+        "EVIDENCE PACKETS:\n\n{evidence}\n---\n\n\
+         TAGGED DRAFT TO AUDIT -- EACH LINE STARTS WITH ITS CITATION ID:\n\n\
+         {numbered_draft}",
+    );
+    let mut correction = String::new();
+    for attempt in 1..=2 {
+        let verdict = backend
+            .chat_with_options(
+                DAILY_DIGEST_AUDIT_AGENT,
+                &format!("{base}{correction}"),
+                Some(0.0),
+            )
+            .await
+            .context("daily digest factual audit failed")?;
+        match parse_audit_verdict(&verdict, digest) {
+            Ok(issues) => return Ok(issues),
+            Err(err) if attempt == 1 => {
+                eprintln!("[digestive] factual auditor response rejected: {err:#}");
+                correction = format!(
+                    "\n\nMANDATORY AUDIT FORMAT CORRECTION:\n\
+                     The previous verdict was rejected: {err:#}\n\
+                     Audit the same draft again. In every finding, copy one \
+                     `LNNNN` citation ID from TAGGED DRAFT TO AUDIT into the \
+                     middle field. Do not quote or paraphrase text there.\n",
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the bounded audit loop always returns")
 }
 
-/// Only a bare `OK` accepts the draft.  An auditor that answers in prose
-/// has found something it could not phrase as a verdict, so its whole
-/// answer becomes rejection issues rather than an implicit pass.
-fn parse_audit_verdict(verdict: &str) -> Vec<String> {
+fn parse_audit_verdict(verdict: &str, digest: &str) -> Result<Vec<String>> {
     if verdict.trim() == "OK" {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mut issues: Vec<String> = verdict
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("```"))
-        .map(|line| line.trim().trim_start_matches(['-', '*', ' ']).trim())
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut issues = Vec::new();
+    for line in verdict.lines().filter(|line| !line.trim().is_empty()) {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']).trim();
+        let mut fields = line.splitn(3, "|||").map(str::trim);
+        let topic = fields.next().unwrap_or_default();
+        let citation = fields
+            .next()
+            .context("factual audit finding has no draft line citation")?;
+        let issue = fields
+            .next()
+            .context("factual audit finding has no explanation")?;
+        let line_number = citation
+            .strip_prefix('L')
+            .context("factual audit citation does not start with `L`")?
+            .parse::<usize>()
+            .context("factual audit citation is not a line number")?;
+        let line = line_number
+            .checked_sub(1)
+            .and_then(|index| digest.lines().nth(index))
+            .with_context(|| format!("factual auditor cited absent draft line `{citation}`"))?;
+        if !topic.starts_with('T') {
+            anyhow::bail!("factual audit finding has invalid topic `{topic}`");
+        }
+        issues.push(format!("{topic}: line {line_number} `{line}` -- {issue}"));
+    }
     if issues.is_empty() {
-        issues.push("the factual auditor rejected the draft without naming an issue".into());
+        anyhow::bail!("the factual auditor rejected the draft without naming an issue");
     }
     issues.truncate(MAX_ISSUES);
-    issues
+    Ok(issues)
 }
 
 fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
@@ -3749,23 +3794,25 @@ Prose about completing subcommands of the new history command.
 
     #[test]
     fn test_parse_audit_verdict_accepts_only_a_bare_ok() {
-        assert!(parse_audit_verdict("OK").is_empty());
-        assert!(parse_audit_verdict("  OK\n").is_empty());
+        let draft = "### [T01] topic\n\nThe series is ready to merge.\n";
+        assert!(parse_audit_verdict("OK", draft).unwrap().is_empty());
+        assert!(parse_audit_verdict("  OK\n", draft).unwrap().is_empty());
         assert_eq!(
-            parse_audit_verdict("Okay, this looks fine to me."),
-            vec!["Okay, this looks fine to me.".to_string()],
-            "hedged prose is a rejection, never an implicit pass",
+            parse_audit_verdict("- T01 ||| L0003 ||| no delta states readiness", draft,).unwrap(),
+            vec![
+                "T01: line 3 `The series is ready to merge.` -- no delta states readiness"
+                    .to_string()
+            ],
         );
-        assert_eq!(
-            parse_audit_verdict("```\n- T01: claims an unstated integration state.\n```"),
-            vec!["T01: claims an unstated integration state.".to_string()],
+        assert!(
+            parse_audit_verdict("- T01 ||| L0099 ||| no delta states integration", draft,).is_err(),
+            "an auditor may not invent the line it rejects",
         );
-        assert_eq!(parse_audit_verdict("\n \n").len(), 1);
 
         let many: String = (1..=20)
-            .map(|n| format!("- T{n:02}: unsupported claim.\n"))
+            .map(|n| format!("- T{n:02} ||| L0003 ||| unsupported claim\n"))
             .collect();
-        assert_eq!(parse_audit_verdict(&many).len(), MAX_ISSUES);
+        assert_eq!(parse_audit_verdict(&many, draft).unwrap().len(), MAX_ISSUES);
     }
 
     #[test]
