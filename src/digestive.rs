@@ -1707,13 +1707,17 @@ async fn generate_digest_mode(
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
-        issues = validate_digest(&digest, mode, ids);
-        if issues.is_empty() {
+        let structural_issues = validate_digest(&digest, mode, ids);
+        let factual_revision = if structural_issues.is_empty() {
             issues = audit_digest(&digest, evidence, backend).await?;
             if issues.is_empty() {
                 return Ok(strip_topic_tags(&digest));
             }
-        }
+            Some(digest.as_str())
+        } else {
+            issues = structural_issues;
+            None
+        };
         trace_digest_attempt(mode, attempt, "issues.txt", &issues.join("\n"))?;
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
@@ -1724,7 +1728,7 @@ async fn generate_digest_mode(
                 corrections.push(issue.clone());
             }
         }
-        correction = format!("\n\n{}", correction_block(&corrections));
+        correction = format!("\n\n{}", correction_block(&corrections, factual_revision),);
     }
 
     anyhow::bail!(
@@ -1820,18 +1824,27 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
     )
 }
 
-fn correction_block(issues: &[String]) -> String {
-    format!(
-        "MANDATORY CORRECTION -- THE PREVIOUS DRAFT WAS REJECTED:\n{}\n\
-         Write the digest again from the evidence above, from scratch. The \
-         rejected draft is not shown to you and none of its shape may be \
-         reused. Satisfy every point of the FINAL OUTPUT CONTRACT above.",
-        issues
-            .iter()
-            .map(|issue| format!("- {issue}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+fn correction_block(issues: &[String], factual_revision: Option<&str>) -> String {
+    let issues = issues
+        .iter()
+        .map(|issue| format!("- {issue}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match factual_revision {
+        Some(draft) => format!(
+            "MANDATORY FACTUAL REVISION:\n{issues}\n\
+             Revise the draft below only as needed to remove these unsupported \
+             claims. Preserve its valid structure, topic boundaries, and word \
+             budget. Do not replace a removed claim with a new inference.\n\n\
+             DRAFT TO REVISE:\n\n{draft}",
+        ),
+        None => format!(
+            "MANDATORY CORRECTION -- THE PREVIOUS DRAFT WAS REJECTED:\n{issues}\n\
+             Write the digest again from the evidence above, from scratch. The \
+             rejected draft is not shown to you and none of its shape may be \
+             reused. Satisfy every point of the FINAL OUTPUT CONTRACT above.",
+        ),
+    }
 }
 
 /// The deterministic test mock can emit neither extractor syntax nor a
@@ -3758,10 +3771,18 @@ Prose about completing subcommands of the new history command.
         let names = "Ren\u{e9} Scharfe and Jean-Noe\u{308}l Avila reviewed it.";
         assert_eq!(normalize_typography(names), names);
 
-        let block = correction_block(&["word count is 977; too long".to_string()]);
+        let block = correction_block(&["word count is 977; too long".to_string()], None);
         assert!(block.contains("word count is 977; too long"), "{block}");
         assert!(!block.contains("UNIQUE_DRAFT_PROSE"));
         assert!(block.contains("not shown to you"));
+
+        let block = correction_block(
+            &["T01: unsupported status".to_string()],
+            Some("UNIQUE_DRAFT_PROSE"),
+        );
+        assert!(block.contains("T01: unsupported status"));
+        assert!(block.contains("UNIQUE_DRAFT_PROSE"));
+        assert!(block.contains("Preserve its valid structure"));
     }
 
     #[test]
