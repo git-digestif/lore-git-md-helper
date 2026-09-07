@@ -1691,7 +1691,7 @@ async fn generate_digest_mode(
     let mut issues = Vec::new();
     let mut corrections = Vec::new();
 
-    for _ in 0..3 {
+    for attempt in 1..=3 {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
             output_contract(mode, ids),
@@ -1703,6 +1703,7 @@ async fn generate_digest_mode(
         let digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
             &summarize::normalize_headings(&raw),
         )));
+        trace_digest_attempt(mode, attempt, "draft.md", &digest)?;
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
@@ -1713,6 +1714,7 @@ async fn generate_digest_mode(
                 return Ok(strip_topic_tags(&digest));
             }
         }
+        trace_digest_attempt(mode, attempt, "issues.txt", &issues.join("\n"))?;
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
@@ -1730,6 +1732,24 @@ async fn generate_digest_mode(
          after two corrective retries:\n{}",
         issues.join("\n"),
     )
+}
+
+fn trace_digest_attempt(
+    mode: &DigestMode,
+    attempt: usize,
+    suffix: &str,
+    content: &str,
+) -> Result<()> {
+    let Some(dir) = std::env::var_os("DIGESTIVE_TRACE_DIR") else {
+        return Ok(());
+    };
+    let dir = std::path::Path::new(&dir);
+    std::fs::create_dir_all(dir).context("create daily digest trace directory")?;
+    std::fs::write(
+        dir.join(format!("{}-{attempt}-{suffix}", mode.label)),
+        content,
+    )
+    .context("write daily digest trace")
 }
 
 /// Check a structurally valid, tagged draft against the exact evidence
