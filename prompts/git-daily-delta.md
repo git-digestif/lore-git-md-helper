@@ -69,14 +69,13 @@ Do not infer facts, dates, authors, Message-IDs, URLs, or status transitions.
 Attribute each retained contribution only to the author named in its
 `[date-key by Author]` header.
 
-Output zero or more blocks in this exact shape:
+Output one bullet per independent development in this exact shape:
 
----
-Thread root: <date-key>
-New today:
-- [<date-key> by <Author>] <new information>
+- [<email-date-key>] <new information>
 
-Use one bullet per independent development. If no thread has noteworthy new
-information, output exactly `No noteworthy thread deltas.`
+Copy the email's date-key from its input header, not the thread root.
+Thread ownership and author labels are supplied by code from that source
+email; do not reproduce them in output headers. If no thread has noteworthy
+new information, output exactly `No noteworthy thread deltas.`
 
 Use only ASCII characters.

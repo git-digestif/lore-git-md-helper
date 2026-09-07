@@ -1498,8 +1498,8 @@ pub async fn generate_daily_digest(
                 extraction_correction = format!(
                     "\n\nMANDATORY FORMAT CORRECTION:\n\
                      The previous output was rejected: {err:#}\n\
-                     Emit only the requested root blocks. Copy every \
-                     `Thread root:` value exactly from the input; never \
+                     Emit only the requested bullets. Copy each email's \
+                     date-key exactly from its input header; never \
                      construct or alter a date-key.\n",
                 );
             }
@@ -1551,13 +1551,8 @@ struct TopicPacket {
     bullets: Vec<String>,
 }
 
-/// Recover per-root delta records from the merged extractor output.
-///
-/// Tolerates Markdown fences, `---` separators, either extractor's
-/// "no deltas" sentinel, wrapped bullets, and a root reported by both
-/// extractors (the bullets are merged).  Anything else is an error:
-/// silently dropping extractor output would let the final editor write
-/// about a topic from nothing but its background.
+/// Bind each delta to its cited email's source metadata, not to the
+/// model's thread or author labels.
 fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<RootDelta>> {
     let mut by_thread: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut current: Option<usize> = None;
@@ -1573,25 +1568,55 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
         }
         if let Some(dk) = line.strip_prefix("Thread root:") {
             let dk = dk.trim();
-            let index = threads
+            threads
                 .iter()
-                .position(|thread| thread.root_dk == dk)
+                .find(|thread| thread.root_dk == dk)
                 .with_context(|| format!("delta extractor named unknown thread root `{dk}`"))?;
-            by_thread.entry(index).or_default();
-            current = Some(index);
+            current = None;
             continue;
         }
         if line.eq_ignore_ascii_case("New today:") {
             continue;
         }
-        let bullets = current
-            .and_then(|index| by_thread.get_mut(&index))
-            .with_context(|| format!("delta extractor output has no root before `{line}`"))?;
         match line.strip_prefix("- ") {
-            Some(bullet) => bullets.push(bullet.trim().to_string()),
+            Some(bullet) => {
+                let (header, text) = bullet
+                    .strip_prefix('[')
+                    .and_then(|text| text.split_once(']'))
+                    .context("delta extractor emitted a bullet without an email citation")?;
+                let dk = header
+                    .split_once(" by ")
+                    .map_or(header, |(dk, _)| dk)
+                    .trim();
+                let (index, email) = threads
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, thread)| {
+                        thread
+                            .email_summaries
+                            .iter()
+                            .find(|email| email.dk == dk)
+                            .map(|email| (index, email))
+                    })
+                    .with_context(|| {
+                        format!("delta extractor cited unknown source email `{dk}`")
+                    })?;
+                let text = text.trim();
+                anyhow::ensure!(!text.is_empty(), "empty delta for source email `{dk}`");
+                let citation = match &email.from {
+                    Some(author) => format!("[{dk} by {author}]"),
+                    None => format!("[{dk}]"),
+                };
+                by_thread
+                    .entry(index)
+                    .or_default()
+                    .push(format!("{citation} {text}"));
+                current = Some(index);
+            }
             None => {
-                let last = bullets
-                    .last_mut()
+                let last = current
+                    .and_then(|index| by_thread.get_mut(&index))
+                    .and_then(|bullets| bullets.last_mut())
                     .with_context(|| format!("delta extractor emitted stray line `{line}`"))?;
                 last.push(' ');
                 last.push_str(line);
@@ -3404,14 +3429,62 @@ mod tests {
         }
     }
 
+    fn delta_activity(root_dk: &str, emails: &[(&str, &str)]) -> ThreadDayActivity {
+        let mut activity = thread_activity(root_dk, None);
+        activity.email_summaries = emails
+            .iter()
+            .map(|(dk, author)| DayEmailEvidence {
+                dk: (*dk).into(),
+                ai: "Untrusted brief.".into(),
+                from: Some((*author).into()),
+                source_excerpt: Some("Authored source.".into()),
+                source_is_short: false,
+            })
+            .collect();
+        activity
+    }
+
+    #[test]
+    fn test_parse_root_deltas_uses_message_provenance() {
+        let threads = [
+            delta_activity(
+                "2026/07/15/01-18-50",
+                &[("2026/08/13/06-11-25", "Tian Yuchen")],
+            ),
+            delta_activity(
+                "2026/07/16/13-28-41",
+                &[("2026/08/13/20-08-24", "Siddharth Shrimali")],
+            ),
+        ];
+        let raw = "Thread root: 2026/07/15/01-18-50\n\
+                   New today:\n\
+                   - [2026/08/13/20-08-24 by Wrong Author] Posted v5.";
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap(),
+            vec![RootDelta {
+                root_dk: "2026/07/16/13-28-41".into(),
+                bullets: vec!["[2026/08/13/20-08-24 by Siddharth Shrimali] Posted v5.".into()],
+            }],
+        );
+    }
+
     /// The two extractors' outputs arrive concatenated, optionally
     /// fenced, and may both report the same root; the parser has to
     /// recover exactly one record per root, in thread order.
     #[test]
     fn test_parse_root_deltas_merges_extractor_outputs() {
         let threads = [
-            thread_activity("2026/08/12/00-00-00", None),
-            thread_activity("2026/08/13/05-47-56", None),
+            delta_activity(
+                "2026/08/12/00-00-00",
+                &[("2026/08/13/10-00-00", "Jeff King")],
+            ),
+            delta_activity(
+                "2026/08/13/05-47-56",
+                &[
+                    ("2026/08/13/09-00-00", "Patrick Steinhardt"),
+                    ("2026/08/13/17-35-39", "Junio C Hamano"),
+                ],
+            ),
         ];
         let raw = "```markdown\n\
                    ---\n\
@@ -3455,7 +3528,10 @@ mod tests {
 
     #[test]
     fn test_parse_root_deltas_rejects_malformed_output() {
-        let threads = [thread_activity("2026/08/13/05-47-56", None)];
+        let threads = [delta_activity(
+            "2026/08/13/05-47-56",
+            &[("2026/08/13/17-35-39", "Junio C Hamano")],
+        )];
 
         assert!(
             parse_root_deltas("No noteworthy thread deltas.", &threads)
@@ -3481,11 +3557,18 @@ mod tests {
                 "---\nThread root: 2026/01/01/00-00-00\nNew today:\n- Something.",
                 "unknown thread root",
             ),
-            ("Today the list discussed several series.", "no root before"),
+            ("Today the list discussed several series.", "stray line"),
+            ("- Something.", "without an email citation"),
+            ("- [2026/08/12/00-00-00] Posted v5.", "unknown source email"),
+            ("- [2026/08/13/17-35-39]", "empty delta"),
         ] {
             let err = parse_root_deltas(raw, &threads).unwrap_err().to_string();
             assert!(err.contains(expected), "expected `{expected}`, got `{err}`");
         }
+        assert_eq!(
+            parse_root_deltas("- [2026/08/13/17-35-39] Agreed.", &threads).unwrap()[0].bullets,
+            vec!["[2026/08/13/17-35-39 by Junio C Hamano] Agreed."],
+        );
     }
 
     #[test]
