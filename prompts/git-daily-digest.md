@@ -189,6 +189,9 @@ consequential material rather than overrunning it.
 
 ## Style
 
+Return only the digest, beginning with its title. Do not add a preface,
+separator rules, a closing explanation, or a self-reported word count.
+
 Use present tense and active voice. Put commands, options, symbols, paths,
 and branch names in backticks. Avoid hype and process praise. Use only ASCII
 except for contributor names that contain diacritics.

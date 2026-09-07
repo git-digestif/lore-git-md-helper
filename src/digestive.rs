@@ -1769,7 +1769,7 @@ async fn generate_digest_mode(
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
-        let structural_issues = validate_digest(&digest, mode, ids);
+        let structural_issues = validate_digest(&digest, mode, ids, day);
         let factual_revision = if structural_issues.is_empty() {
             issues = audit_digest(&digest, evidence, backend).await?;
             if issues.is_empty() {
@@ -2078,7 +2078,7 @@ const INACTIVITY_PHRASES: [&str; 6] = [
     "nothing new to report",
 ];
 
-fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
+fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<String> {
     static NUMBERED_RE: OnceLock<Regex> = OnceLock::new();
     static DATE_RE: OnceLock<Regex> = OnceLock::new();
     static BOLD_RE: OnceLock<Regex> = OnceLock::new();
@@ -2094,8 +2094,15 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
         (Vec::new(), Vec::new(), Vec::new());
     let mut section = 0;
     let mut fenced = false;
+    let mut title_count = 0;
+    let mut extra_prose = 0;
+    let mut in_brief_item = false;
 
     for line in md.lines().map(str::trim) {
+        if line.is_empty() {
+            in_brief_item = false;
+            continue;
+        }
         if line.starts_with("```") {
             fenced = !fenced;
             continue;
@@ -2111,9 +2118,12 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
         let level = line.chars().take_while(|c| *c == '#').count();
         let text = line[level..].trim();
         match level {
-            // The title is the one place a date belongs.
-            1 => continue,
+            1 => {
+                title_count += 1;
+                continue;
+            }
             2 => {
+                in_brief_item = false;
                 let key = label_key(text);
                 section = match key.as_str() {
                     "notable threads" => 1,
@@ -2142,12 +2152,16 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
             }
             0 if section == 2 => {
                 if let Some(item) = line.strip_prefix("- ") {
+                    in_brief_item = true;
                     match split_topic_tag(item).0 {
                         Some(id) => tags.push(id),
                         None => untagged += 1,
                     }
+                } else if !in_brief_item {
+                    extra_prose += 1;
                 }
             }
+            0 if h2.is_empty() => extra_prose += 1,
             0 => {}
             _ => deep += 1,
         }
@@ -2172,6 +2186,19 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str]) -> Vec<String> {
             "word count is {words}; the {} digest must contain {}-{} words",
             mode.label, mode.min_words, mode.max_words,
         ));
+    }
+    let title = format!("# Git mailing list daily digest for {day}");
+    if title_count != 1 || md.trim().lines().next().map(str::trim) != Some(title.as_str()) {
+        issues.push(format!(
+            "the first content must be the sole title `{title}`"
+        ));
+    }
+    if extra_prose > 0 {
+        issues.push(
+            "write only the digest: no preamble, and no unbulleted footer or word-count \
+             report under `## In brief`"
+                .into(),
+        );
     }
     if h2 != DIGEST_H2_SEQUENCE {
         issues.push(format!(
@@ -3746,6 +3773,7 @@ mod tests {
 
     /// The topic IDs the fixture digest below is bound to.
     const VALID_IDS: [&str; 4] = ["T01", "T02", "T03", "T04"];
+    const DIGEST_DAY: &str = "2026/08/13";
 
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
         let skeleton = "\
@@ -3782,9 +3810,12 @@ Prose about completing subcommands of the new history command.
             .split_whitespace()
             .filter(|token| token.chars().any(char::is_alphanumeric))
             .count();
-        format!(
-            "{skeleton}\n{}\n",
-            vec!["alpha"; target.saturating_sub(have)].join(" "),
+        skeleton.replace(
+            "\n\n## In brief",
+            &format!(
+                " {}\n\n## In brief",
+                vec!["alpha"; target.saturating_sub(have)].join(" ")
+            ),
         )
     }
 
@@ -3792,11 +3823,14 @@ Prose about completing subcommands of the new history command.
     fn test_validate_digest_word_contracts() {
         for mode in [&HUMAN_DIGEST_MODE, &AI_DIGEST_MODE] {
             for words in [mode.min_words, mode.max_words] {
-                assert!(validate_digest(&valid_digest(mode, words), mode, &VALID_IDS).is_empty());
+                assert!(
+                    validate_digest(&valid_digest(mode, words), mode, &VALID_IDS, DIGEST_DAY)
+                        .is_empty()
+                );
             }
             for words in [mode.min_words - 1, mode.max_words + 1] {
                 assert!(
-                    validate_digest(&valid_digest(mode, words), mode, &VALID_IDS)[0]
+                    validate_digest(&valid_digest(mode, words), mode, &VALID_IDS, DIGEST_DAY)[0]
                         .contains(&format!("word count is {words}"))
                 );
             }
@@ -3804,6 +3838,27 @@ Prose about completing subcommands of the new history command.
             assert!(DAILY_DIGEST_AGENT.contains(&range));
             assert!(output_contract(mode, &VALID_IDS).contains(&range));
         }
+    }
+
+    #[test]
+    fn test_validate_digest_rejects_model_chatter() {
+        let base = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        for draft in [
+            format!("Here is the revised digest:\n\n{base}"),
+            format!("{base}\n\nWord count: 600. The digest follows all requirements."),
+            base.replace("for 2026/08/13", "for 2026/08/12"),
+            format!("{base}\n# Another title\n"),
+        ] {
+            assert!(
+                !validate_digest(&draft, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY).is_empty(),
+                "non-digest content or a wrong title must be rejected",
+            );
+        }
+        let wrapped = base.replace(
+            "One remaining thread saw a small test fix.",
+            "One remaining thread saw\n  a small test fix.",
+        );
+        assert!(validate_digest(&wrapped, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY).is_empty(),);
     }
 
     #[test]
@@ -3873,7 +3928,7 @@ Prose about completing subcommands of the new history command.
                 "`YYYY/MM/DD` date",
             ),
         ] {
-            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS);
+            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY);
             assert!(
                 issues.iter().any(|issue| issue.contains(expected)),
                 "expected `{expected}`, got {issues:?}",
@@ -3925,7 +3980,7 @@ Prose about completing subcommands of the new history command.
                 "the draft writes `no new developments`",
             ),
         ] {
-            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS);
+            let issues = validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY);
             assert!(
                 issues.iter().any(|issue| issue.contains(expected)),
                 "expected `{expected}`, got {issues:?}",
@@ -4019,7 +4074,7 @@ Prose about completing subcommands of the new history command.
              Thread root: 2026/05/22\n\
              ```",
         );
-        assert!(validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS).is_empty());
+        assert!(validate_digest(&md, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY).is_empty());
         let raw = "Steinhardt\u{2019}s \u{201c}fast path\u{201d} cut O(N\u{00b2}) work \
                    \u{2013} 0.4s \u{2192} 4.5s \u{2014} and more\u{2026}";
         assert_eq!(
