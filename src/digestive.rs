@@ -1543,7 +1543,8 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
     let mut by_thread: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut current: Option<usize> = None;
 
-    for line in raw.lines().map(str::trim) {
+    for raw_line in raw.lines() {
+        let line = raw_line.trim();
         if line.is_empty()
             || line.starts_with("```")
             || line.chars().all(|c| c == '-')
@@ -1565,7 +1566,7 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
             continue;
         }
         match line.strip_prefix("- ") {
-            Some(bullet) => {
+            Some(bullet) if raw_line.starts_with('-') || bullet.starts_with('[') => {
                 let (header, text) = bullet
                     .strip_prefix('[')
                     .and_then(|text| text.split_once(']'))
@@ -1599,7 +1600,7 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
                     .push(format!("{citation} {text}"));
                 current = Some(index);
             }
-            None => {
+            _ => {
                 let last = current
                     .and_then(|index| by_thread.get_mut(&index))
                     .and_then(|bullets| bullets.last_mut())
@@ -3577,6 +3578,32 @@ mod tests {
                 "[2026/08/13/20-11-08 by Mark Levedahl] Retracted that description.",
                 "[2026/08/13/20-11-08 by Mark Levedahl] Suggested a clearer label.",
             ],
+        );
+    }
+
+    #[test]
+    fn test_parse_root_deltas_keeps_nested_details_with_their_source() {
+        let threads = [delta_activity(
+            "2026/07/08/02-59-40",
+            &[("2026/08/13/01-05-33", "Michael Montalbo")],
+        )];
+        let raw = "- [2026/08/13/01-05-33] Posted v3:\n  \
+                   - Use rm without -f for atomic consumption.\n  \
+                   - Move documentation to t/lib-httpd.sh.";
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap()[0].bullets,
+            vec![
+                "[2026/08/13/01-05-33 by Michael Montalbo] Posted v3: \
+                 - Use rm without -f for atomic consumption. \
+                 - Move documentation to t/lib-httpd.sh.",
+            ],
+        );
+        assert!(
+            parse_root_deltas(
+                "- [2026/08/13/01-05-33] Posted v3.\n- An uncited development.",
+                &threads,
+            )
+            .is_err()
         );
     }
 
