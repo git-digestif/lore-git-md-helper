@@ -1761,6 +1761,8 @@ async fn generate_digest_mode(
     let mut correction = String::new();
     let mut issues = Vec::new();
     let mut corrections = Vec::new();
+    // Sources are fixed for this mode's retries; only identical accepted text is reusable.
+    let mut approved = HashMap::new();
 
     for attempt in 1..=4 {
         let prompt = format!(
@@ -1781,7 +1783,14 @@ async fn generate_digest_mode(
         }
         let structural_issues = validate_digest(&digest, mode, ids, day);
         let factual_revision = if structural_issues.is_empty() {
-            issues = audit_digest(&digest, packets, backend, &format!("{label}-{attempt}")).await?;
+            issues = audit_digest(
+                &digest,
+                packets,
+                &mut approved,
+                backend,
+                &format!("{label}-{attempt}"),
+            )
+            .await?;
             if issues.is_empty() {
                 return Ok(strip_topic_tags(&digest));
             }
@@ -1873,6 +1882,7 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
 async fn audit_digest(
     digest: &str,
     packets: &[TopicPacket],
+    approved: &mut HashMap<String, String>,
     backend: &Backend,
     trace_label: &str,
 ) -> Result<Vec<String>> {
@@ -1891,14 +1901,17 @@ async fn audit_digest(
             .map(|(_, line)| *line)
             .collect::<Vec<_>>()
             .join("\n");
-        let findings = audit_section(id, &packet.source, section, backend, trace_label).await?;
-        if !findings.is_empty() {
-            issues.extend(findings);
-            if issues.len() >= MAX_ISSUES {
-                issues.truncate(MAX_ISSUES);
-                return Ok(issues);
+        if approved.get(id) != Some(&text) {
+            let findings = audit_section(id, &packet.source, section, backend, trace_label).await?;
+            if !findings.is_empty() {
+                issues.extend(findings);
+                if issues.len() >= MAX_ISSUES {
+                    issues.truncate(MAX_ISSUES);
+                    return Ok(issues);
+                }
+                continue;
             }
-            continue;
+            approved.insert(id.to_string(), text.clone());
         }
         verified.push_str(&format!("TOPIC {id}\n{text}\n\n"));
     }
@@ -4263,7 +4276,7 @@ Prose about completing subcommands of the new history command.
     }
 
     #[tokio::test]
-    async fn test_audit_uses_source_per_topic() {
+    async fn test_audit_uses_source_per_topic_and_reuses_unchanged_items() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4290,7 +4303,7 @@ Prose about completing subcommands of the new history command.
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"role": "assistant", "content": "OK"}}]
             })))
-            .expect(3)
+            .expect(6)
             .mount(&server)
             .await;
         let backend = Backend::Api {
@@ -4298,12 +4311,19 @@ Prose about completing subcommands of the new history command.
             model: "test".into(),
             token: None,
         };
-        assert!(
-            audit_digest(draft, &packets, &backend, "test")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let mut approved = HashMap::new();
+        for text in [
+            draft.to_string(),
+            draft.to_string(),
+            draft.replace("Alpha changed.", "Alpha was corrected."),
+        ] {
+            assert!(
+                audit_digest(&text, &packets, &mut approved, &backend, "test")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         let requests = server.received_requests().await.unwrap();
         let inputs: Vec<String> = requests
             .iter()
@@ -4312,7 +4332,7 @@ Prose about completing subcommands of the new history command.
                 body["messages"][1]["content"].as_str().unwrap().to_string()
             })
             .collect();
-        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs.len(), 6);
         assert!(inputs[0].contains("ORIGINAL-SOURCE-0"));
         assert!(!inputs[0].contains("ORIGINAL-SOURCE-1"));
         assert!(inputs[1].contains("ORIGINAL-SOURCE-1"));
@@ -4322,9 +4342,54 @@ Prose about completing subcommands of the new history command.
                 .iter()
                 .all(|input| !input.contains("UNTRUSTED-EXTRACTED-CLAIM"))
         );
-        assert!(inputs[2].contains("AUDIT LOCATION: T00"));
-        assert!(inputs[2].contains("VERIFIED DIGEST ITEMS"));
-        assert!(!inputs[2].contains("ORIGINAL-SOURCE"));
+        for index in [2, 3, 5] {
+            assert!(inputs[index].contains("AUDIT LOCATION: T00"));
+            assert!(inputs[index].contains("VERIFIED DIGEST ITEMS"));
+            assert!(!inputs[index].contains("ORIGINAL-SOURCE"));
+        }
+        assert!(inputs[4].contains("AUDIT LOCATION: T01"));
+        assert!(inputs[4].contains("Alpha was corrected."));
+    }
+
+    #[tokio::test]
+    async fn test_rejected_audit_items_are_not_reused() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let thread = delta_activity("2026/08/12/00-00-00", &[("2026/08/13/09-00-00", "Alice")]);
+        let deltas = vec![RootDelta {
+            root_dk: thread.root_dk.clone(),
+            bullets: vec!["A candidate.".into()],
+        }];
+        let packets = build_topic_packets(DIGEST_DAY, &[thread], &deltas);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "- T01 ||| L0003 ||| Unsupported assertion"
+                }}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        let draft = "## Notable threads\n### [T01] Test\nUnsupported.\n";
+        let mut approved = HashMap::new();
+        for _ in 0..2 {
+            assert_eq!(
+                audit_digest(draft, &packets, &mut approved, &backend, "test")
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+            );
+            assert!(approved.is_empty());
+        }
     }
 
     #[test]
