@@ -1626,9 +1626,17 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
 
     Ok(by_thread
         .into_iter()
-        .map(|(index, bullets)| RootDelta {
-            root_dk: threads[index].root_dk.clone(),
-            bullets,
+        .map(|(index, mut bullets)| {
+            // Keep clauses from the same email in their original order.
+            bullets.sort_by(|a, b| {
+                a.split_whitespace()
+                    .next()
+                    .cmp(&b.split_whitespace().next())
+            });
+            RootDelta {
+                root_dk: threads[index].root_dk.clone(),
+                bullets,
+            }
         })
         .collect())
 }
@@ -3465,6 +3473,32 @@ mod tests {
                 root_dk: "2026/07/16/13-28-41".into(),
                 bullets: vec!["[2026/08/13/20-08-24 by Siddharth Shrimali] Posted v5.".into()],
             }],
+        );
+    }
+
+    #[test]
+    fn test_parse_root_deltas_orders_interleaved_replies() {
+        let threads = [delta_activity(
+            "2026/08/06/06-40-13",
+            &[
+                ("2026/08/13/17-00-40", "Mark Levedahl"),
+                ("2026/08/13/19-35-46", "Johannes Sixt"),
+                ("2026/08/13/20-11-08", "Mark Levedahl"),
+            ],
+        )];
+        let raw = "- [2026/08/13/17-00-40] Described the color incorrectly.\n\
+                   - [2026/08/13/20-11-08] Retracted that description.\n\
+                   - [2026/08/13/20-11-08] Suggested a clearer label.\n\
+                   No noteworthy thread deltas.\n\
+                   - [2026/08/13/19-35-46] Corrected the description.";
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap()[0].bullets,
+            vec![
+                "[2026/08/13/17-00-40 by Mark Levedahl] Described the color incorrectly.",
+                "[2026/08/13/19-35-46 by Johannes Sixt] Corrected the description.",
+                "[2026/08/13/20-11-08 by Mark Levedahl] Retracted that description.",
+                "[2026/08/13/20-11-08 by Mark Levedahl] Suggested a clearer label.",
+            ],
         );
     }
 
