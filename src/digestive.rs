@@ -1448,40 +1448,59 @@ pub async fn generate_daily_digest(
          ({email_count} emails, {thread_count} threads) ...",
     );
 
-    let regular_deltas = if regular_count == 0 {
-        String::new()
-    } else {
-        backend
-            .chat_with_options(DAILY_DELTA_AGENT, &delta_input, Some(0.0))
-            .await
-            .context("daily delta extraction failed")?
-    };
-    let short_deltas = if short_count == 0 {
-        String::new()
-    } else {
-        backend
-            .chat_with_options(DAILY_SHORT_DELTA_AGENT, &short_delta_input, Some(0.0))
-            .await
-            .context("short daily delta extraction failed")?
-    };
-    let deltas = [regular_deltas.trim(), short_deltas.trim()]
-        .into_iter()
-        .filter(|delta| !delta.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut extraction_correction = String::new();
+    let mut extraction_attempt = 0;
+    let root_deltas = loop {
+        extraction_attempt += 1;
+        let regular_prompt = format!("{delta_input}{extraction_correction}");
+        let short_prompt = format!("{short_delta_input}{extraction_correction}");
+        let regular_deltas = if regular_count == 0 {
+            String::new()
+        } else {
+            backend
+                .chat_with_options(DAILY_DELTA_AGENT, &regular_prompt, Some(0.0))
+                .await
+                .context("daily delta extraction failed")?
+        };
+        let short_deltas = if short_count == 0 {
+            String::new()
+        } else {
+            backend
+                .chat_with_options(DAILY_SHORT_DELTA_AGENT, &short_prompt, Some(0.0))
+                .await
+                .context("short daily delta extraction failed")?
+        };
+        let deltas = [regular_deltas.trim(), short_deltas.trim()]
+            .into_iter()
+            .filter(|delta| !delta.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
 
-    // The deterministic test mock cannot emit extractor syntax, so under
-    // it every active thread simply carries the raw mock output.
-    let root_deltas = if is_mock(backend) {
-        threads
-            .iter()
-            .map(|thread| RootDelta {
-                root_dk: thread.root_dk.clone(),
-                bullets: vec![deltas.clone()],
-            })
-            .collect()
-    } else {
-        parse_root_deltas(&deltas, threads)?
+        // The deterministic test mock cannot emit extractor syntax, so under
+        // it every active thread simply carries the raw mock output.
+        if is_mock(backend) {
+            break threads
+                .iter()
+                .map(|thread| RootDelta {
+                    root_dk: thread.root_dk.clone(),
+                    bullets: vec![deltas.clone()],
+                })
+                .collect();
+        }
+        match parse_root_deltas(&deltas, threads) {
+            Ok(root_deltas) => break root_deltas,
+            Err(err) if extraction_attempt == 1 => {
+                eprintln!("[digestive] {day} delta extraction rejected: {err:#}");
+                extraction_correction = format!(
+                    "\n\nMANDATORY FORMAT CORRECTION:\n\
+                     The previous output was rejected: {err:#}\n\
+                     Emit only the requested root blocks. Copy every \
+                     `Thread root:` value exactly from the input; never \
+                     construct or alter a date-key.\n",
+                );
+            }
+            Err(err) => return Err(err),
+        }
     };
     let packets = build_topic_packets(threads, &root_deltas);
     if packets.is_empty() {
