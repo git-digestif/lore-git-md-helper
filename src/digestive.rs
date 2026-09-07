@@ -1440,7 +1440,7 @@ pub async fn generate_daily_digest(
     for thread in threads {
         root_deltas.extend(extract_thread_deltas(day, thread, backend).await?);
     }
-    let packets = build_topic_packets(threads, &root_deltas);
+    let packets = build_topic_packets(day, threads, &root_deltas);
     if packets.is_empty() {
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
     }
@@ -1461,9 +1461,8 @@ pub async fn generate_daily_digest(
     eprintln!("[digestive] generating daily digest for {day} ...");
 
     let human =
-        generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &evidence, &ids, backend).await?;
-    let ai =
-        generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &evidence, &ids, backend).await?;
+        generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &packets, &ids, backend).await?;
+    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &packets, &ids, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
 }
@@ -1535,6 +1534,7 @@ struct TopicPacket {
     current_subject: Option<String>,
     background: Option<String>,
     bullets: Vec<String>,
+    source: String,
 }
 
 /// Bind each delta to its cited email's source metadata, not to the
@@ -1642,7 +1642,11 @@ fn is_delta_preamble(line: &str) -> bool {
 /// Pair each root that has same-day deltas with its root author's
 /// background and an opaque, deterministic topic ID.  A root without
 /// deltas has no packet, and therefore no way into the digest.
-fn build_topic_packets(threads: &[ThreadDayActivity], deltas: &[RootDelta]) -> Vec<TopicPacket> {
+fn build_topic_packets(
+    day: &str,
+    threads: &[ThreadDayActivity],
+    deltas: &[RootDelta],
+) -> Vec<TopicPacket> {
     deltas
         .iter()
         .filter(|delta| !delta.bullets.is_empty())
@@ -1650,22 +1654,26 @@ fn build_topic_packets(threads: &[ThreadDayActivity], deltas: &[RootDelta]) -> V
         .map(|(n, delta)| {
             let thread = threads
                 .iter()
-                .find(|thread| thread.root_dk == delta.root_dk);
+                .find(|thread| thread.root_dk == delta.root_dk)
+                .expect("delta root was validated against source threads");
             TopicPacket {
                 id: format!("T{:02}", n + 1),
-                current_subject: thread.and_then(|thread| {
-                    thread.email_summaries.iter().rev().find_map(|email| {
-                        email
-                            .source_excerpt
-                            .as_deref()?
-                            .lines()
-                            .next()?
-                            .strip_prefix("Subject: ")
-                            .map(str::to_string)
-                    })
+                current_subject: thread.email_summaries.iter().rev().find_map(|email| {
+                    email
+                        .source_excerpt
+                        .as_deref()?
+                        .lines()
+                        .next()?
+                        .strip_prefix("Subject: ")
+                        .map(str::to_string)
                 }),
-                background: thread.and_then(|thread| thread.root_source_excerpt.clone()),
+                background: thread.root_source_excerpt.clone(),
                 bullets: delta.bullets.clone(),
+                source: build_daily_digest_user_msg(
+                    day,
+                    std::slice::from_ref(thread),
+                    thread.email_summaries.len(),
+                ),
             }
         })
         .collect()
@@ -1678,6 +1686,7 @@ fn render_topic_packets(packets: &[TopicPacket]) -> String {
         current_subject,
         background,
         bullets,
+        ..
     } in packets
     {
         out.push_str(&format!("---\nTOPIC {id}\n\n"));
@@ -1744,7 +1753,7 @@ async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
     user_msg: &str,
-    evidence: &str,
+    packets: &[TopicPacket],
     ids: &[&str],
     backend: &Backend,
 ) -> Result<String> {
@@ -1772,7 +1781,7 @@ async fn generate_digest_mode(
         }
         let structural_issues = validate_digest(&digest, mode, ids, day);
         let factual_revision = if structural_issues.is_empty() {
-            issues = audit_digest(&digest, evidence, backend).await?;
+            issues = audit_digest(&digest, packets, backend, &format!("{label}-{attempt}")).await?;
             if issues.is_empty() {
                 return Ok(strip_topic_tags(&digest));
             }
@@ -1811,41 +1820,134 @@ fn trace_digest_attempt(label: &str, attempt: usize, suffix: &str, content: &str
         .context("write daily digest trace")
 }
 
-/// Check a structurally valid, tagged draft against the exact evidence
-/// packets it was written from.  Returns the auditor's issue lines, or
-/// an empty vector when it accepts the draft.
-async fn audit_digest(digest: &str, evidence: &str, backend: &Backend) -> Result<Vec<String>> {
-    let numbered_draft = digest
-        .lines()
-        .enumerate()
-        .map(|(index, line)| format!("L{:04} {line}", index + 1))
+struct AuditSection<'a> {
+    topic_id: Option<&'a str>,
+    lines: Vec<(usize, &'a str)>,
+}
+
+fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
+    let mut sections: Vec<AuditSection<'_>> = Vec::new();
+    let mut current = None;
+    let mut in_brief = false;
+    let mut fenced = false;
+    for (index, line) in digest.lines().enumerate() {
+        let trimmed = line.trim();
+        if !fenced {
+            if let Some(heading) = trimmed.strip_prefix("## ") {
+                current = None;
+                let heading = label_key(heading);
+                in_brief = heading == "in brief";
+                if heading == "the day in brief" {
+                    sections.push(AuditSection {
+                        topic_id: None,
+                        lines: Vec::new(),
+                    });
+                    current = Some(sections.len() - 1);
+                }
+            }
+            let item = trimmed.strip_prefix("### ").or_else(|| {
+                if in_brief {
+                    trimmed.strip_prefix("- ")
+                } else {
+                    None
+                }
+            });
+            if let Some(topic_id) = item.and_then(|text| split_topic_tag(text).0) {
+                sections.push(AuditSection {
+                    topic_id: Some(topic_id),
+                    lines: Vec::new(),
+                });
+                current = Some(sections.len() - 1);
+            }
+        }
+        if let Some(current) = current {
+            sections[current].lines.push((index + 1, line));
+        }
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+        }
+    }
+    sections
+}
+
+async fn audit_digest(
+    digest: &str,
+    packets: &[TopicPacket],
+    backend: &Backend,
+    trace_label: &str,
+) -> Result<Vec<String>> {
+    let sections = audit_sections(digest);
+    let mut issues = Vec::new();
+    let mut verified = String::from("VERIFIED DIGEST ITEMS:\n\n");
+    for section in &sections {
+        let Some(id) = section.topic_id else { continue };
+        let packet = packets
+            .iter()
+            .find(|packet| packet.id == id)
+            .with_context(|| format!("no source packet for audit topic {id}"))?;
+        let text = section
+            .lines
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let findings = audit_section(id, &packet.source, section, backend, trace_label).await?;
+        if !findings.is_empty() {
+            issues.extend(findings);
+            if issues.len() >= MAX_ISSUES {
+                issues.truncate(MAX_ISSUES);
+                return Ok(issues);
+            }
+            continue;
+        }
+        verified.push_str(&format!("TOPIC {id}\n{text}\n\n"));
+    }
+    if !issues.is_empty() {
+        return Ok(issues);
+    }
+    if let Some(overview) = sections.iter().find(|section| section.topic_id.is_none()) {
+        return audit_section("T00", &verified, overview, backend, trace_label).await;
+    }
+    Ok(Vec::new())
+}
+
+async fn audit_section(
+    location: &str,
+    evidence: &str,
+    section: &AuditSection<'_>,
+    backend: &Backend,
+    trace_label: &str,
+) -> Result<Vec<String>> {
+    let numbered = section
+        .lines
+        .iter()
+        .map(|(line_number, line)| format!("L{line_number:04} {line}"))
         .collect::<Vec<_>>()
         .join("\n");
     let base = format!(
-        "EVIDENCE PACKETS:\n\n{evidence}\n---\n\n\
-         TAGGED DRAFT TO AUDIT -- EACH LINE STARTS WITH ITS CITATION ID:\n\n\
-         {numbered_draft}",
+        "AUDIT LOCATION: {location}\n\nEVIDENCE:\n\n{evidence}\n---\n\n\
+         DRAFT EXCERPT TO AUDIT -- ORIGINAL LINE IDS:\n\n{numbered}",
     );
+    let label = format!("{trace_label}-audit-{location}");
     let mut correction = String::new();
     for attempt in 1..=2 {
+        let prompt = format!("{base}{correction}");
+        trace_digest_attempt(&label, attempt, "input.txt", &prompt)?;
         let verdict = backend
-            .chat_with_options(
-                DAILY_DIGEST_AUDIT_AGENT,
-                &format!("{base}{correction}"),
-                Some(0.0),
-            )
+            .chat_with_options(DAILY_DIGEST_AUDIT_AGENT, &prompt, Some(0.0))
             .await
-            .context("daily digest factual audit failed")?;
-        match parse_audit_verdict(&verdict, digest) {
+            .with_context(|| format!("daily digest factual audit failed for {location}"))?;
+        trace_digest_attempt(&label, attempt, "output.txt", &verdict)?;
+        match parse_audit_verdict(&verdict, location, &section.lines) {
             Ok(issues) => return Ok(issues),
             Err(err) if attempt == 1 => {
                 eprintln!("[digestive] factual auditor response rejected: {err:#}");
                 correction = format!(
                     "\n\nMANDATORY AUDIT FORMAT CORRECTION:\n\
                      The previous verdict was rejected: {err:#}\n\
-                     Audit the same draft again. In every finding, copy one \
-                     `LNNNN` citation ID from TAGGED DRAFT TO AUDIT into the \
-                     middle field. Do not quote or paraphrase text there.\n",
+                     Audit the same excerpt again. Use location {location} \
+                     and copy one `LNNNN` citation ID from DRAFT EXCERPT TO \
+                     AUDIT. Do not cite a source email or another topic.\n",
                 );
             }
             Err(err) => return Err(err),
@@ -1854,7 +1956,11 @@ async fn audit_digest(digest: &str, evidence: &str, backend: &Backend) -> Result
     unreachable!("the bounded audit loop always returns")
 }
 
-fn parse_audit_verdict(verdict: &str, digest: &str) -> Result<Vec<String>> {
+fn parse_audit_verdict(
+    verdict: &str,
+    location: &str,
+    lines: &[(usize, &str)],
+) -> Result<Vec<String>> {
     if verdict.trim() == "OK" {
         return Ok(Vec::new());
     }
@@ -1869,18 +1975,29 @@ fn parse_audit_verdict(verdict: &str, digest: &str) -> Result<Vec<String>> {
         let issue = fields
             .next()
             .context("factual audit finding has no explanation")?;
+        anyhow::ensure!(
+            topic == location,
+            "factual audit named {topic}, expected {location}"
+        );
+        anyhow::ensure!(
+            !issue.is_empty(),
+            "factual audit finding has an empty explanation"
+        );
         let line_number = citation
             .strip_prefix('L')
             .context("factual audit citation does not start with `L`")?
             .parse::<usize>()
             .context("factual audit citation is not a line number")?;
-        let line = line_number
-            .checked_sub(1)
-            .and_then(|index| digest.lines().nth(index))
-            .with_context(|| format!("factual auditor cited absent draft line `{citation}`"))?;
-        if !topic.starts_with('T') {
-            anyhow::bail!("factual audit finding has invalid topic `{topic}`");
-        }
+        let (_, line) = lines
+            .iter()
+            .find(|(number, _)| *number == line_number)
+            .with_context(|| {
+                format!("factual auditor cited line `{citation}` outside {location}")
+            })?;
+        anyhow::ensure!(
+            !line.trim().is_empty(),
+            "factual auditor cited a blank draft line"
+        );
         issues.push(format!("{topic}: line {line_number} `{line}` -- {issue}"));
     }
     if issues.is_empty() {
@@ -3743,7 +3860,7 @@ mod tests {
             },
         ];
 
-        let packets = build_topic_packets(&threads, &deltas);
+        let packets = build_topic_packets(DIGEST_DAY, &threads, &deltas);
         assert_eq!(packets.len(), 2, "a root without deltas gets no packet");
         assert_eq!(packets[0].id, "T01");
         assert_eq!(packets[1].id, "T02");
@@ -3791,7 +3908,7 @@ mod tests {
             root_dk: thread.root_dk.clone(),
             bullets: vec!["[2026/08/13/21-52-53 by Junio C Hamano] Queued a test fix.".into()],
         }];
-        let packets = build_topic_packets(&[thread], &deltas);
+        let packets = build_topic_packets(DIGEST_DAY, &[thread], &deltas);
         assert_eq!(
             packets[0].current_subject.as_deref(),
             Some("Re: [PATCH v13 7/8] history: create squashed commits without editing"),
@@ -4091,25 +4208,123 @@ Prose about completing subcommands of the new history command.
 
     #[test]
     fn test_parse_audit_verdict_accepts_only_a_bare_ok() {
-        let draft = "### [T01] topic\n\nThe series is ready to merge.\n";
-        assert!(parse_audit_verdict("OK", draft).unwrap().is_empty());
-        assert!(parse_audit_verdict("  OK\n", draft).unwrap().is_empty());
+        let lines = [
+            (1, "### [T01] topic"),
+            (2, ""),
+            (3, "The series is ready to merge."),
+        ];
+        let parse = |verdict| parse_audit_verdict(verdict, "T01", &lines);
+        assert!(parse("OK").unwrap().is_empty());
+        assert!(parse("  OK\n").unwrap().is_empty());
         assert_eq!(
-            parse_audit_verdict("- T01 ||| L0003 ||| no delta states readiness", draft,).unwrap(),
+            parse("- T01 ||| L0003 ||| no delta states readiness").unwrap(),
             vec![
                 "T01: line 3 `The series is ready to merge.` -- no delta states readiness"
                     .to_string()
             ],
         );
         assert!(
-            parse_audit_verdict("- T01 ||| L0099 ||| no delta states integration", draft,).is_err(),
+            parse("- T01 ||| L0099 ||| no delta states integration").is_err(),
             "an auditor may not invent the line it rejects",
         );
+        for verdict in [
+            "- T02 ||| L0003 ||| Wrong topic",
+            "- T01 ||| L0002 ||| Blank line",
+            "- T01 ||| L0000 ||| No such line",
+            "- T01 ||| L0003 |||",
+            "OK, with reservations",
+        ] {
+            assert!(parse(verdict).is_err(), "{verdict}");
+        }
 
         let many: String = (1..=20)
-            .map(|n| format!("- T{n:02} ||| L0003 ||| unsupported claim\n"))
+            .map(|n| format!("- T01 ||| L0003 ||| unsupported claim {n}\n"))
             .collect();
-        assert_eq!(parse_audit_verdict(&many, draft).unwrap().len(), MAX_ISSUES);
+        assert_eq!(parse(&many).unwrap().len(), MAX_ISSUES);
+    }
+
+    #[test]
+    fn test_audit_sections_preserve_locations_and_fenced_text() {
+        let draft = "# Title\n## The day in brief\nOverview.\n## Notable threads\n\
+                     ### [T01] First topic\nDetails.\n```text\n### [T99] Not a topic\n```\n\
+                     ## In brief\n- [T02] Second topic\n  Continued.\n";
+        let sections = audit_sections(draft);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.topic_id)
+                .collect::<Vec<_>>(),
+            vec![None, Some("T01"), Some("T02")],
+        );
+        assert_eq!(sections[0].lines[0], (2, "## The day in brief"));
+        assert!(sections[1].lines.contains(&(8, "### [T99] Not a topic")));
+        assert_eq!(sections[2].lines[0], (11, "- [T02] Second topic"));
+        assert_eq!(sections[2].lines[1], (12, "  Continued."));
+    }
+
+    #[tokio::test]
+    async fn test_audit_uses_source_per_topic() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut threads = [
+            delta_activity("2026/08/12/00-00-00", &[("2026/08/13/09-00-00", "Alice")]),
+            delta_activity("2026/08/12/01-00-00", &[("2026/08/13/10-00-00", "Bob")]),
+        ];
+        for (index, thread) in threads.iter_mut().enumerate() {
+            thread.email_summaries[0].source_excerpt = Some(format!("ORIGINAL-SOURCE-{index}"));
+        }
+        let deltas: Vec<_> = threads
+            .iter()
+            .map(|thread| RootDelta {
+                root_dk: thread.root_dk.clone(),
+                bullets: vec!["UNTRUSTED-EXTRACTED-CLAIM".into()],
+            })
+            .collect();
+        let packets = build_topic_packets(DIGEST_DAY, &threads, &deltas);
+        let draft = "# Title\n## The day in brief\nAlpha and beta changed.\n\
+                     ## Notable threads\n### [T01] Alpha\nAlpha changed.\n\
+                     ## In brief\n- [T02] Beta changed.\n";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        assert!(
+            audit_digest(draft, &packets, &backend, "test")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests = server.received_requests().await.unwrap();
+        let inputs: Vec<String> = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["messages"][1]["content"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs[0].contains("ORIGINAL-SOURCE-0"));
+        assert!(!inputs[0].contains("ORIGINAL-SOURCE-1"));
+        assert!(inputs[1].contains("ORIGINAL-SOURCE-1"));
+        assert!(!inputs[1].contains("ORIGINAL-SOURCE-0"));
+        assert!(
+            inputs
+                .iter()
+                .all(|input| !input.contains("UNTRUSTED-EXTRACTED-CLAIM"))
+        );
+        assert!(inputs[2].contains("AUDIT LOCATION: T00"));
+        assert!(inputs[2].contains("VERIFIED DIGEST ITEMS"));
+        assert!(!inputs[2].contains("ORIGINAL-SOURCE"));
     }
 
     #[test]
