@@ -1892,7 +1892,7 @@ fn parse_audit_verdict(verdict: &str, digest: &str) -> Result<Vec<String>> {
 fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
     format!(
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
-         - Length: {}-{} words. Count them, and compress or drop the least \
+         - Length: {}-{} words, excluding internal topic tags. Compress or drop the least \
          consequential topics rather than overrun.\n\
          - Exactly these level-2 headings, in this order and no others: \
          `## The day in brief`, `## Notable threads`, `## In brief`.\n\
@@ -2107,7 +2107,10 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
             fenced = !fenced;
             continue;
         }
-        words += line
+        let published_text = split_marker(line)
+            .map(|(_, text)| split_topic_tag(text).1)
+            .unwrap_or(line);
+        words += published_text
             .split_whitespace()
             .filter(|token| token.chars().any(char::is_alphanumeric))
             .count();
@@ -3806,7 +3809,7 @@ Prose about completing subcommands of the new history command.
         } else {
             words
         };
-        let have = skeleton
+        let have = strip_topic_tags(skeleton)
             .split_whitespace()
             .filter(|token| token.chars().any(char::is_alphanumeric))
             .count();
@@ -3838,6 +3841,26 @@ Prose about completing subcommands of the new history command.
             assert!(DAILY_DIGEST_AGENT.contains(&range));
             assert!(output_contract(mode, &VALID_IDS).contains(&range));
         }
+    }
+
+    #[test]
+    fn test_validate_digest_counts_published_words() {
+        let draft = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let printed_words = strip_topic_tags(&draft)
+            .split_whitespace()
+            .filter(|word| word.chars().any(char::is_alphanumeric))
+            .count();
+        let mode = DigestMode {
+            label: "human",
+            min_words: printed_words + 1,
+            max_words: printed_words + 100,
+        };
+        let issues = validate_digest(&draft, &mode, &VALID_IDS, DIGEST_DAY);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains(&format!("word count is {printed_words}")))
+        );
     }
 
     #[test]
