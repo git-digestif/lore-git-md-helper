@@ -1605,12 +1605,13 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
 
 fn is_delta_sentinel(line: &str) -> bool {
     let line = line.strip_prefix("- ").unwrap_or(line);
-    line.starts_with("No noteworthy") && line.ends_with("deltas.")
+    line.eq_ignore_ascii_case("None.")
+        || (line.starts_with("No noteworthy") && line.ends_with("deltas."))
 }
 
 fn is_delta_preamble(line: &str) -> bool {
     let line = line.to_ascii_lowercase();
-    line.starts_with("here are ") && line.contains("thread deltas")
+    line.starts_with("here are ") && line.contains("deltas")
 }
 
 /// Pair each root that has same-day deltas with its root author's
@@ -3466,10 +3467,11 @@ mod tests {
         );
         assert!(
             parse_root_deltas(
-                "Here are the thread deltas for today, following the strict rules:\n\
+                "Here are the deltas for threads with new information today:\n\
                  Thread root: 2026/08/13/05-47-56\n\
                  New today:\n\
-                 - [2026/08/13/17-35-39 by Junio C Hamano] Agreed.",
+                 - [2026/08/13/17-35-39 by Junio C Hamano] Agreed.\n\
+                 None.",
                 &threads,
             )
             .is_ok(),
