@@ -1225,6 +1225,7 @@ const DAILY_DIGEST_AGENT: &str = include_str!("../prompts/git-daily-digest.md");
 const DAILY_DIGEST_AUDIT_AGENT: &str = include_str!("../prompts/git-daily-digest-audit.md");
 const DAILY_DELTA_AGENT: &str = include_str!("../prompts/git-daily-delta.md");
 const DAILY_SELECT_AGENT: &str = include_str!("../prompts/git-daily-select.md");
+const DAILY_REVISE_AGENT: &str = include_str!("../prompts/git-daily-revise.md");
 
 /// Per-thread data accumulated for a single day's digest.
 pub struct ThreadDayActivity {
@@ -1781,18 +1782,21 @@ impl TopicSelection {
     }
 }
 
-fn parse_topic_ranking(raw: &str, packets: &[TopicPacket]) -> Result<Vec<String>> {
+fn response_json(raw: &str) -> Result<&str> {
     let raw = raw.trim();
-    let json = if raw.starts_with("```") {
+    if raw.starts_with("```") {
         raw.split_once('\n')
             .and_then(|(_, json)| json.strip_suffix("```"))
-            .context("topic ranking has an incomplete JSON fence")?
-            .trim()
+            .map(str::trim)
+            .context("response has an incomplete JSON fence")
     } else {
-        raw
-    };
-    let ranking: Vec<String> =
-        serde_json::from_str(json).context("topic ranking must be a JSON ID array")?;
+        Ok(raw)
+    }
+}
+
+fn parse_topic_ranking(raw: &str, packets: &[TopicPacket]) -> Result<Vec<String>> {
+    let ranking: Vec<String> = serde_json::from_str(response_json(raw)?)
+        .context("topic ranking must be a JSON ID array")?;
     anyhow::ensure!(
         ranking.len() >= 3,
         "topic ranking must select at least three topics"
@@ -1933,6 +1937,7 @@ async fn generate_digest_mode(
     );
     let mut correction = String::new();
     let mut issues = Vec::new();
+    let mut revision: Option<(String, Vec<String>)> = None;
     // Sources are fixed for this mode's retries; only identical accepted text is reusable.
     let mut approved = HashMap::new();
 
@@ -1941,11 +1946,23 @@ async fn generate_digest_mode(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
             output_contract(mode, &ids),
         );
-        trace_digest_attempt(label, attempt, "input.txt", &prompt)?;
-        let raw = backend
-            .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
-            .await
-            .with_context(|| format!("daily digest ({label}) failed"))?;
+        let raw = if let Some((draft, findings)) = revision.take() {
+            revise_digest_items(
+                &draft,
+                &findings,
+                packets,
+                mode,
+                backend,
+                &format!("{label}-{attempt}"),
+            )
+            .await?
+        } else {
+            trace_digest_attempt(label, attempt, "input.txt", &prompt)?;
+            backend
+                .chat_with_options(DAILY_DIGEST_AGENT, &prompt, Some(0.0))
+                .await
+                .with_context(|| format!("daily digest ({label}) failed"))?
+        };
         let digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
             &summarize::normalize_headings(&raw),
         )));
@@ -1958,7 +1975,7 @@ async fn generate_digest_mode(
             structural_issues.push(issue);
             structural_issues.truncate(MAX_ISSUES);
         }
-        let factual_revision = if structural_issues.is_empty() {
+        if structural_issues.is_empty() {
             issues = audit_digest(
                 &digest,
                 packets,
@@ -1970,17 +1987,16 @@ async fn generate_digest_mode(
             if issues.is_empty() {
                 return Ok(strip_topic_tags(&digest));
             }
-            Some(digest.as_str())
+            revision = Some((digest.clone(), issues.clone()));
         } else {
             issues = structural_issues;
-            None
-        };
+        }
         trace_digest_attempt(label, attempt, "issues.txt", &issues.join("\n"))?;
         eprintln!(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
         );
-        correction = format!("\n\n{}", correction_block(&issues, factual_revision));
+        correction = format!("\n\n{}", correction_block(&issues));
     }
 
     anyhow::bail!(
@@ -1988,6 +2004,165 @@ async fn generate_digest_mode(
          after three corrective retries:\n{}",
         issues.join("\n"),
     )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisedItem {
+    title: String,
+    body: String,
+}
+
+fn digest_word_count(md: &str) -> usize {
+    strip_topic_tags(md)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .flat_map(str::split_whitespace)
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count()
+}
+
+fn render_revised_item(section: &AuditSection<'_>, raw: &str) -> Result<String> {
+    let item: RevisedItem = serde_json::from_str(response_json(raw)?)
+        .context("item revision must contain JSON title and body strings")?;
+    anyhow::ensure!(!item.body.trim().is_empty(), "item revision has no body");
+    let body = item.body.trim();
+    match section.topic_id {
+        None => Ok(format!("## The day in brief\n\n{body}\n\n")),
+        Some(id) => {
+            let title = item.title.trim();
+            anyhow::ensure!(
+                !title.is_empty() && !title.contains(['\n', '\r']),
+                "item revision needs a one-line title"
+            );
+            if section.lines[0].1.trim_start().starts_with("### ") {
+                Ok(format!("### [{id}] {title}\n\n{body}\n\n"))
+            } else {
+                Ok(format!("- [{id}] **{title}**: {body}\n\n"))
+            }
+        }
+    }
+}
+
+async fn revise_digest_items(
+    digest: &str,
+    issues: &[String],
+    packets: &[TopicPacket],
+    mode: &DigestMode,
+    backend: &Backend,
+    trace_label: &str,
+) -> Result<String> {
+    let sections = audit_sections(digest);
+    let lines: Vec<_> = digest.lines().collect();
+    let mut out = String::new();
+    let mut cursor = 0;
+    let mut total = digest_word_count(digest);
+    let mut handled = 0;
+    for section in &sections {
+        let id = section.topic_id.unwrap_or("T00");
+        let findings: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.starts_with(&format!("{id}: ")))
+            .collect();
+        if findings.is_empty() {
+            continue;
+        }
+        handled += findings.len();
+        let evidence = match section.topic_id {
+            Some(id) => packets
+                .iter()
+                .find(|packet| packet.id == id)
+                .with_context(|| format!("missing original source for revision {id}"))?
+                .source
+                .clone(),
+            None => sections
+                .iter()
+                .filter(|section| section.topic_id.is_some())
+                .flat_map(|section| section.lines.iter().map(|(_, line)| *line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let old = section
+            .lines
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old_words = digest_word_count(&old);
+        let other_words = total - old_words;
+        let min_words = mode.min_words.saturating_sub(other_words);
+        let max_words = mode.max_words.saturating_sub(other_words);
+        let base = format!(
+            "Revise only item {id}. Aim for {old_words} words including its title; \
+                 the rendered item must contain {min_words}-{max_words} words to \
+                 preserve the overall digest budget.\n\nORIGINAL SOURCE EVIDENCE:\n\n\
+                 {evidence}\n\nFINDINGS TO ADDRESS:\n{}\n\nEXISTING ITEM:\n\n{old}",
+            findings
+                .iter()
+                .map(|finding| finding.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let label = format!("{trace_label}-revise-{id}");
+        let mut correction = String::new();
+        let mut replacement = None;
+        for attempt in 1..=2 {
+            let prompt = format!("{base}{correction}");
+            trace_digest_attempt(&label, attempt, "input.txt", &prompt)?;
+            let raw = backend
+                .chat_with_options(DAILY_REVISE_AGENT, &prompt, Some(0.0))
+                .await
+                .with_context(|| format!("source-backed revision failed for {id}"))?;
+            trace_digest_attempt(&label, attempt, "output.txt", &raw)?;
+            let candidate = render_revised_item(section, &raw).and_then(|rendered| {
+                let rendered =
+                    normalize_topic_tags(&normalize_typography(&strip_digest_links(&rendered)));
+                let words = digest_word_count(&rendered);
+                anyhow::ensure!(
+                    (min_words..=max_words).contains(&words),
+                    "revised item has {words} words; required {min_words}-{max_words}"
+                );
+                Ok(rendered)
+            });
+            match candidate {
+                Ok(text) => {
+                    replacement = Some(text);
+                    break;
+                }
+                Err(err) if attempt == 1 => {
+                    eprintln!("[digestive] revision of {id} rejected: {err:#}");
+                    correction = format!(
+                        "\n\nCorrect this revision error: {err:#}\nReturn only the requested JSON object."
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let replacement =
+            replacement.expect("bounded revision either succeeds or returns an error");
+        total = other_words + digest_word_count(&replacement);
+        let start = section.lines[0].0 - 1;
+        let end = section
+            .lines
+            .last()
+            .expect("an audit section is nonempty")
+            .0;
+        for line in &lines[cursor..start] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    anyhow::ensure!(
+        handled == issues.len() && handled > 0,
+        "revision findings did not map to the current digest items"
+    );
+    for line in &lines[cursor..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn trace_digest_attempt(label: &str, attempt: usize, suffix: &str, content: &str) -> Result<()> {
@@ -2228,27 +2403,18 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
     )
 }
 
-fn correction_block(issues: &[String], factual_revision: Option<&str>) -> String {
+fn correction_block(issues: &[String]) -> String {
     let issues = issues
         .iter()
         .map(|issue| format!("- {issue}"))
         .collect::<Vec<_>>()
         .join("\n");
-    match factual_revision {
-        Some(draft) => format!(
-            "MANDATORY FACTUAL REVISION:\n{issues}\n\
-             Revise the draft below only as needed to remove these unsupported \
-             claims. Preserve its valid structure, topic boundaries, and word \
-             budget. Do not replace a removed claim with a new inference.\n\n\
-             DRAFT TO REVISE:\n\n{draft}",
-        ),
-        None => format!(
-            "MANDATORY CORRECTION -- THE PREVIOUS DRAFT WAS REJECTED:\n{issues}\n\
+    format!(
+        "MANDATORY CORRECTION -- THE PREVIOUS DRAFT WAS REJECTED:\n{issues}\n\
              Write the digest again from the evidence above, from scratch. The \
              rejected draft is not shown to you and none of its shape may be \
              reused. Satisfy every point of the FINAL OUTPUT CONTRACT above.",
-        ),
-    }
+    )
 }
 
 /// The deterministic test mock can emit neither extractor syntax nor a
@@ -2400,7 +2566,8 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
     let bold_re = BOLD_RE.get_or_init(|| Regex::new(r"^\*\*([^*]+)\*\*:?").unwrap());
     let tag_re = TAG_RE.get_or_init(|| Regex::new(r"\[T\d+\]").unwrap());
 
-    let (mut words, mut deep, mut outside, mut generic) = (0, 0, 0, 0);
+    let words = digest_word_count(md);
+    let (mut deep, mut outside, mut generic) = (0, 0, 0);
     let (mut numbered, mut roots, mut dated, mut untagged) = (0, 0, 0, 0);
     let (mut h2, mut h3, mut tags): (Vec<String>, Vec<String>, Vec<&str>) =
         (Vec::new(), Vec::new(), Vec::new());
@@ -2419,13 +2586,6 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
             fenced = !fenced;
             continue;
         }
-        let published_text = split_marker(line)
-            .map(|(_, text)| split_topic_tag(text).1)
-            .unwrap_or(line);
-        words += published_text
-            .split_whitespace()
-            .filter(|token| token.chars().any(char::is_alphanumeric))
-            .count();
         if fenced {
             continue;
         }
@@ -4335,13 +4495,11 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let clean = valid_digest(&HUMAN_DIGEST_MODE, 0);
-        let drafts = [
-            clean.replace("Prose about the packfile lookup fast path.",
-                "Prose about the packfile lookup fast path. OBSOLETE_FACT_A"),
-            clean.replace("Prose about passing an explicit repository into the object database.",
-                "Prose about passing an explicit repository into the object database. CURRENT_FACT_B"),
-            clean,
-        ];
+        let expected = strip_topic_tags(&clean);
+        let initial = clean.replace(
+            "Prose about the packfile lookup fast path.",
+            "Prose about the packfile lookup fast path. OBSOLETE_FACT_A",
+        );
         let calls = AtomicUsize::new(0);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4352,10 +4510,15 @@ mod tests {
                 let content = if system == DAILY_SELECT_AGENT {
                     r#"["T01","T02","T03","T04"]"#.to_string()
                 } else if system == DAILY_DIGEST_AGENT {
-                    drafts
-                        .get(calls.fetch_add(1, Ordering::Relaxed))
-                        .cloned()
-                        .unwrap_or_else(|| "unexpected editor request".into())
+                    initial.clone()
+                } else if system == DAILY_REVISE_AGENT {
+                    let body = if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        "Prose about the packfile lookup fast path. CURRENT_FACT_B"
+                    } else {
+                        "Prose about the packfile lookup fast path."
+                    };
+                    serde_json::json!({"title": "packfile lookup fast path", "body": body})
+                        .to_string()
                 } else {
                     assert_eq!(system, DAILY_DIGEST_AUDIT_AGENT);
                     let finding = user.lines().find(|line| {
@@ -4390,7 +4553,7 @@ mod tests {
             model: "test".into(),
             token: None,
         };
-        generate_digest_mode(
+        let result = generate_digest_mode(
             DIGEST_DAY,
             &HUMAN_DIGEST_MODE,
             &selection_packets(4),
@@ -4398,19 +4561,96 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(result, expected);
         let requests = server.received_requests().await.unwrap();
         let editor_inputs: Vec<_> = requests
             .iter()
             .filter_map(|request| {
                 let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                (body["messages"][0]["content"].as_str() == Some(DAILY_DIGEST_AGENT))
+                (body["messages"][0]["content"].as_str() == Some(DAILY_REVISE_AGENT))
                     .then(|| body["messages"][1]["content"].as_str().unwrap().to_string())
             })
             .collect();
-        assert_eq!(editor_inputs.len(), 3);
-        assert!(editor_inputs[1].contains("OBSOLETE_FACT_A"));
-        assert!(!editor_inputs[2].contains("OBSOLETE_FACT_A"));
-        assert!(editor_inputs[2].contains("CURRENT_FACT_B"));
+        assert_eq!(editor_inputs.len(), 2);
+        assert!(editor_inputs[0].contains("OBSOLETE_FACT_A"));
+        assert!(!editor_inputs[1].contains("OBSOLETE_FACT_A"));
+        assert!(editor_inputs[1].contains("CURRENT_FACT_B"));
+        for input in editor_inputs {
+            assert!(input.contains("Source 1."));
+            assert!(!input.contains("Source 2."));
+        }
+    }
+
+    #[test]
+    fn test_revised_items_are_rendered_with_owned_structure() {
+        let draft = "## The day in brief\nOverview.\n## Notable threads\n\
+                     ### [T01] Old title\nOld text.\n## In brief\n- [T02] Old brief.\n";
+        let sections = audit_sections(draft);
+        let raw = r#"{"title":"Current topic","body":"Source-backed text."}"#;
+        assert_eq!(
+            render_revised_item(&sections[0], raw).unwrap(),
+            "## The day in brief\n\nSource-backed text.\n\n"
+        );
+        assert_eq!(
+            render_revised_item(&sections[1], raw).unwrap(),
+            "### [T01] Current topic\n\nSource-backed text.\n\n"
+        );
+        assert_eq!(
+            render_revised_item(&sections[2], raw).unwrap(),
+            "- [T02] **Current topic**: Source-backed text.\n\n"
+        );
+        for invalid in [
+            r#"{"title":"Title","body":""}"#,
+            r#"{"title":"First\nSecond","body":"Text"}"#,
+            r#"{"title":"Title","body":"Text","topic_id":"T99"}"#,
+        ] {
+            assert!(render_revised_item(&sections[1], invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_item_revision_preserves_the_document_word_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let body = if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    "word ".repeat(1000)
+                } else {
+                    "Source-backed repair.".into()
+                };
+                let item =
+                    serde_json::json!({"title": "Packfile loading", "body": body}).to_string();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": item}}]
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        let draft = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let repaired = revise_digest_items(
+            &draft,
+            &["T01: repair the factual claim".into()],
+            &selection_packets(4),
+            &HUMAN_DIGEST_MODE,
+            &backend,
+            "test",
+        )
+        .await
+        .unwrap();
+        assert!(validate_digest(&repaired, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY).is_empty());
+        assert!(repaired.contains("Source-backed repair."));
+        assert!(repaired.contains("### [T02] object database plumbing"));
     }
 
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
@@ -4910,18 +5150,10 @@ Prose about completing subcommands of the new history command.
         let names = "Ren\u{e9} Scharfe and Jean-Noe\u{308}l Avila reviewed it.";
         assert_eq!(normalize_typography(names), names);
 
-        let block = correction_block(&["word count is 977; too long".to_string()], None);
+        let block = correction_block(&["word count is 977; too long".to_string()]);
         assert!(block.contains("word count is 977; too long"), "{block}");
         assert!(!block.contains("UNIQUE_DRAFT_PROSE"));
         assert!(block.contains("not shown to you"));
-
-        let block = correction_block(
-            &["T01: unsupported status".to_string()],
-            Some("UNIQUE_DRAFT_PROSE"),
-        );
-        assert!(block.contains("T01: unsupported status"));
-        assert!(block.contains("UNIQUE_DRAFT_PROSE"));
-        assert!(block.contains("Preserve its valid structure"));
     }
 
     #[test]
