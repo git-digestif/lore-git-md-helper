@@ -153,6 +153,8 @@ do not guess it, and do not spend words remarking on its absence.
 Write 500-900 words. This range is absolute. Count the words of the draft;
 if it exceeds 900, compress the prose and drop the least consequential
 topics until it fits. Never overrun it in order to cover one more thread.
+Aim for 700 words. Having a packet does not require including that topic;
+select fewer topics rather than removing the context that makes them useful.
 
 Use exactly these sections, in this order, at these heading levels:
 

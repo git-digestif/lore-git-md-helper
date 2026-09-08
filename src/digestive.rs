@@ -2024,8 +2024,9 @@ fn parse_audit_verdict(
 fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
     format!(
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
-         - Length: {}-{} words, excluding internal topic tags. Compress or drop the least \
-         consequential topics rather than overrun.\n\
+         - Length: {}-{} words, excluding internal topic tags. Aim for {} words \
+         so there is room for correction. Omit lower-priority topics rather \
+         than overrun or strip necessary context.\n\
          - Exactly these level-2 headings, in this order and no others: \
          `## The day in brief`, `## Notable threads`, `## In brief`.\n\
          - Exactly three to six level-3 headings, all between \
@@ -2035,10 +2036,10 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
          `## In brief` bullet begins `- [TNN] `, where `TNN` is the ID of \
          the one topic packet that section is written from. The only valid \
          IDs are: {}.\n\
-         - Each topic ID appears exactly once in the whole digest: a topic \
+         - Each selected topic ID appears only once in the whole digest: a topic \
          is either a notable-thread subsection or an in-brief bullet, never \
-         both, and never twice. Cover every topic packet unless it has \
-         nothing worth reporting, in which case leave it out silently.\n\
+         both, and never twice. You are not required to cover every packet. \
+         Select only as many topics as fit the word budget with useful context.\n\
          - Never write `no new developments`, `nothing new`, or any other \
          inactivity phrase. A topic you have nothing to say about is left \
          out; it is never described as quiet.\n\
@@ -2051,6 +2052,7 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
          - Add no statistics, roundup, integration-status or outlook section.",
         mode.min_words,
         mode.max_words,
+        (mode.min_words + mode.max_words) / 2,
         ids.join(", "),
     )
 }
