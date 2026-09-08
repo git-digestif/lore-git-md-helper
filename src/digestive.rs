@@ -2096,12 +2096,19 @@ fn is_mock(_backend: &Backend) -> bool {
 /// text, returning the ID and the text that follows it.
 fn split_topic_tag(text: &str) -> (Option<&str>, &str) {
     let text = text.trim();
-    let Some((id, rest)) = text.strip_prefix('[').and_then(|t| t.split_once(']')) else {
+    let (tagged, emphasis) = match text.strip_prefix("**") {
+        Some(tagged) => (tagged, "**"),
+        None => (text, ""),
+    };
+    let Some((id, rest)) = tagged.strip_prefix('[').and_then(|t| t.split_once(']')) else {
         return (None, text);
     };
     match id.strip_prefix('T') {
         Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
-            (Some(id), rest.trim_start())
+            match rest.strip_prefix(emphasis) {
+                Some(rest) => (Some(id), rest.trim_start()),
+                None => (None, text),
+            }
         }
         _ => (None, text),
     }
@@ -4220,6 +4227,21 @@ Prose about completing subcommands of the new history command.
              ## In brief\n\n\
              - [T04] A small test fix.\n",
         );
+    }
+
+    #[test]
+    fn test_normalize_topic_tags_preserves_bold_identifiers() {
+        let raw = "### **[T01]** Packfile loading\n\n- **[T02]** A test fix.\n";
+        let normalized = normalize_topic_tags(raw);
+        assert_eq!(
+            normalized,
+            "### [T01] Packfile loading\n\n- [T02] A test fix.\n"
+        );
+        assert_eq!(
+            strip_topic_tags(&normalized),
+            "### Packfile loading\n\n- A test fix.\n"
+        );
+        assert_eq!(split_topic_tag("**[T01] unclosed").0, None);
     }
 
     #[test]
