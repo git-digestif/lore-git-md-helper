@@ -1224,6 +1224,7 @@ pub async fn run_pipeline(
 const DAILY_DIGEST_AGENT: &str = include_str!("../prompts/git-daily-digest.md");
 const DAILY_DIGEST_AUDIT_AGENT: &str = include_str!("../prompts/git-daily-digest-audit.md");
 const DAILY_DELTA_AGENT: &str = include_str!("../prompts/git-daily-delta.md");
+const DAILY_SELECT_AGENT: &str = include_str!("../prompts/git-daily-select.md");
 
 /// Per-thread data accumulated for a single day's digest.
 pub struct ThreadDayActivity {
@@ -1446,23 +1447,10 @@ pub async fn generate_daily_digest(
     }
     let evidence = render_topic_packets(&packets);
     trace_digest_attempt("editor", 0, "evidence.txt", &evidence)?;
-    let ids: Vec<&str> = packets.iter().map(|packet| packet.id.as_str()).collect();
-
-    let user_msg = format!(
-        "Date: {day}\nTotal emails today: {email_count}\n\
-         Active threads before filtering: {thread_count}\n\
-         Topics you may write about: {}\n\n\
-         EVIDENCE -- ONE SELF-CONTAINED PACKET PER TOPIC. EVERYTHING YOU \
-         WRITE ABOUT A TOPIC MUST COME FROM THAT TOPIC'S OWN PACKET AND \
-         FROM NO OTHER PACKET:\n\n{evidence}",
-        ids.join(", "),
-    );
-
     eprintln!("[digestive] generating daily digest for {day} ...");
 
-    let human =
-        generate_digest_mode(day, &HUMAN_DIGEST_MODE, &user_msg, &packets, &ids, backend).await?;
-    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &user_msg, &packets, &ids, backend).await?;
+    let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &packets, backend).await?;
+    let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &packets, backend).await?;
 
     Ok(DayDigestOutput { human, ai })
 }
@@ -1679,7 +1667,7 @@ fn build_topic_packets(
         .collect()
 }
 
-fn render_topic_packets(packets: &[TopicPacket]) -> String {
+fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) -> String {
     let mut out = String::new();
     for TopicPacket {
         id,
@@ -1718,19 +1706,146 @@ struct DigestMode {
     label: &'static str,
     min_words: usize,
     max_words: usize,
+    notable_count: usize,
+    brief_limit: usize,
 }
 
 const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
     label: "human",
     min_words: 500,
     max_words: 900,
+    notable_count: 3,
+    brief_limit: 8,
 };
 
 const AI_DIGEST_MODE: DigestMode = DigestMode {
     label: "ai",
     min_words: 800,
     max_words: 1400,
+    notable_count: 5,
+    brief_limit: 12,
 };
+
+#[derive(Debug)]
+struct TopicSelection {
+    notable: Vec<String>,
+    brief: Vec<String>,
+}
+
+impl TopicSelection {
+    fn from_ranking(mut ranking: Vec<String>, mode: &DigestMode) -> Self {
+        let mut brief = ranking.split_off(mode.notable_count.min(ranking.len()));
+        brief.truncate(mode.brief_limit);
+        Self {
+            notable: ranking,
+            brief,
+        }
+    }
+}
+
+fn parse_topic_ranking(raw: &str, packets: &[TopicPacket]) -> Result<Vec<String>> {
+    let raw = raw.trim();
+    let json = if raw.starts_with("```") {
+        raw.split_once('\n')
+            .and_then(|(_, json)| json.strip_suffix("```"))
+            .context("topic ranking has an incomplete JSON fence")?
+            .trim()
+    } else {
+        raw
+    };
+    let ranking: Vec<String> =
+        serde_json::from_str(json).context("topic ranking must be a JSON ID array")?;
+    anyhow::ensure!(
+        ranking.len() >= 3,
+        "topic ranking must select at least three topics"
+    );
+    for (index, id) in ranking.iter().enumerate() {
+        anyhow::ensure!(
+            packets.iter().any(|packet| packet.id == *id),
+            "unknown ranked topic {id}"
+        );
+        anyhow::ensure!(
+            !ranking[..index].contains(id),
+            "duplicate ranked topic {id}"
+        );
+    }
+    Ok(ranking)
+}
+
+async fn select_digest_topics(
+    day: &str,
+    mode: &DigestMode,
+    packets: &[TopicPacket],
+    backend: &Backend,
+) -> Result<TopicSelection> {
+    if is_mock(backend) {
+        return Ok(TopicSelection {
+            notable: packets.iter().map(|packet| packet.id.clone()).collect(),
+            brief: Vec::new(),
+        });
+    }
+    anyhow::ensure!(
+        packets.len() >= 3,
+        "daily digest needs at least three source-grounded topics",
+    );
+    let input = format!(
+        "Date: {day}\nMode: {}\nThe editor has room for {} notable topics and \
+         at most {} in-brief topics. Rank the supplied topics by their \
+         significance today. Code will take the leading IDs that fit.\n\n{}",
+        mode.label,
+        mode.notable_count,
+        mode.brief_limit,
+        render_topic_packets(packets),
+    );
+    let mut correction = String::new();
+    for attempt in 1..=2 {
+        let prompt = format!("{input}{correction}");
+        trace_digest_attempt(mode.label, attempt, "selection-input.txt", &prompt)?;
+        let raw = backend
+            .chat_with_options(DAILY_SELECT_AGENT, &prompt, Some(0.0))
+            .await
+            .context("daily topic selection failed")?;
+        trace_digest_attempt(mode.label, attempt, "selection-output.txt", &raw)?;
+        match parse_topic_ranking(&raw, packets) {
+            Ok(ranking) => return Ok(TopicSelection::from_ranking(ranking, mode)),
+            Err(err) if attempt == 1 => {
+                eprintln!("[digestive] topic selection rejected: {err:#}");
+                correction = format!(
+                    "\n\nThe ranking was rejected: {err:#}\n\
+                    Return only a JSON array of distinct supplied topic IDs."
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the bounded selection loop always returns")
+}
+
+fn selection_issue(digest: &str, selection: &TopicSelection) -> Option<String> {
+    let notable: Vec<_> = audit_sections(digest)
+        .into_iter()
+        .filter(|section| {
+            section
+                .lines
+                .first()
+                .is_some_and(|(_, line)| line.trim_start().starts_with("### "))
+        })
+        .filter_map(|section| section.topic_id)
+        .collect();
+    if notable.len() == selection.notable.len()
+        && selection
+            .notable
+            .iter()
+            .all(|id| notable.contains(&id.as_str()))
+    {
+        None
+    } else {
+        Some(format!(
+            "notable headings must use exactly these selected IDs: {}",
+            selection.notable.join(", ")
+        ))
+    }
+}
 
 const DIGEST_H2_SEQUENCE: [&str; 3] = ["the day in brief", "notable threads", "in brief"];
 
@@ -1752,12 +1867,32 @@ const MAX_ISSUES: usize = 8;
 async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
-    user_msg: &str,
     packets: &[TopicPacket],
-    ids: &[&str],
     backend: &Backend,
 ) -> Result<String> {
     let label = mode.label;
+    let selection = select_digest_topics(day, mode, packets, backend).await?;
+    let ids: Vec<_> = selection
+        .notable
+        .iter()
+        .chain(&selection.brief)
+        .map(String::as_str)
+        .collect();
+    let selected = ids.iter().map(|id| {
+        packets
+            .iter()
+            .find(|packet| packet.id == *id)
+            .expect("selected ID was validated against source packets")
+    });
+    let user_msg = format!(
+        "Date: {day}\n\nSELECTED TOPICS ONLY:\n\
+         Use exactly these IDs for notable headings: {}.\n\
+         Other entries may only use these in-brief IDs: {}.\n\
+         This is a selected subset, not an inventory of all activity.\n\n{}",
+        selection.notable.join(", "),
+        selection.brief.join(", "),
+        render_topic_packets(selected),
+    );
     let mut correction = String::new();
     let mut issues = Vec::new();
     let mut corrections = Vec::new();
@@ -1767,7 +1902,7 @@ async fn generate_digest_mode(
     for attempt in 1..=4 {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
-            output_contract(mode, ids),
+            output_contract(mode, &ids),
         );
         trace_digest_attempt(label, attempt, "input.txt", &prompt)?;
         let raw = backend
@@ -1781,7 +1916,11 @@ async fn generate_digest_mode(
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
-        let structural_issues = validate_digest(&digest, mode, ids, day);
+        let mut structural_issues = validate_digest(&digest, mode, &ids, day);
+        if let Some(issue) = selection_issue(&digest, &selection) {
+            structural_issues.push(issue);
+            structural_issues.truncate(MAX_ISSUES);
+        }
         let factual_revision = if structural_issues.is_empty() {
             issues = audit_digest(
                 &digest,
@@ -3945,6 +4084,134 @@ mod tests {
     const VALID_IDS: [&str; 4] = ["T01", "T02", "T03", "T04"];
     const DIGEST_DAY: &str = "2026/08/13";
 
+    fn selection_packets(count: usize) -> Vec<TopicPacket> {
+        (1..=count)
+            .map(|index| TopicPacket {
+                id: format!("T{index:02}"),
+                current_subject: Some(format!("Subject {index}")),
+                background: None,
+                bullets: vec![format!("New development {index}.")],
+                source: format!("Source {index}."),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_topic_selection_bounds_ranked_evidence() {
+        let packets = selection_packets(20);
+        let ranking: Vec<_> = packets
+            .iter()
+            .rev()
+            .map(|packet| packet.id.clone())
+            .collect();
+        let raw = format!("```json\n{}\n```", serde_json::to_string(&ranking).unwrap());
+        let parsed = parse_topic_ranking(&raw, &packets).unwrap();
+        let human = TopicSelection::from_ranking(parsed.clone(), &HUMAN_DIGEST_MODE);
+        assert_eq!(human.notable, ranking[..3]);
+        assert_eq!(human.brief, ranking[3..11]);
+        let ai = TopicSelection::from_ranking(parsed, &AI_DIGEST_MODE);
+        assert_eq!(ai.notable, ranking[..5]);
+        assert_eq!(ai.brief, ranking[5..17]);
+        for invalid in [
+            "[]",
+            "{}",
+            "[\"T01\", \"T02\"]",
+            "[\"T01\", \"T02\", \"T01\"]",
+            "[\"T01\", \"T02\", \"T99\"]",
+            "Here is the ranking: [\"T01\",\"T02\",\"T03\"]",
+        ] {
+            assert!(parse_topic_ranking(invalid, &packets).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_selected_notable_roles_are_enforced() {
+        let selection = TopicSelection {
+            notable: vec!["T01".into(), "T02".into(), "T03".into()],
+            brief: vec!["T04".into()],
+        };
+        let draft = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        assert!(selection_issue(&draft, &selection).is_none());
+        let swapped = draft
+            .replace("### [T02]", "### [T04]")
+            .replace("- [T04]", "- [T02]");
+        assert!(validate_digest(&swapped, &HUMAN_DIGEST_MODE, &VALID_IDS, DIGEST_DAY).is_empty());
+        assert!(selection_issue(&swapped, &selection).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_selection_does_not_request_impossible_topic_counts() {
+        let err = select_digest_topics(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(2),
+            &Backend::MockNoChoices,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at least three source-grounded topics")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_editor_receives_only_bounded_selected_packets() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let packets = selection_packets(20);
+        let ranking: Vec<_> = packets
+            .iter()
+            .rev()
+            .map(|packet| packet.id.as_str())
+            .collect();
+        let ranking = serde_json::to_string(&ranking).unwrap();
+        let server = MockServer::start().await;
+        for (system, response, calls) in [
+            (DAILY_SELECT_AGENT, ranking.as_str(), 1),
+            (DAILY_DIGEST_AGENT, "not a digest", 4),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_string_contains(system.lines().next().unwrap()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": response}}]
+                })))
+                .expect(calls)
+                .mount(&server)
+                .await;
+        }
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        assert!(
+            generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        let editor_inputs: Vec<_> = requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["messages"][0]["content"].as_str() == Some(DAILY_DIGEST_AGENT) {
+                    Some(body["messages"][1]["content"].as_str().unwrap().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(editor_inputs.len(), 4);
+        for input in editor_inputs {
+            assert!(input.contains("TOPIC T20\n"));
+            assert!(input.contains("TOPIC T10\n"));
+            assert!(!input.contains("TOPIC T09\n"));
+            assert!(!input.contains("TOPIC T01\n"));
+        }
+    }
+
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
         let skeleton = "\
 # Git mailing list daily digest for 2026/08/13
@@ -4021,6 +4288,7 @@ Prose about completing subcommands of the new history command.
             label: "human",
             min_words: printed_words + 1,
             max_words: printed_words + 100,
+            ..HUMAN_DIGEST_MODE
         };
         let issues = validate_digest(&draft, &mode, &VALID_IDS, DIGEST_DAY);
         assert!(

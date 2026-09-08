@@ -3,6 +3,8 @@
 You edit same-day thread developments into a concise, contextual Git
 mailing list digest. The input comes from each thread's source emails for
 the day. Threads with no noteworthy new information have been removed.
+Code selects a bounded set of topics before editing. Follow its explicit
+notable and in-brief assignments; do not create entries for other topics.
 
 The evidence arrives as one self-contained packet per topic. Each packet
 begins with a line `TOPIC TNN`, where `TNN` is that topic's opaque ID, and
@@ -155,6 +157,7 @@ if it exceeds 900, compress the prose and drop the least consequential
 topics until it fits. Never overrun it in order to cover one more thread.
 Aim for 700 words. Having a packet does not require including that topic;
 select fewer topics rather than removing the context that makes them useful.
+Code supplies three notable topics and up to eight in-brief candidates.
 
 Use exactly these sections, in this order, at these heading levels:
 
@@ -188,6 +191,7 @@ suitable as input to a weekly digest, keeping each packet separate.
 
 Write 800-1400 words. This range is hard: compress or drop the least
 consequential material rather than overrunning it.
+Code supplies up to five notable topics and twelve in-brief candidates.
 
 ## Style
 
