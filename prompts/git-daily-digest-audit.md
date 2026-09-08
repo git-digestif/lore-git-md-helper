@@ -9,7 +9,7 @@ For a topic item, the evidence is its original source emails. Each
 message. Its subject may supersede the name in the older thread root.
 Unquoted text is the sender's contribution; quoted passages identify
 earlier proposals and referents, not new contributions by that sender.
-Root background may explain the topic's purpose and technical effects.
+Topic background may explain the topic's purpose and technical effects.
 Read the whole exchange, including corrections and retractions.
 
 The special location T00 is the opening overview. Its evidence consists

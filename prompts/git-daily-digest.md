@@ -14,10 +14,11 @@ contains only that topic's material:
   Use it to identify today's work when a command or series has changed
   names since the root message. Do not relabel today's development with
   a superseded name from the background.
-- `BACKGROUND FOR TNN` is the original thread-root author's own unquoted
-  text: the subject of the message that started the thread, followed by an
-  excerpt of that message. It is source material, not a summary, and may
-  predate today's exchange. Use it only for what its author states: what
+- `BACKGROUND FOR TNN` is unquoted source text from the latest available
+  cover letter or standalone patch as of this day, or the thread root
+  when no newer topic-defining post is available. It is source material,
+  not a summary, and may predate today's exchange. Use it for what its
+  author states: what
   the topic changes, the problem or goal that motivates it, the subsystem
   or user-visible behavior it affects, the kind of change it is, and its
   concrete technical or practical impact. Some packets have no background
@@ -66,7 +67,7 @@ to one delta bullet of the *same* packet as the section it appears in.
   from an explicit delta bullet in the same packet, or be omitted. This
   holds even when the thread root's own text calls the work finished,
   tested, ready, or urgent.
-- The thread root text may be weeks old and may describe an earlier
+- The background text may be weeks old and may describe an earlier
   revision than today's. Never date it, never present it as today's
   posting, and never infer from it what has happened since.
 - Within one packet the bullets are chronological. When a later bullet

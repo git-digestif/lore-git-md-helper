@@ -1232,8 +1232,7 @@ pub struct ThreadDayActivity {
     pub root_dk: String,
     /// Thread AI summary from *before* today's emails (None if new thread).
     pub thread_ai_before: Option<String>,
-    /// The thread root author's own unquoted words: source material
-    /// describing what the topic is about, as opposed to generated text.
+    /// Source text describing the topic as of this day's latest email.
     pub root_source_excerpt: Option<String>,
     /// Today's emails and complete source text, in chronological order.
     pub email_summaries: Vec<DayEmailEvidence>,
@@ -1297,7 +1296,12 @@ pub fn build_day_digest_input(
         .map(|(root_dk, emails)| {
             let spec = format!("{before_commit}:{root_dk}.thread.ai.md");
             let thread_ai_before = cat.get_str(&spec);
-            let root_source_excerpt = topic_source_evidence(&root_dk, git_ref, cat);
+            let latest_dk = emails
+                .iter()
+                .map(|email| email.dk.as_str())
+                .max()
+                .expect("a grouped thread has at least one email");
+            let root_source_excerpt = topic_source_evidence(&root_dk, latest_dk, git_ref, cat);
             let wc_status = lookup_wc_status(&root_dk, git_ref, cat, &wc_map);
             ThreadDayActivity {
                 root_dk,
@@ -1338,21 +1342,55 @@ fn email_evidence(
     )
 }
 
-/// Load the thread root's own email and reduce it to source-grounded
-/// topic context: the root author's unquoted text, bounded so that a
-/// long cover letter cannot crowd out the verified deltas.
-///
-/// This is deliberately *not* an AI summary.  The daily digest editor
-/// needs to know what a thread is about, but any generated text handed
-/// to it as "context" has been observed to leak stale status,
-/// fabricated readiness, and cross-thread contamination into the
-/// published digest.  The root email cannot.
-fn topic_source_evidence(root_dk: &str, git_ref: &str, cat: &mut impl BlobRead) -> Option<String> {
-    let md = cat.get_str(&format!("{git_ref}:{root_dk}.md"))?;
+/// Use the most recent cover letter or standalone patch available at
+/// the cutoff, rather than a root whose topic may since have changed.
+fn topic_source_evidence(
+    root_dk: &str,
+    latest_dk: &str,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+) -> Option<String> {
+    let source_dk = thread_file::load_from_repo(cat, git_ref, root_dk)
+        .and_then(|(_, tree)| {
+            tree.date_keys()
+                .filter(|dk| *dk <= latest_dk)
+                .filter(|dk| {
+                    tree.node_of(dk)
+                        .is_some_and(|node| is_topic_post(&node.subject))
+                })
+                .max()
+                .map(str::to_string)
+        })
+        .or_else(|| (root_dk <= latest_dk).then(|| root_dk.to_string()))?;
+    let md = cat.get_str(&format!("{git_ref}:{source_dk}.md"))?;
     let parsed = rag_parse::parse_email(&md);
     let authored = authored_email_text(&parsed.body);
     let excerpt = bounded_excerpt(&authored, 2000);
     Some(format!("Subject: {}\n\n{excerpt}", parsed.subject))
+}
+
+fn is_topic_post(subject: &str) -> bool {
+    let Some((tags, _)) = subject
+        .strip_prefix('[')
+        .and_then(|text| text.split_once(']'))
+    else {
+        return false;
+    };
+    if !tags.split_whitespace().any(|tag| {
+        tag.split('/')
+            .any(|part| part.eq_ignore_ascii_case("PATCH"))
+    }) {
+        return false;
+    }
+    match tags
+        .split_whitespace()
+        .find(|tag| tag.starts_with(|c: char| c.is_ascii_digit()) && tag.contains('/'))
+    {
+        Some(part) => part.split_once('/').is_some_and(|(number, total)| {
+            number.parse::<usize>().ok() == Some(0) && total.parse::<usize>().is_ok_and(|n| n > 0)
+        }),
+        None => true,
+    }
 }
 
 fn authored_email_text(body: &str) -> String {
@@ -1683,7 +1721,7 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
         }
         match background {
             Some(background) => out.push_str(&format!(
-                "BACKGROUND FOR {id} -- THE THREAD ROOT AUTHOR'S OWN WORDS. \
+                "BACKGROUND FOR {id} -- ORIGINAL TOPIC-DEFINING SOURCE TEXT. \
                  THEY SAY WHAT THIS TOPIC IS, NOT WHAT CHANGED TODAY OR \
                  HOW IT IS GOING:\n\n{background}\n\n",
             )),
@@ -2628,7 +2666,7 @@ pub(crate) fn build_daily_digest_user_msg(
         }
 
         if let Some(background) = &activity.root_source_excerpt {
-            user_msg.push_str("THREAD BACKGROUND -- ROOT SOURCE, NOT TODAY'S DEVELOPMENTS:\n\n");
+            user_msg.push_str("THREAD BACKGROUND -- TOPIC SOURCE, NOT TODAY'S DEVELOPMENTS:\n\n");
             user_msg.push_str(background);
             user_msg.push_str("\n\n");
         }
@@ -3417,6 +3455,90 @@ mod tests {
             "evidence must stay bounded, got {} chars",
             evidence.chars().count(),
         );
+    }
+
+    #[test]
+    fn test_topic_context_uses_latest_cover_without_future_leakage() {
+        let root = "2026/06/14/19-25-39";
+        let cover = "2026/08/07/07-39-23";
+        let reply = "2026/08/13/21-52-53";
+        let mut tree = ThreadTree::new();
+        let mut blobs = MockBlobs(Default::default());
+        for (dk, subject, body) in [
+            (
+                root,
+                "[PATCH 0/8] rebase: add --fixup",
+                "Original rebase proposal.",
+            ),
+            (
+                cover,
+                "[PATCH v13 0/8] history: add squash subcommand",
+                "Current history squash proposal.",
+            ),
+            (
+                "2026/08/12/12-00-00",
+                "[PATCH v13 8/8] completion: add history support",
+                "Individual patch, not series context.",
+            ),
+            (
+                reply,
+                "Re: [PATCH v13 7/8] history: create squashed commits",
+                "Queued a test fix.",
+            ),
+            (
+                "2026/08/14/12-00-00",
+                "[PATCH v14 0/8] future: rename the command",
+                "Future context must not leak.",
+            ),
+        ] {
+            tree.insert(dk, (dk != root).then_some(root), subject, "Author");
+            blobs.0.insert(
+                format!("test:{dk}.md"),
+                format!("# {subject}\n\n**Thread**: [thread](t.md)\n\n{body}"),
+            );
+        }
+        blobs
+            .0
+            .insert(format!("test:{root}.thread.md"), tree.render(root));
+        let summaries = vec![(
+            reply.into(),
+            root.into(),
+            "Untrusted generated summary.".into(),
+        )];
+        let (threads, _) = build_day_digest_input(&summaries, "before", "test", &mut blobs);
+        let context = threads[0].root_source_excerpt.as_ref().unwrap();
+        assert!(
+            context.contains("Current history squash proposal."),
+            "{context}"
+        );
+        assert!(!context.contains("Original rebase proposal."));
+        assert!(!context.contains("Individual patch"));
+        assert!(!context.contains("Future context"));
+        let earlier =
+            topic_source_evidence(root, "2026/07/01/00-00-00", "test", &mut blobs).unwrap();
+        assert!(earlier.contains("Original rebase proposal."));
+        blobs.0.remove(&format!("test:{cover}.md"));
+        assert!(topic_source_evidence(root, reply, "test", &mut blobs).is_none());
+    }
+
+    #[test]
+    fn test_topic_posts_exclude_replies_and_individual_series_patches() {
+        for subject in [
+            "[PATCH RFC v3 00/13] Topic",
+            "[GSoC PATCH v5 0/6] Topic",
+            "[PATCH v2] Standalone patch",
+            "[PATCH/RFC] Standalone proposal",
+        ] {
+            assert!(is_topic_post(subject), "{subject}");
+        }
+        for subject in [
+            "Re: [PATCH v3 0/6] Review",
+            "[PATCH v13 7/8] One series member",
+            "[PATCH v2 0/0] Malformed count",
+            "[ANNOUNCE] Release",
+        ] {
+            assert!(!is_topic_post(subject), "{subject}");
+        }
     }
 
     #[test]

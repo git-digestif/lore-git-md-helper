@@ -7,7 +7,7 @@ following message. There are no generated summaries in this input.
 Read the whole exchange before writing:
 
 - Attribute a message's unquoted contributions to its sender. Quoted
-  passages and the optional root background can identify what a reply
+  passages and the optional topic background can identify what a reply
   refers to, but are not new statements by that sender.
 - Preserve each contributor's actual position, including the conclusion
   after an "initially ... however" argument. Retain material corrections,
