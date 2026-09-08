@@ -1934,6 +1934,7 @@ async fn audit_section(
     let numbered = section
         .lines
         .iter()
+        .filter(|(_, line)| !line.trim().is_empty())
         .map(|(line_number, line)| format!("L{line_number:04} {line}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -4296,7 +4297,7 @@ Prose about completing subcommands of the new history command.
             .collect();
         let packets = build_topic_packets(DIGEST_DAY, &threads, &deltas);
         let draft = "# Title\n## The day in brief\nAlpha and beta changed.\n\
-                     ## Notable threads\n### [T01] Alpha\nAlpha changed.\n\
+                     ## Notable threads\n### [T01] Alpha\n\nAlpha changed.\n\
                      ## In brief\n- [T02] Beta changed.\n";
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4335,6 +4336,8 @@ Prose about completing subcommands of the new history command.
         assert_eq!(inputs.len(), 6);
         assert!(inputs[0].contains("ORIGINAL-SOURCE-0"));
         assert!(!inputs[0].contains("ORIGINAL-SOURCE-1"));
+        assert!(!inputs[0].contains("\nL0006 "));
+        assert!(inputs[0].contains("\nL0007 Alpha changed."));
         assert!(inputs[1].contains("ORIGINAL-SOURCE-1"));
         assert!(!inputs[1].contains("ORIGINAL-SOURCE-0"));
         assert!(
