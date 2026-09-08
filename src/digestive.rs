@@ -1933,7 +1933,6 @@ async fn generate_digest_mode(
     );
     let mut correction = String::new();
     let mut issues = Vec::new();
-    let mut corrections = Vec::new();
     // Sources are fixed for this mode's retries; only identical accepted text is reusable.
     let mut approved = HashMap::new();
 
@@ -1981,12 +1980,7 @@ async fn generate_digest_mode(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
         );
-        for issue in &issues {
-            if !corrections.contains(issue) {
-                corrections.push(issue.clone());
-            }
-        }
-        correction = format!("\n\n{}", correction_block(&corrections, factual_revision),);
+        correction = format!("\n\n{}", correction_block(&issues, factual_revision));
     }
 
     anyhow::bail!(
@@ -4332,6 +4326,91 @@ mod tests {
             assert!(!input.contains("TOPIC T09\n"));
             assert!(!input.contains("TOPIC T01\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_revision_does_not_reintroduce_obsolete_findings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let clean = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let drafts = [
+            clean.replace("Prose about the packfile lookup fast path.",
+                "Prose about the packfile lookup fast path. OBSOLETE_FACT_A"),
+            clean.replace("Prose about passing an explicit repository into the object database.",
+                "Prose about passing an explicit repository into the object database. CURRENT_FACT_B"),
+            clean,
+        ];
+        let calls = AtomicUsize::new(0);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                let user = body["messages"][1]["content"].as_str().unwrap();
+                let content = if system == DAILY_SELECT_AGENT {
+                    r#"["T01","T02","T03","T04"]"#.to_string()
+                } else if system == DAILY_DIGEST_AGENT {
+                    drafts
+                        .get(calls.fetch_add(1, Ordering::Relaxed))
+                        .cloned()
+                        .unwrap_or_else(|| "unexpected editor request".into())
+                } else {
+                    assert_eq!(system, DAILY_DIGEST_AUDIT_AGENT);
+                    let finding = user.lines().find(|line| {
+                        line.starts_with('L')
+                            && (line.contains("OBSOLETE_FACT_A") || line.contains("CURRENT_FACT_B"))
+                    });
+                    match finding {
+                        Some(line) => {
+                            let location = user
+                                .lines()
+                                .find_map(|line| line.strip_prefix("AUDIT LOCATION: "))
+                                .unwrap();
+                            let citation = line.split_whitespace().next().unwrap();
+                            let marker = if line.contains("OBSOLETE_FACT_A") {
+                                "OBSOLETE_FACT_A"
+                            } else {
+                                "CURRENT_FACT_B"
+                            };
+                            format!("- {location} ||| {citation} ||| Remove {marker}")
+                        }
+                        None => "OK".into(),
+                    }
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": content}}]
+                }))
+            })
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(4),
+            &backend,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let editor_inputs: Vec<_> = requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                (body["messages"][0]["content"].as_str() == Some(DAILY_DIGEST_AGENT))
+                    .then(|| body["messages"][1]["content"].as_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(editor_inputs.len(), 3);
+        assert!(editor_inputs[1].contains("OBSOLETE_FACT_A"));
+        assert!(!editor_inputs[2].contains("OBSOLETE_FACT_A"));
+        assert!(editor_inputs[2].contains("CURRENT_FACT_B"));
     }
 
     fn valid_digest(mode: &DigestMode, words: usize) -> String {
