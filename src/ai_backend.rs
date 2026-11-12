@@ -416,6 +416,8 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -477,6 +479,8 @@ async fn chat_api(
             },
         ],
         temperature,
+        // Mistral Large 4 rejects greedy sampling unless top_p is 1.
+        top_p: (temperature == Some(0.0)).then_some(1.0),
     };
 
     let max_retries: u32 = 5;
@@ -770,6 +774,34 @@ mod tests {
         };
         let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_sends_top_p_only_with_greedy_sampling() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (temperature, top_p) in [(Some(0.0), Some(1.0)), (Some(0.7), None), (None, None)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("top_p").and_then(|v| v.as_f64()) == top_p
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let ep = ApiEndpoint {
+                api_url: &server.uri(),
+                model: "test",
+                auth: ApiAuth::None,
+                rate_limits: None,
+            };
+            let result = chat_api(&ep, "sys", "usr", temperature).await.unwrap();
+            assert_eq!(result, "ok", "temperature {temperature:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
