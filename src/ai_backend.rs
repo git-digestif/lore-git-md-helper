@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -161,6 +162,7 @@ struct ApiEndpoint<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
     reasoning_effort: Option<String>,
+    max_completion_tokens: Option<NonZeroU32>,
 }
 
 /// An AI chat backend.
@@ -376,9 +378,10 @@ pub struct BackendArgs {
     /// (falls back to AZURE_OPENAI_ENDPOINT env var).
     /// Reads the API key from AZURE_OPENAI_API_KEY.
     /// Model defaults to Mistral-Large-3; override via --model or
-    /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT, if
-    /// set, is sent as `reasoning_effort` (the values a deployment
-    /// accepts vary by model).
+    /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT and
+    /// AZURE_OPENAI_MAX_COMPLETION_TOKENS, if set, are sent as
+    /// `reasoning_effort` (the values a deployment accepts vary by
+    /// model) and `max_completion_tokens`.
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
@@ -417,6 +420,9 @@ impl BackendArgs {
                 reasoning_effort: std::env::var("AZURE_OPENAI_REASONING_EFFORT")
                     .ok()
                     .filter(|v| !v.is_empty()),
+                max_completion_tokens: parse_max_completion_tokens(
+                    std::env::var("AZURE_OPENAI_MAX_COMPLETION_TOKENS").ok(),
+                )?,
             };
             Ok(Backend::azure_openai(api_url, model, api_key, options))
         } else {
@@ -431,6 +437,17 @@ impl BackendArgs {
     }
 }
 
+/// Parse AZURE_OPENAI_MAX_COMPLETION_TOKENS: unset or empty means no cap.
+fn parse_max_completion_tokens(value: Option<String>) -> Result<Option<NonZeroU32>> {
+    value
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<NonZeroU32>()
+                .context("AZURE_OPENAI_MAX_COMPLETION_TOKENS must be a positive integer")
+        })
+        .transpose()
+}
+
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
@@ -441,6 +458,8 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<NonZeroU32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -552,6 +571,7 @@ async fn chat_api_with(
         // Mistral Large 4 rejects greedy sampling unless top_p is 1.
         top_p: (temperature == Some(0.0)).then_some(1.0),
         reasoning_effort: options.reasoning_effort.clone(),
+        max_completion_tokens: options.max_completion_tokens,
     };
 
     let max_retries: u32 = 5;
@@ -929,9 +949,56 @@ mod tests {
 
             let options = RequestOptions {
                 reasoning_effort: effort.map(String::from),
+                ..Default::default()
             };
             let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
             assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_max_completion_tokens_only_when_set() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for cap in [NonZeroU32::new(300), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("max_completion_tokens").and_then(|v| v.as_u64())
+                        == cap.map(|n| u64::from(n.get()))
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                max_completion_tokens: cap,
+                ..Default::default()
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn max_completion_tokens_setting_must_be_a_positive_integer() {
+        assert_eq!(parse_max_completion_tokens(None).unwrap(), None);
+        assert_eq!(
+            parse_max_completion_tokens(Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_max_completion_tokens(Some("16384".into())).unwrap(),
+            NonZeroU32::new(16384)
+        );
+        for bad in ["0", "-5", "many", "1.5"] {
+            assert!(
+                parse_max_completion_tokens(Some(bad.into())).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
