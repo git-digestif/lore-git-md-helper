@@ -157,6 +157,12 @@ struct ApiEndpoint<'a> {
     rate_limits: Option<&'a Mutex<RateLimitState>>,
 }
 
+/// Request fields that only some deployments accept.
+#[derive(Clone, Debug, Default)]
+pub struct RequestOptions {
+    reasoning_effort: Option<String>,
+}
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -183,6 +189,7 @@ pub enum Backend {
         api_url: String,
         model: String,
         api_key: String,
+        options: RequestOptions,
     },
     /// Deterministic mock for testing.  Returns every Nth word from
     /// the user message (default: every 5th word).
@@ -245,11 +252,17 @@ impl Backend {
         }
     }
 
-    pub fn azure_openai(api_url: String, model: Option<String>, api_key: String) -> Self {
+    pub fn azure_openai(
+        api_url: String,
+        model: Option<String>,
+        api_key: String,
+        options: RequestOptions,
+    ) -> Self {
         Self::AzureOpenAI {
             api_url,
             model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
             api_key,
+            options,
         }
     }
 
@@ -312,6 +325,7 @@ impl Backend {
                 api_url,
                 model,
                 api_key,
+                options,
             } => {
                 let ep = ApiEndpoint {
                     api_url,
@@ -319,7 +333,7 @@ impl Backend {
                     auth: ApiAuth::ApiKey(api_key),
                     rate_limits: None,
                 };
-                chat_api(&ep, system, user, temperature).await
+                chat_api_with(&ep, options, system, user, temperature).await
             }
             #[cfg(test)]
             Backend::Mock { nth_word } => Ok(mock_summarize(user, *nth_word)),
@@ -362,7 +376,9 @@ pub struct BackendArgs {
     /// (falls back to AZURE_OPENAI_ENDPOINT env var).
     /// Reads the API key from AZURE_OPENAI_API_KEY.
     /// Model defaults to Mistral-Large-3; override via --model or
-    /// AZURE_OPENAI_MODEL env var.
+    /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT, if
+    /// set, is sent as `reasoning_effort` (the values a deployment
+    /// accepts vary by model).
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
@@ -397,7 +413,12 @@ impl BackendArgs {
             let model = self
                 .model
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
-            Ok(Backend::azure_openai(api_url, model, api_key))
+            let options = RequestOptions {
+                reasoning_effort: std::env::var("AZURE_OPENAI_REASONING_EFFORT")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+            };
+            Ok(Backend::azure_openai(api_url, model, api_key, options))
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
@@ -418,6 +439,8 @@ struct ChatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -479,6 +502,16 @@ async fn chat_api(
     user: &str,
     temperature: Option<f32>,
 ) -> Result<String> {
+    chat_api_with(ep, &RequestOptions::default(), system, user, temperature).await
+}
+
+async fn chat_api_with(
+    ep: &ApiEndpoint<'_>,
+    options: &RequestOptions,
+    system: &str,
+    user: &str,
+    temperature: Option<f32>,
+) -> Result<String> {
     // Preemptive rate limit back-off: if we know we are running low on
     // requests and the information is recent (within the last 60 s), sleep
     // briefly to avoid hammering the API.
@@ -518,6 +551,7 @@ async fn chat_api(
         temperature,
         // Mistral Large 4 rejects greedy sampling unless top_p is 1.
         top_p: (temperature == Some(0.0)).then_some(1.0),
+        reasoning_effort: options.reasoning_effort.clone(),
     };
 
     let max_retries: u32 = 5;
@@ -873,6 +907,31 @@ mod tests {
             };
             let result = chat_api(&ep, "sys", "usr", temperature).await.unwrap();
             assert_eq!(result, "ok", "temperature {temperature:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_reasoning_effort_only_when_set() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for effort in [Some("low"), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("reasoning_effort").and_then(|v| v.as_str()) == effort
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                reasoning_effort: effort.map(String::from),
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
         }
     }
 
