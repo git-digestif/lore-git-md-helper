@@ -148,6 +148,9 @@ Do not pad the digest, but do not sacrifice these answers for brevity. A
 paragraph that merely says who asked for, reviewed, acknowledged, or agreed
 to something is not informative enough. Generic headings such as "Topic
 integration shuffle" are forbidden; name the actual work and subsystem.
+A heading names the work only, never a status, decision, or outcome:
+"Pluggable packfile generation", not "Pluggable packfile generation moves
+into `seen`".
 If the context does not answer a question, silently leave that answer out;
 do not guess it, and do not spend words remarking on its absence.
 
