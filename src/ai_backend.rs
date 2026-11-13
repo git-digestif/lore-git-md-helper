@@ -429,11 +429,48 @@ struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    reasoning_tokens: Option<u64>,
+}
+
+/// One-line token accounting for a response.  Fields the server does
+/// not report are left out.
+fn usage_line(usage: &Usage, finish_reason: Option<&str>) -> String {
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens);
+    let mut line = String::from("[usage]");
+    for (name, tokens) in [
+        ("prompt", usage.prompt_tokens),
+        ("completion", usage.completion_tokens),
+        ("reasoning", reasoning),
+    ] {
+        if let Some(tokens) = tokens {
+            line.push_str(&format!(" {name}={tokens}"));
+        }
+    }
+    if let Some(reason) = finish_reason {
+        line.push_str(&format!(" finish={reason}"));
+    }
+    line
 }
 
 async fn chat_api(
@@ -640,6 +677,13 @@ async fn chat_api(
                 &body[..body.len().min(200)]
             )
         })?;
+        if let Some(usage) = &parsed.usage {
+            let finish = parsed
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.as_deref());
+            eprintln!("{}", usage_line(usage, finish));
+        }
         let content = match parsed.choices.into_iter().next() {
             Some(c) => c.message.content,
             None => {
@@ -744,6 +788,34 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": content}}]
         })
         .to_string()
+    }
+
+    #[test]
+    fn usage_line_reports_only_what_the_server_sent() {
+        let reasoning_model: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":""},
+                "finish_reason":"length"}],
+                "usage":{"prompt_tokens":2154,"completion_tokens":441,
+                "completion_tokens_details":{"reasoning_tokens":437}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_line(
+                reasoning_model.usage.as_ref().unwrap(),
+                reasoning_model.choices[0].finish_reason.as_deref()
+            ),
+            "[usage] prompt=2154 completion=441 reasoning=437 finish=length"
+        );
+
+        let plain_model: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"OK"}}],
+                "usage":{"prompt_tokens":11,"completion_tokens":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_line(plain_model.usage.as_ref().unwrap(), None),
+            "[usage] prompt=11 completion=2"
+        );
     }
 
     #[tokio::test(start_paused = true)]
