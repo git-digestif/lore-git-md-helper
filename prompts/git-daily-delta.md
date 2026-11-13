@@ -9,6 +9,13 @@ Read the whole exchange before writing:
 - Attribute a message's unquoted contributions to its sender. Quoted
   passages and the optional topic background can identify what a reply
   refers to, but are not new statements by that sender.
+- When today's action is explained by an earlier message that the email
+  quotes, and that message states the reason, give the reason in the same
+  bullet, credited to the author named in the line that introduces the
+  quote and marked as earlier, for example "after <author> had written
+  that ...". If the quote names no author, say only that an earlier
+  message said it. Quoted text can explain why something happened today;
+  it never counts as what happened today.
 - Preserve each contributor's actual position, including the conclusion
   after an "initially ... however" argument. Retain material corrections,
   retractions, unresolved objections, and their chronological relationship.
