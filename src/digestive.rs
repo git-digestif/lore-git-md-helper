@@ -1592,7 +1592,13 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
         if line.eq_ignore_ascii_case("New today:") {
             continue;
         }
-        match line.strip_prefix("- ") {
+        // The extractor sometimes drops the "- " from every bullet; a
+        // line that opens with a citation of a known email is one anyway.
+        let bullet = line.strip_prefix("- ").or_else(|| {
+            let (header, _) = line.strip_prefix('[')?.split_once(']')?;
+            cited_email(header, threads).is_ok().then_some(line)
+        });
+        match bullet {
             Some(bullet) if raw_line.starts_with('-') || bullet.starts_with('[') => {
                 let (header, text) = bullet
                     .strip_prefix('[')
@@ -4229,6 +4235,30 @@ mod tests {
         );
     }
 
+    /// The extractor sometimes writes every bullet as `[date-key] text`,
+    /// without the leading dash.
+    #[test]
+    fn test_parse_root_deltas_accepts_bullets_without_marker() {
+        let threads = [delta_activity(
+            "2026/08/13/05-47-56",
+            &[
+                ("2026/08/13/05-47-56", "Patrick Steinhardt"),
+                ("2026/08/13/17-35-39", "Junio C Hamano"),
+            ],
+        )];
+        let raw = "[2026/08/13/05-47-56] Posted\n\
+                   [PATCH v2 0/5] with the rebased series.\n\
+                   [2026/08/13/17-35-39 by Wrong Author] Agreed.";
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap()[0].bullets,
+            vec![
+                "[2026/08/13/05-47-56 by Patrick Steinhardt] Posted \
+                 [PATCH v2 0/5] with the rebased series.",
+                "[2026/08/13/17-35-39 by Junio C Hamano] Agreed.",
+            ],
+        );
+    }
+
     #[test]
     fn test_parse_root_deltas_rejects_malformed_output() {
         let threads = [delta_activity(
@@ -4261,6 +4291,7 @@ mod tests {
                 "unknown thread root",
             ),
             ("Today the list discussed several series.", "stray line"),
+            ("[2026/08/12/00-00-00] Posted v5.", "stray line"),
             ("- Something.", "without an email citation"),
             ("- [2026/08/12/00-00-00] Posted v5.", "unknown source email"),
             ("- [2026/08/13/17-35-39]", "empty delta"),
