@@ -162,7 +162,31 @@ struct ApiEndpoint<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
     reasoning_effort: Option<String>,
+    /// Replaces `reasoning_effort` for audit requests, when set.
+    audit_reasoning_effort: Option<String>,
     max_completion_tokens: Option<NonZeroU32>,
+}
+
+/// What a chat request is for.
+#[derive(Clone, Copy)]
+enum Purpose {
+    General,
+    Audit,
+}
+
+impl RequestOptions {
+    fn for_purpose(&self, purpose: Purpose) -> Self {
+        match purpose {
+            Purpose::General => self.clone(),
+            Purpose::Audit => Self {
+                reasoning_effort: self
+                    .audit_reasoning_effort
+                    .clone()
+                    .or_else(|| self.reasoning_effort.clone()),
+                ..self.clone()
+            },
+        }
+    }
 }
 
 /// An AI chat backend.
@@ -280,6 +304,30 @@ impl Backend {
         user: &str,
         temperature: Option<f32>,
     ) -> Result<String> {
+        self.chat_for(Purpose::General, system, user, temperature)
+            .await
+    }
+
+    /// Like `chat_with_options`, for factual audits: with
+    /// AZURE_OPENAI_AUDIT_REASONING_EFFORT set, the Azure backend sends
+    /// that reasoning effort instead of AZURE_OPENAI_REASONING_EFFORT.
+    pub async fn chat_audit(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        self.chat_for(Purpose::Audit, system, user, temperature)
+            .await
+    }
+
+    async fn chat_for(
+        &self,
+        purpose: Purpose,
+        system: &str,
+        user: &str,
+        temperature: Option<f32>,
+    ) -> Result<String> {
         match self {
             Backend::Api {
                 api_url,
@@ -335,7 +383,14 @@ impl Backend {
                     auth: ApiAuth::ApiKey(api_key),
                     rate_limits: None,
                 };
-                chat_api_with(&ep, options, system, user, temperature).await
+                chat_api_with(
+                    &ep,
+                    &options.for_purpose(purpose),
+                    system,
+                    user,
+                    temperature,
+                )
+                .await
             }
             #[cfg(test)]
             Backend::Mock { nth_word } => Ok(mock_summarize(user, *nth_word)),
@@ -381,7 +436,8 @@ pub struct BackendArgs {
     /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT and
     /// AZURE_OPENAI_MAX_COMPLETION_TOKENS, if set, are sent as
     /// `reasoning_effort` (the values a deployment accepts vary by
-    /// model) and `max_completion_tokens`.
+    /// model) and `max_completion_tokens`.  AZURE_OPENAI_AUDIT_REASONING_EFFORT,
+    /// if set, replaces the reasoning effort of factual-audit requests.
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
@@ -418,6 +474,9 @@ impl BackendArgs {
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
             let options = RequestOptions {
                 reasoning_effort: std::env::var("AZURE_OPENAI_REASONING_EFFORT")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                audit_reasoning_effort: std::env::var("AZURE_OPENAI_AUDIT_REASONING_EFFORT")
                     .ok()
                     .filter(|v| !v.is_empty()),
                 max_completion_tokens: parse_max_completion_tokens(
@@ -953,6 +1012,44 @@ mod tests {
             };
             let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
             assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_audit_reasoning_effort_only_to_audit_requests() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (general, audit, is_audit, expected) in [
+            (Some("low"), Some("high"), false, Some("low")),
+            (Some("low"), Some("high"), true, Some("high")),
+            (Some("low"), None, true, Some("low")),
+            (None, Some("high"), true, Some("high")),
+            (None, Some("high"), false, None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("reasoning_effort").and_then(|v| v.as_str()) == expected
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                reasoning_effort: general.map(String::from),
+                audit_reasoning_effort: audit.map(String::from),
+                ..Default::default()
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            let reply = if is_audit {
+                backend.chat_audit("sys", "usr", None).await
+            } else {
+                backend.chat("sys", "usr").await
+            };
+            assert_eq!(reply.unwrap(), "ok");
         }
     }
 
