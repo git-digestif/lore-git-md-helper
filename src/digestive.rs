@@ -2309,7 +2309,7 @@ async fn audit_section(
         let prompt = format!("{base}{correction}");
         trace_digest_attempt(&label, attempt, "input.txt", &prompt)?;
         let verdict = backend
-            .chat_with_options(DAILY_DIGEST_AUDIT_AGENT, &prompt, Some(0.0))
+            .chat_audit(DAILY_DIGEST_AUDIT_AGENT, &prompt, Some(0.0))
             .await
             .with_context(|| format!("daily digest factual audit failed for {location}"))?;
         trace_digest_attempt(&label, attempt, "output.txt", &verdict)?;
@@ -4618,6 +4618,46 @@ mod tests {
         for input in editor_inputs {
             assert!(input.contains("Source 1."));
             assert!(!input.contains("Source 2."));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_audits_use_the_audit_reasoning_effort() {
+        use crate::ai_backend::RequestOptions;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}]
+            })))
+            .mount(&server)
+            .await;
+        let options = RequestOptions {
+            reasoning_effort: Some("low".into()),
+            audit_reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+        let digest = valid_digest(&HUMAN_DIGEST_MODE, 0);
+
+        let issues = audit_digest(
+            &digest,
+            &selection_packets(4),
+            &mut HashMap::new(),
+            &backend,
+            "test",
+        )
+        .await
+        .unwrap();
+
+        assert!(issues.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
         }
     }
 

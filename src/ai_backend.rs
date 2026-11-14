@@ -161,10 +161,10 @@ struct ApiEndpoint<'a> {
 /// Request fields that only some deployments accept.
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     /// Replaces `reasoning_effort` for audit requests, when set.
-    audit_reasoning_effort: Option<String>,
-    max_completion_tokens: Option<NonZeroU32>,
+    pub(crate) audit_reasoning_effort: Option<String>,
+    pub(crate) max_completion_tokens: Option<NonZeroU32>,
 }
 
 /// What a chat request is for.
