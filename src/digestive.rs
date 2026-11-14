@@ -1598,23 +1598,8 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
                     .strip_prefix('[')
                     .and_then(|text| text.split_once(']'))
                     .context("delta extractor emitted a bullet without an email citation")?;
-                let dk = header
-                    .split_once(" by ")
-                    .map_or(header, |(dk, _)| dk)
-                    .trim();
-                let (index, email) = threads
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, thread)| {
-                        thread
-                            .email_summaries
-                            .iter()
-                            .find(|email| email.dk == dk)
-                            .map(|email| (index, email))
-                    })
-                    .with_context(|| {
-                        format!("delta extractor cited unknown source email `{dk}`")
-                    })?;
+                let (index, email) = cited_email(header, threads)?;
+                let dk = &email.dk;
                 let text = text.trim();
                 anyhow::ensure!(!text.is_empty(), "empty delta for source email `{dk}`");
                 let citation = match &email.from {
@@ -1653,6 +1638,30 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
             }
         })
         .collect())
+}
+
+/// The thread index and email that a bullet's `[date-key]` or
+/// `[date-key by Author]` header names.  Only the date-key counts; the
+/// author comes from the source email.
+fn cited_email<'a>(
+    header: &str,
+    threads: &'a [ThreadDayActivity],
+) -> Result<(usize, &'a DayEmailEvidence)> {
+    let dk = header
+        .split_once(" by ")
+        .map_or(header, |(dk, _)| dk)
+        .trim();
+    threads
+        .iter()
+        .enumerate()
+        .find_map(|(index, thread)| {
+            thread
+                .email_summaries
+                .iter()
+                .find(|email| email.dk == dk)
+                .map(|email| (index, email))
+        })
+        .with_context(|| format!("delta extractor cited unknown source email `{dk}`"))
 }
 
 fn is_delta_sentinel(line: &str) -> bool {
