@@ -1925,7 +1925,7 @@ const MAX_ISSUES: usize = 8;
 /// factual audit are limited separately: a writer that keeps missing
 /// the word window must not leave the audit's findings unrepaired.
 const MAX_STRUCTURAL_REJECTIONS: usize = 4;
-const MAX_AUDIT_ROUNDS: usize = 4;
+const MAX_AUDIT_ROUNDS: usize = 6;
 
 async fn generate_digest_mode(
     day: &str,
