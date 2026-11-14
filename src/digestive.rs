@@ -3113,7 +3113,10 @@ pub async fn redo_daily(
         if !path.ends_with(".ai.md") {
             continue;
         }
-        if path.contains(".thread.") || path.ends_with("/digest.ai.md") {
+        if path.contains(".thread.")
+            || path.ends_with("/digest.ai.md")
+            || path.ends_with("/digest.weekly.ai.md")
+        {
             continue;
         }
         let dk = path.trim_end_matches(".ai.md").to_string();
@@ -6345,6 +6348,43 @@ Prose about completing subcommands of the new history command.
         assert_eq!(
             result.total_processed, 2,
             "both emails should be summarized when deadline is far in the future",
+        );
+    }
+
+    /// A Sunday's directory also holds the week's digest, which is not
+    /// an email and must not be read as one.
+    #[tokio::test]
+    async fn test_redo_daily_ignores_the_weekly_digest_of_a_sunday() {
+        use crate::ai_backend::Backend;
+
+        const SUNDAY: &str = "2025/01/05";
+        const EMAIL: &str = "2025/01/05/09-00-00";
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+
+        {
+            let mut fi = FastImport::new(repo, git_ref).unwrap();
+            fi.commit(
+                "seed",
+                &[
+                    (&format!("{EMAIL}.md"), "Subject: A\nFrom: Alice\n\nbody"),
+                    (&format!("{EMAIL}.ai.md"), "Summary of A."),
+                    (&format!("{SUNDAY}/digest.weekly.ai.md"), "Weekly digest."),
+                ],
+            )
+            .unwrap();
+            fi.finish().unwrap();
+        }
+
+        let backend = Backend::Mock { nth_word: 1 };
+        redo_daily(repo, git_ref, SUNDAY, &backend).await.unwrap();
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert!(
+            cat.get_str(&format!("{git_ref}:{SUNDAY}/digest.human.md"))
+                .is_some()
         );
     }
 }
