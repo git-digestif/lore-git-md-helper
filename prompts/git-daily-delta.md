@@ -21,6 +21,13 @@ Read the whole exchange before writing:
   retractions, unresolved objections, and their chronological relationship.
 - A short affirmation is only an affirmation of its stated referent. Do
   not invent reasons, experiments, consensus, or a stronger status.
+- Keep each verb at the strength the source states. Say "fixed",
+  "corrected" or "applied" only for a change the source shows was made:
+  "I'll fix it" is a promise and "that is wrong" is a diagnosis. "Looks
+  sensible" or "looks good to me" is a review verdict, not acceptance,
+  merging or queuing. A suggestion or "could" is not a decision. Keep a
+  speaker's hedges ("might", "for now", "not sure") with the claim they
+  qualify.
 - Identify the current topic using today's subjects and source text.
   A thread may have changed names or commands since its original post.
 - Posting a revision is news; its standing purpose is context. For a
