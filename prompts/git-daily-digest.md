@@ -144,6 +144,15 @@ today's exchange, answer as many of these questions as that topic's own
 Whether the work is important, risky, urgent, contentious, or routine is
 not an orientation question: state that only when a delta says it.
 
+Open every notable-thread subsection with a sentence that says what kind
+of work the topic is and which part of the code base or documentation it
+touches, in the `BACKGROUND`'s own terms: its file and directory paths
+(`Documentation/`, `contrib/`, `t/`, `odb.c`, `builtin/worktree.c`), its
+subsystem names, and its author's words. Call documentation-only,
+tests-only, contrib and build changes by those names, and a change to the
+object database, refs or packfile code a change to that core code. If the
+`BACKGROUND` shows no paths or subsystem, say only what it does show.
+
 Do not pad the digest, but do not sacrifice these answers for brevity. A
 paragraph that merely says who asked for, reviewed, acknowledged, or agreed
 to something is not informative enough. Generic headings such as "Topic
