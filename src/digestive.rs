@@ -2009,7 +2009,7 @@ async fn generate_digest_mode(
             )
             .await?;
             if issues.is_empty() {
-                return Ok(strip_topic_tags(&digest));
+                return Ok(drop_empty_brief_section(&strip_topic_tags(&digest)));
             }
             revision = Some((digest.clone(), issues.clone()));
         } else {
@@ -2534,6 +2534,17 @@ fn strip_topic_tags(md: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Remove a final `## In brief` heading that has no items: when every
+/// selected topic is notable, nothing is left to put under it.
+fn drop_empty_brief_section(md: &str) -> String {
+    match md.trim_end().rsplit_once('\n') {
+        Some((head, last)) if last.starts_with("## ") && label_key(last) == "in brief" => {
+            format!("{}\n", head.trim_end())
+        }
+        _ => md.to_string(),
+    }
 }
 
 fn normalize_typography(md: &str) -> String {
@@ -4710,6 +4721,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, strip_topic_tags(&clean));
+    }
+
+    #[test]
+    fn test_an_empty_in_brief_section_is_dropped() {
+        let empty = "# Title\n\n## Notable threads\n\n### [T01] Work\n\nProse.\n\n## In brief\n\n";
+        assert_eq!(
+            drop_empty_brief_section(empty),
+            "# Title\n\n## Notable threads\n\n### [T01] Work\n\nProse.\n"
+        );
+        let filled = "# Title\n\n## In brief\n\n- Item.\n";
+        assert_eq!(drop_empty_brief_section(filled), filled);
+    }
+
+    #[tokio::test]
+    async fn test_a_digest_without_in_brief_topics_is_published_without_the_heading() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let digest = valid_digest(&HUMAN_DIGEST_MODE, 0)
+            .replace("- [T04] One remaining thread saw a small test fix.\n", "");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                let content = if system == DAILY_SELECT_AGENT {
+                    r#"["T01","T02","T03"]"#.to_string()
+                } else if system == DAILY_DIGEST_AGENT {
+                    digest.clone()
+                } else {
+                    "OK".to_string()
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": content}}]
+                }))
+            })
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+
+        let result = generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(3),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.contains("## In brief"));
     }
 
     #[tokio::test]
