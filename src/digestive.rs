@@ -1632,6 +1632,14 @@ fn parse_root_deltas(raw: &str, threads: &[ThreadDayActivity]) -> Result<Vec<Roo
     Ok(by_thread
         .into_iter()
         .map(|(index, mut bullets)| {
+            for bullet in &mut bullets {
+                if let Some((citation, text)) = bullet.split_once("] ") {
+                    *bullet = format!(
+                        "{citation}] {}",
+                        correct_misspelled_names(text, &threads[index])
+                    );
+                }
+            }
             // Keep clauses from the same email in their original order.
             bullets.sort_by(|a, b| {
                 a.split_whitespace()
@@ -1668,6 +1676,62 @@ fn cited_email<'a>(
                 .map(|email| (index, email))
         })
         .with_context(|| format!("delta extractor cited unknown source email `{dk}`"))
+}
+
+/// The extractor sometimes garbles a participant's name. Replace a word
+/// that is one letter away from a word of a name in the thread's `From`
+/// headers, and that no source text of the thread uses, by that word.
+fn correct_misspelled_names(text: &str, thread: &ThreadDayActivity) -> String {
+    static WORD_RE: OnceLock<Regex> = OnceLock::new();
+    let word_re = WORD_RE.get_or_init(|| Regex::new(r"\p{L}+").unwrap());
+    let names: Vec<&str> = thread
+        .email_summaries
+        .iter()
+        .filter_map(|email| email.from.as_deref())
+        .flat_map(str::split_whitespace)
+        .filter(|word| word.chars().count() >= 5 && word.chars().all(char::is_alphabetic))
+        .collect();
+    let source = thread
+        .email_summaries
+        .iter()
+        .filter_map(|email| email.source_excerpt.as_deref())
+        .chain(thread.root_source_excerpt.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    word_re
+        .replace_all(text, |caps: &regex::Captures| {
+            let word = &caps[0];
+            let lower = word.to_lowercase();
+            if word.chars().count() < 5 || source.contains(&lower) {
+                return word.to_string();
+            }
+            names
+                .iter()
+                .find(|name| one_letter_apart(&lower, &name.to_lowercase()))
+                .map_or_else(|| word.to_string(), |name| (*name).to_string())
+        })
+        .into_owned()
+}
+
+/// Whether `a` and `b` differ by exactly one inserted, deleted or
+/// replaced letter.
+fn one_letter_apart(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let common = short.iter().zip(long).take_while(|(x, y)| x == y).count();
+    if short.len() == long.len() {
+        common < long.len() && short[common + 1..] == long[common + 1..]
+    } else {
+        short[common..] == long[common + 1..]
+    }
 }
 
 fn is_delta_sentinel(line: &str) -> bool {
@@ -4284,6 +4348,45 @@ mod tests {
                  [PATCH v2 0/5] with the rebased series.",
                 "[2026/08/13/17-35-39 by Junio C Hamano] Agreed.",
             ],
+        );
+    }
+
+    /// The extractor sometimes garbles a participant's name, and the
+    /// error then reaches both digests.
+    #[test]
+    fn test_parse_root_deltas_corrects_misspelled_participant_names() {
+        let mut threads = [delta_activity(
+            "2026/08/22/16-03-35",
+            &[
+                (
+                    "2026/08/22/16-03-35",
+                    "brian m. carlson <carlsson@example.com>",
+                ),
+                ("2026/08/22/17-59-09", "Junio C Hamano <gitster@pobox.com>"),
+            ],
+        )];
+        let raw = "- [2026/08/22/16-03-35] brian m. carlsson doubted the series.\n\
+                   - [2026/08/22/17-59-09] Junio C Hamano endorsed brian m. carlsson's stance.";
+        assert_eq!(
+            parse_root_deltas(raw, &threads).unwrap()[0].bullets,
+            vec![
+                "[2026/08/22/16-03-35 by brian m. carlson <carlsson@example.com>] \
+                 brian m. carlson doubted the series.",
+                "[2026/08/22/17-59-09 by Junio C Hamano <gitster@pobox.com>] \
+                 Junio C Hamano endorsed brian m. carlson's stance.",
+            ],
+            "only the extractor's text is corrected, never the citation",
+        );
+
+        threads[0].email_summaries[0].source_excerpt = Some("Mr. Carlsson wrote this.".into());
+        assert_eq!(
+            parse_root_deltas("- [2026/08/22/16-03-35] Carlsson doubted it.", &threads).unwrap()[0]
+                .bullets,
+            vec![
+                "[2026/08/22/16-03-35 by brian m. carlson <carlsson@example.com>] \
+                 Carlsson doubted it."
+            ],
+            "a spelling that the source itself uses is not a misspelling",
         );
     }
 
