@@ -1921,6 +1921,12 @@ const GENERIC_LABELS: [&str; 10] = [
 
 const MAX_ISSUES: usize = 8;
 
+/// Drafts rejected by the structural checks and drafts flagged by the
+/// factual audit are limited separately: a writer that keeps missing
+/// the word window must not leave the audit's findings unrepaired.
+const MAX_STRUCTURAL_REJECTIONS: usize = 4;
+const MAX_AUDIT_ROUNDS: usize = 4;
+
 async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
@@ -1955,8 +1961,10 @@ async fn generate_digest_mode(
     let mut revision: Option<(String, Vec<String>)> = None;
     // Sources are fixed for this mode's retries; only identical accepted text is reusable.
     let mut approved = HashMap::new();
+    let mut structural_rejections = 0;
+    let mut audit_rounds = 0;
 
-    for attempt in 1..=4 {
+    for attempt in 1.. {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
             output_contract(mode, &ids),
@@ -1991,6 +1999,7 @@ async fn generate_digest_mode(
             structural_issues.truncate(MAX_ISSUES);
         }
         if structural_issues.is_empty() {
+            audit_rounds += 1;
             issues = audit_digest(
                 &digest,
                 packets,
@@ -2004,6 +2013,7 @@ async fn generate_digest_mode(
             }
             revision = Some((digest.clone(), issues.clone()));
         } else {
+            structural_rejections += 1;
             issues = structural_issues;
         }
         trace_digest_attempt(label, attempt, "issues.txt", &issues.join("\n"))?;
@@ -2011,12 +2021,16 @@ async fn generate_digest_mode(
             "[digestive] {day} {label} digest rejected:\n{}",
             issues.join("\n"),
         );
+        if structural_rejections == MAX_STRUCTURAL_REJECTIONS || audit_rounds == MAX_AUDIT_ROUNDS {
+            break;
+        }
         correction = format!("\n\n{}", correction_block(&issues));
     }
 
     anyhow::bail!(
         "daily digest ({label}) for {day} failed validation or factual audit \
-         after three corrective retries:\n{}",
+         after {} attempts:\n{}",
+        structural_rejections + audit_rounds,
         issues.join("\n"),
     )
 }
@@ -4622,6 +4636,80 @@ mod tests {
             assert!(input.contains("Source 1."));
             assert!(!input.contains("Source 2."));
         }
+    }
+
+    #[tokio::test]
+    async fn test_structural_rejections_do_not_use_up_the_audit_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let clean = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let too_long = valid_digest(&HUMAN_DIGEST_MODE, HUMAN_DIGEST_MODE.max_words + 1);
+        let flawed = clean.replace(
+            "Prose about the packfile lookup fast path.",
+            "Prose about the packfile lookup fast path. FLAW",
+        );
+        let drafts = AtomicUsize::new(0);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                let user = body["messages"][1]["content"].as_str().unwrap();
+                let content = if system == DAILY_SELECT_AGENT {
+                    r#"["T01","T02","T03","T04"]"#.to_string()
+                } else if system == DAILY_DIGEST_AGENT {
+                    if drafts.fetch_add(1, Ordering::Relaxed) < MAX_STRUCTURAL_REJECTIONS - 1 {
+                        too_long.clone()
+                    } else {
+                        flawed.clone()
+                    }
+                } else if system == DAILY_REVISE_AGENT {
+                    serde_json::json!({
+                        "title": "packfile lookup fast path",
+                        "body": "Prose about the packfile lookup fast path.",
+                    })
+                    .to_string()
+                } else {
+                    assert_eq!(system, DAILY_DIGEST_AUDIT_AGENT);
+                    match user
+                        .lines()
+                        .find(|line| line.starts_with('L') && line.contains("FLAW"))
+                    {
+                        Some(line) => {
+                            let location = user
+                                .lines()
+                                .find_map(|line| line.strip_prefix("AUDIT LOCATION: "))
+                                .unwrap();
+                            let citation = line.split_whitespace().next().unwrap();
+                            format!("- {location} ||| {citation} ||| Remove FLAW")
+                        }
+                        None => "OK".into(),
+                    }
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": content}}]
+                }))
+            })
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+
+        let result = generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(4),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, strip_topic_tags(&clean));
     }
 
     #[tokio::test]
