@@ -96,6 +96,12 @@ to one delta bullet of the *same* packet as the section it appears in.
   Never let one author's name grammatically govern another author's finding.
 - Preserve differences between contributors' positions. Asking whether a
   change is planned is not the same as questioning its feasibility.
+- Keep each person's verb and hedge as the delta states it. A plan or
+  proposal that a person makes is theirs ("proposed", "plans to"), not
+  an agreement; say that someone agreed or accepted only when a delta
+  says so, and name that person. Report a hedged claim ("not sure",
+  "perhaps", "I think", "not strictly") with its hedge, or leave the
+  claim out; never keep the claim and drop the hedge.
 - Do not infer where a reported typo or defect appears. State only the
   location named in the delta.
 - Use a topic short-name, branch name, Message-ID, URL, date, version, or
