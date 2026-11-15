@@ -208,7 +208,7 @@ status section, no topic roundup, and no statistics section. Within that
 structure, preserve all technically consequential deltas in dense prose
 suitable as input to a weekly digest, keeping each packet separate.
 
-Write 800-1400 words. This range is hard: compress or drop the least
+Write 600-1400 words. This range is hard: compress or drop the least
 consequential material rather than overrunning it.
 Code supplies up to five notable topics and twelve in-brief candidates.
 

@@ -1838,7 +1838,7 @@ const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
 
 const AI_DIGEST_MODE: DigestMode = DigestMode {
     label: "ai",
-    min_words: 800,
+    min_words: 600,
     max_words: 1400,
     notable_count: 5,
     brief_limit: 12,
