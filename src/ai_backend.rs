@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -16,7 +17,11 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
-const DEFAULT_AZURE_MODEL: &str = "Mistral-Large-3";
+const DEFAULT_AZURE_MODEL: &str = "mistral-large-4-latest";
+/// The request settings `DEFAULT_AZURE_MODEL` was validated with.
+const DEFAULT_AZURE_REASONING_EFFORT: &str = "low";
+const DEFAULT_AZURE_AUDIT_REASONING_EFFORT: &str = "high";
+const DEFAULT_AZURE_MAX_COMPLETION_TOKENS: &str = "16384";
 const MAX_RETRY_WAIT_SECS: u64 = 300;
 
 /// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
@@ -157,6 +162,37 @@ struct ApiEndpoint<'a> {
     rate_limits: Option<&'a Mutex<RateLimitState>>,
 }
 
+/// Request fields that only some deployments accept.
+#[derive(Clone, Debug, Default)]
+pub struct RequestOptions {
+    pub(crate) reasoning_effort: Option<String>,
+    /// Replaces `reasoning_effort` for audit requests, when set.
+    pub(crate) audit_reasoning_effort: Option<String>,
+    pub(crate) max_completion_tokens: Option<NonZeroU32>,
+}
+
+/// What a chat request is for.
+#[derive(Clone, Copy)]
+enum Purpose {
+    General,
+    Audit,
+}
+
+impl RequestOptions {
+    fn for_purpose(&self, purpose: Purpose) -> Self {
+        match purpose {
+            Purpose::General => self.clone(),
+            Purpose::Audit => Self {
+                reasoning_effort: self
+                    .audit_reasoning_effort
+                    .clone()
+                    .or_else(|| self.reasoning_effort.clone()),
+                ..self.clone()
+            },
+        }
+    }
+}
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -183,6 +219,7 @@ pub enum Backend {
         api_url: String,
         model: String,
         api_key: String,
+        options: RequestOptions,
     },
     /// Deterministic mock for testing.  Returns every Nth word from
     /// the user message (default: every 5th word).
@@ -245,11 +282,17 @@ impl Backend {
         }
     }
 
-    pub fn azure_openai(api_url: String, model: Option<String>, api_key: String) -> Self {
+    pub fn azure_openai(
+        api_url: String,
+        model: Option<String>,
+        api_key: String,
+        options: RequestOptions,
+    ) -> Self {
         Self::AzureOpenAI {
             api_url,
             model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
             api_key,
+            options,
         }
     }
 
@@ -261,6 +304,30 @@ impl Backend {
     /// Like `chat`, but with optional temperature override.
     pub async fn chat_with_options(
         &self,
+        system: &str,
+        user: &str,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        self.chat_for(Purpose::General, system, user, temperature)
+            .await
+    }
+
+    /// Like `chat_with_options`, for factual audits: with
+    /// AZURE_OPENAI_AUDIT_REASONING_EFFORT set, the Azure backend sends
+    /// that reasoning effort instead of AZURE_OPENAI_REASONING_EFFORT.
+    pub async fn chat_audit(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: Option<f32>,
+    ) -> Result<String> {
+        self.chat_for(Purpose::Audit, system, user, temperature)
+            .await
+    }
+
+    async fn chat_for(
+        &self,
+        purpose: Purpose,
         system: &str,
         user: &str,
         temperature: Option<f32>,
@@ -312,6 +379,7 @@ impl Backend {
                 api_url,
                 model,
                 api_key,
+                options,
             } => {
                 let ep = ApiEndpoint {
                     api_url,
@@ -319,7 +387,14 @@ impl Backend {
                     auth: ApiAuth::ApiKey(api_key),
                     rate_limits: None,
                 };
-                chat_api(&ep, system, user, temperature).await
+                chat_api_with(
+                    &ep,
+                    &options.for_purpose(purpose),
+                    system,
+                    user,
+                    temperature,
+                )
+                .await
             }
             #[cfg(test)]
             Backend::Mock { nth_word } => Ok(mock_summarize(user, *nth_word)),
@@ -361,8 +436,14 @@ pub struct BackendArgs {
     /// Use Azure OpenAI Service. Optionally pass the endpoint URL
     /// (falls back to AZURE_OPENAI_ENDPOINT env var).
     /// Reads the API key from AZURE_OPENAI_API_KEY.
-    /// Model defaults to Mistral-Large-3; override via --model or
-    /// AZURE_OPENAI_MODEL env var.
+    /// Model defaults to mistral-large-4-latest; override via --model or
+    /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT and
+    /// AZURE_OPENAI_MAX_COMPLETION_TOKENS are sent as `reasoning_effort`
+    /// (the values a deployment accepts vary by model) and
+    /// `max_completion_tokens`.  AZURE_OPENAI_AUDIT_REASONING_EFFORT
+    /// replaces the reasoning effort of factual-audit requests.  For the
+    /// default model they default to low, 16384 and high; an empty value
+    /// sends nothing.  For any other model they are sent only if set.
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
@@ -397,7 +478,8 @@ impl BackendArgs {
             let model = self
                 .model
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
-            Ok(Backend::azure_openai(api_url, model, api_key))
+            let options = azure_request_options(model.as_deref(), |name| std::env::var(name).ok())?;
+            Ok(Backend::azure_openai(api_url, model, api_key, options))
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
@@ -410,12 +492,61 @@ impl BackendArgs {
     }
 }
 
+/// Parse the completion-token setting: a missing or empty value means no cap.
+fn parse_max_completion_tokens(value: Option<String>) -> Result<Option<NonZeroU32>> {
+    value
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<NonZeroU32>()
+                .context("AZURE_OPENAI_MAX_COMPLETION_TOKENS must be a positive integer")
+        })
+        .transpose()
+}
+
+/// The Azure request settings.  A variable that is set wins, and an empty
+/// one disables its setting.  An unset one gets the value that
+/// `DEFAULT_AZURE_MODEL` was validated with, for that model only: the
+/// values a deployment accepts vary by model, and one that rejects a
+/// setting answers HTTP 400.
+fn azure_request_options(
+    model: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<RequestOptions> {
+    let is_default = model.is_none_or(|m| m == DEFAULT_AZURE_MODEL);
+    let setting = |name: &str, default: &str| match env(name) {
+        None if is_default => Some(default.to_string()),
+        other => other,
+    };
+    Ok(RequestOptions {
+        reasoning_effort: setting(
+            "AZURE_OPENAI_REASONING_EFFORT",
+            DEFAULT_AZURE_REASONING_EFFORT,
+        )
+        .filter(|v| !v.is_empty()),
+        audit_reasoning_effort: setting(
+            "AZURE_OPENAI_AUDIT_REASONING_EFFORT",
+            DEFAULT_AZURE_AUDIT_REASONING_EFFORT,
+        )
+        .filter(|v| !v.is_empty()),
+        max_completion_tokens: parse_max_completion_tokens(setting(
+            "AZURE_OPENAI_MAX_COMPLETION_TOKENS",
+            DEFAULT_AZURE_MAX_COMPLETION_TOKENS,
+        ))?,
+    })
+}
+
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<NonZeroU32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -427,15 +558,62 @@ struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    reasoning_tokens: Option<u64>,
+}
+
+/// One-line token accounting for a response.  Fields the server does
+/// not report are left out.
+fn usage_line(usage: &Usage, finish_reason: Option<&str>) -> String {
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens);
+    let mut line = String::from("[usage]");
+    for (name, tokens) in [
+        ("prompt", usage.prompt_tokens),
+        ("completion", usage.completion_tokens),
+        ("reasoning", reasoning),
+    ] {
+        if let Some(tokens) = tokens {
+            line.push_str(&format!(" {name}={tokens}"));
+        }
+    }
+    if let Some(reason) = finish_reason {
+        line.push_str(&format!(" finish={reason}"));
+    }
+    line
 }
 
 async fn chat_api(
     ep: &ApiEndpoint<'_>,
+    system: &str,
+    user: &str,
+    temperature: Option<f32>,
+) -> Result<String> {
+    chat_api_with(ep, &RequestOptions::default(), system, user, temperature).await
+}
+
+async fn chat_api_with(
+    ep: &ApiEndpoint<'_>,
+    options: &RequestOptions,
     system: &str,
     user: &str,
     temperature: Option<f32>,
@@ -477,6 +655,10 @@ async fn chat_api(
             },
         ],
         temperature,
+        // Mistral Large 4 rejects greedy sampling unless top_p is 1.
+        top_p: (temperature == Some(0.0)).then_some(1.0),
+        reasoning_effort: options.reasoning_effort.clone(),
+        max_completion_tokens: options.max_completion_tokens,
     };
 
     let max_retries: u32 = 5;
@@ -636,6 +818,13 @@ async fn chat_api(
                 &body[..body.len().min(200)]
             )
         })?;
+        if let Some(usage) = &parsed.usage {
+            let finish = parsed
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.as_deref());
+            eprintln!("{}", usage_line(usage, finish));
+        }
         let content = match parsed.choices.into_iter().next() {
             Some(c) => c.message.content,
             None => {
@@ -742,6 +931,34 @@ mod tests {
         .to_string()
     }
 
+    #[test]
+    fn usage_line_reports_only_what_the_server_sent() {
+        let reasoning_model: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":""},
+                "finish_reason":"length"}],
+                "usage":{"prompt_tokens":2154,"completion_tokens":441,
+                "completion_tokens_details":{"reasoning_tokens":437}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_line(
+                reasoning_model.usage.as_ref().unwrap(),
+                reasoning_model.choices[0].finish_reason.as_deref()
+            ),
+            "[usage] prompt=2154 completion=441 reasoning=437 finish=length"
+        );
+
+        let plain_model: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"OK"}}],
+                "usage":{"prompt_tokens":11,"completion_tokens":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_line(plain_model.usage.as_ref().unwrap(), None),
+            "[usage] prompt=11 completion=2"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn chat_api_retries_on_429() {
         use wiremock::matchers::method;
@@ -770,6 +987,192 @@ mod tests {
         };
         let result = chat_api(&ep, "sys", "usr", None).await.unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_api_sends_top_p_only_with_greedy_sampling() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (temperature, top_p) in [(Some(0.0), Some(1.0)), (Some(0.7), None), (None, None)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("top_p").and_then(|v| v.as_f64()) == top_p
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let ep = ApiEndpoint {
+                api_url: &server.uri(),
+                model: "test",
+                auth: ApiAuth::None,
+                rate_limits: None,
+            };
+            let result = chat_api(&ep, "sys", "usr", temperature).await.unwrap();
+            assert_eq!(result, "ok", "temperature {temperature:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_reasoning_effort_only_when_set() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for effort in [Some("low"), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("reasoning_effort").and_then(|v| v.as_str()) == effort
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                reasoning_effort: effort.map(String::from),
+                ..Default::default()
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_audit_reasoning_effort_only_to_audit_requests() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (general, audit, is_audit, expected) in [
+            (Some("low"), Some("high"), false, Some("low")),
+            (Some("low"), Some("high"), true, Some("high")),
+            (Some("low"), None, true, Some("low")),
+            (None, Some("high"), true, Some("high")),
+            (None, Some("high"), false, None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("reasoning_effort").and_then(|v| v.as_str()) == expected
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                reasoning_effort: general.map(String::from),
+                audit_reasoning_effort: audit.map(String::from),
+                ..Default::default()
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            let reply = if is_audit {
+                backend.chat_audit("sys", "usr", None).await
+            } else {
+                backend.chat("sys", "usr").await
+            };
+            assert_eq!(reply.unwrap(), "ok");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_max_completion_tokens_only_when_set() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for cap in [NonZeroU32::new(300), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    body.get("max_completion_tokens").and_then(|v| v.as_u64())
+                        == cap.map(|n| u64::from(n.get()))
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let options = RequestOptions {
+                max_completion_tokens: cap,
+                ..Default::default()
+            };
+            let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
+            assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn max_completion_tokens_setting_must_be_a_positive_integer() {
+        assert_eq!(parse_max_completion_tokens(None).unwrap(), None);
+        assert_eq!(
+            parse_max_completion_tokens(Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_max_completion_tokens(Some("16384".into())).unwrap(),
+            NonZeroU32::new(16384)
+        );
+        for bad in ["0", "-5", "many", "1.5"] {
+            assert!(
+                parse_max_completion_tokens(Some(bad.into())).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    fn azure_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn azure_settings_default_to_the_validated_values_for_the_default_model_only() {
+        for model in [None, Some(DEFAULT_AZURE_MODEL)] {
+            let options = azure_request_options(model, azure_env(&[])).unwrap();
+            assert_eq!(options.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(options.audit_reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(options.max_completion_tokens, NonZeroU32::new(16384));
+        }
+
+        let options = azure_request_options(Some("gpt-4.1"), azure_env(&[])).unwrap();
+        assert_eq!(options.reasoning_effort, None);
+        assert_eq!(options.audit_reasoning_effort, None);
+        assert_eq!(options.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn azure_settings_can_be_overridden_or_disabled_by_their_variables() {
+        let set = azure_env(&[
+            ("AZURE_OPENAI_REASONING_EFFORT", "medium"),
+            ("AZURE_OPENAI_AUDIT_REASONING_EFFORT", "low"),
+            ("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "8192"),
+        ]);
+        let disabled = azure_env(&[
+            ("AZURE_OPENAI_REASONING_EFFORT", ""),
+            ("AZURE_OPENAI_AUDIT_REASONING_EFFORT", ""),
+            ("AZURE_OPENAI_MAX_COMPLETION_TOKENS", ""),
+        ]);
+        for model in [None, Some("gpt-4.1")] {
+            let options = azure_request_options(model, &set).unwrap();
+            assert_eq!(options.reasoning_effort.as_deref(), Some("medium"));
+            assert_eq!(options.audit_reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(options.max_completion_tokens, NonZeroU32::new(8192));
+
+            let options = azure_request_options(model, &disabled).unwrap();
+            assert_eq!(options.reasoning_effort, None);
+            assert_eq!(options.audit_reasoning_effort, None);
+            assert_eq!(options.max_completion_tokens, None);
+        }
     }
 
     #[tokio::test(start_paused = true)]
