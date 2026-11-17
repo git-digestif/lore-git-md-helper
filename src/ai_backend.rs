@@ -18,6 +18,10 @@ const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
 const GITHUB_MODELS_URL: &str = "https://models.github.ai/inference";
 const DEFAULT_GITHUB_MODELS_MODEL: &str = "gpt-4.1";
 const DEFAULT_AZURE_MODEL: &str = "mistral-large-4-latest";
+/// The request settings `DEFAULT_AZURE_MODEL` was validated with.
+const DEFAULT_AZURE_REASONING_EFFORT: &str = "low";
+const DEFAULT_AZURE_AUDIT_REASONING_EFFORT: &str = "high";
+const DEFAULT_AZURE_MAX_COMPLETION_TOKENS: &str = "16384";
 const MAX_RETRY_WAIT_SECS: u64 = 300;
 
 /// Exponential backoff: 10s, 20s, 40s, 80s, capped at 120s.
@@ -434,10 +438,12 @@ pub struct BackendArgs {
     /// Reads the API key from AZURE_OPENAI_API_KEY.
     /// Model defaults to mistral-large-4-latest; override via --model or
     /// AZURE_OPENAI_MODEL env var.  AZURE_OPENAI_REASONING_EFFORT and
-    /// AZURE_OPENAI_MAX_COMPLETION_TOKENS, if set, are sent as
-    /// `reasoning_effort` (the values a deployment accepts vary by
-    /// model) and `max_completion_tokens`.  AZURE_OPENAI_AUDIT_REASONING_EFFORT,
-    /// if set, replaces the reasoning effort of factual-audit requests.
+    /// AZURE_OPENAI_MAX_COMPLETION_TOKENS are sent as `reasoning_effort`
+    /// (the values a deployment accepts vary by model) and
+    /// `max_completion_tokens`.  AZURE_OPENAI_AUDIT_REASONING_EFFORT
+    /// replaces the reasoning effort of factual-audit requests.  For the
+    /// default model they default to low, 16384 and high; an empty value
+    /// sends nothing.  For any other model they are sent only if set.
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
@@ -472,17 +478,7 @@ impl BackendArgs {
             let model = self
                 .model
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
-            let options = RequestOptions {
-                reasoning_effort: std::env::var("AZURE_OPENAI_REASONING_EFFORT")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-                audit_reasoning_effort: std::env::var("AZURE_OPENAI_AUDIT_REASONING_EFFORT")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-                max_completion_tokens: parse_max_completion_tokens(
-                    std::env::var("AZURE_OPENAI_MAX_COMPLETION_TOKENS").ok(),
-                )?,
-            };
+            let options = azure_request_options(model.as_deref(), |name| std::env::var(name).ok())?;
             Ok(Backend::azure_openai(api_url, model, api_key, options))
         } else {
             let mut b = Backend::api_from_env()?;
@@ -496,7 +492,7 @@ impl BackendArgs {
     }
 }
 
-/// Parse AZURE_OPENAI_MAX_COMPLETION_TOKENS: unset or empty means no cap.
+/// Parse the completion-token setting: a missing or empty value means no cap.
 fn parse_max_completion_tokens(value: Option<String>) -> Result<Option<NonZeroU32>> {
     value
         .filter(|v| !v.is_empty())
@@ -505,6 +501,38 @@ fn parse_max_completion_tokens(value: Option<String>) -> Result<Option<NonZeroU3
                 .context("AZURE_OPENAI_MAX_COMPLETION_TOKENS must be a positive integer")
         })
         .transpose()
+}
+
+/// The Azure request settings.  A variable that is set wins, and an empty
+/// one disables its setting.  An unset one gets the value that
+/// `DEFAULT_AZURE_MODEL` was validated with, for that model only: the
+/// values a deployment accepts vary by model, and one that rejects a
+/// setting answers HTTP 400.
+fn azure_request_options(
+    model: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<RequestOptions> {
+    let is_default = model.is_none_or(|m| m == DEFAULT_AZURE_MODEL);
+    let setting = |name: &str, default: &str| match env(name) {
+        None if is_default => Some(default.to_string()),
+        other => other,
+    };
+    Ok(RequestOptions {
+        reasoning_effort: setting(
+            "AZURE_OPENAI_REASONING_EFFORT",
+            DEFAULT_AZURE_REASONING_EFFORT,
+        )
+        .filter(|v| !v.is_empty()),
+        audit_reasoning_effort: setting(
+            "AZURE_OPENAI_AUDIT_REASONING_EFFORT",
+            DEFAULT_AZURE_AUDIT_REASONING_EFFORT,
+        )
+        .filter(|v| !v.is_empty()),
+        max_completion_tokens: parse_max_completion_tokens(setting(
+            "AZURE_OPENAI_MAX_COMPLETION_TOKENS",
+            DEFAULT_AZURE_MAX_COMPLETION_TOKENS,
+        ))?,
+    })
 }
 
 #[derive(Serialize)]
@@ -1096,6 +1124,54 @@ mod tests {
                 parse_max_completion_tokens(Some(bad.into())).is_err(),
                 "{bad:?} should be rejected"
             );
+        }
+    }
+
+    fn azure_env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn azure_settings_default_to_the_validated_values_for_the_default_model_only() {
+        for model in [None, Some(DEFAULT_AZURE_MODEL)] {
+            let options = azure_request_options(model, azure_env(&[])).unwrap();
+            assert_eq!(options.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(options.audit_reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(options.max_completion_tokens, NonZeroU32::new(16384));
+        }
+
+        let options = azure_request_options(Some("gpt-4.1"), azure_env(&[])).unwrap();
+        assert_eq!(options.reasoning_effort, None);
+        assert_eq!(options.audit_reasoning_effort, None);
+        assert_eq!(options.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn azure_settings_can_be_overridden_or_disabled_by_their_variables() {
+        let set = azure_env(&[
+            ("AZURE_OPENAI_REASONING_EFFORT", "medium"),
+            ("AZURE_OPENAI_AUDIT_REASONING_EFFORT", "low"),
+            ("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "8192"),
+        ]);
+        let disabled = azure_env(&[
+            ("AZURE_OPENAI_REASONING_EFFORT", ""),
+            ("AZURE_OPENAI_AUDIT_REASONING_EFFORT", ""),
+            ("AZURE_OPENAI_MAX_COMPLETION_TOKENS", ""),
+        ]);
+        for model in [None, Some("gpt-4.1")] {
+            let options = azure_request_options(model, &set).unwrap();
+            assert_eq!(options.reasoning_effort.as_deref(), Some("medium"));
+            assert_eq!(options.audit_reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(options.max_completion_tokens, NonZeroU32::new(8192));
+
+            let options = azure_request_options(model, &disabled).unwrap();
+            assert_eq!(options.reasoning_effort, None);
+            assert_eq!(options.audit_reasoning_effort, None);
+            assert_eq!(options.max_completion_tokens, None);
         }
     }
 
