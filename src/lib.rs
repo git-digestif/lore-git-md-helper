@@ -17,6 +17,7 @@ pub mod thread_file;
 
 pub mod ai_backend;
 pub mod annotate;
+pub mod azure_cli_token;
 pub mod date_range;
 pub mod date_util;
 pub mod digestive;
