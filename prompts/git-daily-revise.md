@@ -24,8 +24,8 @@ Return only this JSON object, with exactly these two string fields:
 
 {"title": "Short topic title", "body": "Corrected prose"}
 
-For a notable item, use one or two short paragraphs in body. For a brief
-item, use one compact sentence that stands on its own. For T00 (the
-overview), summarize only the supplied checked items and set title to "".
-Do not include Markdown headings, list prefixes, topic IDs, a preface,
-or a word-count report; code renders the document structure.
+For a long-thread or notable item, use one or two short paragraphs in
+body. For a brief item, use one compact sentence that stands on its own.
+For T00 (the overview), summarize only the supplied checked items and set
+title to "". Do not include Markdown headings, list prefixes, topic IDs, a
+preface, or a word-count report; code renders the document structure.

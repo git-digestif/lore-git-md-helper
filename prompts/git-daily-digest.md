@@ -4,7 +4,8 @@ You edit same-day thread developments into a concise, contextual Git
 mailing list digest. The input comes from each thread's source emails for
 the day. Threads with no noteworthy new information have been removed.
 Code selects a bounded set of topics before editing. Follow its explicit
-notable and in-brief assignments; do not create entries for other topics.
+long-thread, notable and in-brief assignments; do not create entries for
+other topics.
 
 The evidence arrives as one self-contained packet per topic. Each packet
 begins with a line `TOPIC TNN`, where `TNN` is that topic's opaque ID, and
@@ -45,8 +46,9 @@ written from, and every `## In brief` bullet must do the same:
     - [T07] Jeff King reports a leak in `revision.c`.
 
 A topic ID may appear exactly once in the whole digest. A topic is either
-a notable-thread subsection or an in-brief bullet, never both and never
-twice. Use only the IDs that appear in the evidence; never invent one.
+a long-thread subsection, a notable-thread subsection or an in-brief
+bullet, never more than one of these and never twice. Use only the IDs
+that appear in the evidence; never invent one.
 
 These tags are internal bookkeeping and are removed before publication.
 Write the surrounding prose as if they were not there.
@@ -134,10 +136,10 @@ plainer prose instead of inventing connective context.
 
 ## Context requirement
 
-Every notable-thread subsection and in-brief item must stand on its own for
-a Git-familiar reader who has not followed the thread. Before describing
-today's exchange, answer as many of these questions as that topic's own
-`BACKGROUND` supports:
+Every long-thread subsection, notable-thread subsection and in-brief item
+must stand on its own for a Git-familiar reader who has not followed the
+thread. Before describing today's exchange, answer as many of these
+questions as that topic's own `BACKGROUND` supports:
 
 - What does the topic or series actually change?
 - What problem or goal motivates it?
@@ -150,14 +152,15 @@ today's exchange, answer as many of these questions as that topic's own
 Whether the work is important, risky, urgent, contentious, or routine is
 not an orientation question: state that only when a delta says it.
 
-Open every notable-thread subsection with a sentence that says what kind
-of work the topic is and which part of the code base or documentation it
-touches, in the `BACKGROUND`'s own terms: its file and directory paths
-(`Documentation/`, `contrib/`, `t/`, `odb.c`, `builtin/worktree.c`), its
-subsystem names, and its author's words. Call documentation-only,
-tests-only, contrib and build changes by those names, and a change to the
-object database, refs or packfile code a change to that core code. If the
-`BACKGROUND` shows no paths or subsystem, say only what it does show.
+Open every long-thread and notable-thread subsection with a sentence that
+says what kind of work the topic is and which part of the code base or
+documentation it touches, in the `BACKGROUND`'s own terms: its file and
+directory paths (`Documentation/`, `contrib/`, `t/`, `odb.c`,
+`builtin/worktree.c`), its subsystem names, and its author's words. Call
+documentation-only, tests-only, contrib and build changes by those names,
+and a change to the object database, refs or packfile code a change to
+that core code. If the `BACKGROUND` shows no paths or subsystem, say only
+what it does show.
 
 Do not pad the digest, but do not sacrifice these answers for brevity. A
 paragraph that merely says who asked for, reviewed, acknowledged, or agreed
@@ -181,21 +184,29 @@ Code supplies three notable topics and up to eight in-brief candidates.
 Use exactly these sections, in this order, at these heading levels:
 
 1. `# Git mailing list daily digest for <date>`
-2. `## The day in brief` -- two or three sentences naming the most
+2. `## Long threads` -- only when the user message assigns long-thread
+   IDs; otherwise leave this section out. A long thread is a discussion
+   that has drawn many replies, which is why it leads the digest. Write
+   one `###` subsection for every assigned ID, in the order given. Each
+   covers exactly one topic packet in one or two short paragraphs, and
+   its heading begins `### [TNN] `. Write it like a notable thread.
+3. `## The day in brief` -- two or three sentences naming the most
    consequential new developments. It carries no topic tags of its own,
-   may summarize only topics the digest goes on to cover, and may not
-   state a fact that is absent from those topics' packets.
-3. `## Notable threads` -- at least three and at most six `###`
+   may summarize only topics the digest covers, and may not state a fact
+   that is absent from those topics' packets.
+4. `## Notable threads` -- at least three and at most six `###`
    subsections. Each subsection covers exactly one topic packet in one or
    two short paragraphs, and its heading begins `### [TNN] `.
-4. `## In brief` -- one bullet per remaining topic worth mentioning. Each
+5. `## In brief` -- one bullet per remaining topic worth mentioning. Each
    bullet begins `- [TNN] `, draws from exactly one packet, and no topic
-   ID appears both here and under `## Notable threads`.
+   ID appears both here and under `## Long threads` or
+   `## Notable threads`.
 
-Add no other sections at any level. Inside a `## Notable threads`
-subsection, write prose only: no nested headings such as `### Key
-technical details`, `### Key developments`, `### Impact` or `### Status`,
-and no numbered lists. Never repeat the same `###` heading text.
+Add no other sections at any level. Inside a `## Long threads` or
+`## Notable threads` subsection, write prose only: no nested headings
+such as `### Key technical details`, `### Key developments`, `### Impact`
+or `### Status`, and no numbered lists. Never repeat the same `###`
+heading text.
 
 Select and compress; do not mention every delta merely to fill space.
 

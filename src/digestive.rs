@@ -1974,6 +1974,8 @@ const AI_DIGEST_MODE: DigestMode = DigestMode {
 
 #[derive(Debug)]
 struct TopicSelection {
+    /// Long threads with a noteworthy update today; they lead the digest.
+    long: Vec<String>,
     notable: Vec<String>,
     brief: Vec<String>,
 }
@@ -1983,6 +1985,7 @@ impl TopicSelection {
         let mut brief = ranking.split_off(mode.notable_count.min(ranking.len()));
         brief.truncate(mode.brief_limit);
         Self {
+            long: Vec::new(),
             notable: ranking,
             brief,
         }
@@ -2029,6 +2032,7 @@ async fn select_digest_topics(
 ) -> Result<TopicSelection> {
     if is_mock(backend) {
         return Ok(TopicSelection {
+            long: Vec::new(),
             notable: packets.iter().map(|packet| packet.id.clone()).collect(),
             brief: Vec::new(),
         });
@@ -2071,32 +2075,58 @@ async fn select_digest_topics(
 }
 
 fn selection_issue(digest: &str, selection: &TopicSelection) -> Option<String> {
-    let notable: Vec<_> = audit_sections(digest)
-        .into_iter()
-        .filter(|section| {
-            section
-                .lines
-                .first()
-                .is_some_and(|(_, line)| line.trim_start().starts_with("### "))
-        })
-        .filter_map(|section| section.topic_id)
-        .collect();
-    if notable.len() == selection.notable.len()
-        && selection
-            .notable
+    let sections = audit_sections(digest);
+    let headings = |long: bool| -> Vec<&str> {
+        sections
             .iter()
-            .all(|id| notable.contains(&id.as_str()))
-    {
-        None
-    } else {
-        Some(format!(
+            .filter(|section| section.long == long)
+            .filter(|section| {
+                section
+                    .lines
+                    .first()
+                    .is_some_and(|(_, line)| line.trim_start().starts_with("### "))
+            })
+            .filter_map(|section| section.topic_id)
+            .collect()
+    };
+    let is_exactly = |found: Vec<&str>, expected: &[String]| {
+        found.len() == expected.len() && expected.iter().all(|id| found.contains(&id.as_str()))
+    };
+    let has_long_section = digest.lines().any(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .is_some_and(|heading| label_key(heading) == "long threads")
+    });
+    let mut issues = Vec::new();
+    if selection.long.is_empty() {
+        if has_long_section {
+            issues.push(
+                "no topic is assigned to `## Long threads`; leave that section out".to_string(),
+            );
+        }
+    } else if !is_exactly(headings(true), &selection.long) {
+        issues.push(format!(
+            "long-thread headings under `## Long threads` must use exactly \
+             these selected IDs: {}",
+            selection.long.join(", ")
+        ));
+    }
+    if !is_exactly(headings(false), &selection.notable) {
+        issues.push(format!(
             "notable headings must use exactly these selected IDs: {}",
             selection.notable.join(", ")
-        ))
+        ));
     }
+    (!issues.is_empty()).then(|| issues.join("; "))
 }
 
 const DIGEST_H2_SEQUENCE: [&str; 3] = ["the day in brief", "notable threads", "in brief"];
+const DIGEST_H2_SEQUENCE_WITH_LONG: [&str; 4] = [
+    "long threads",
+    "the day in brief",
+    "notable threads",
+    "in brief",
+];
 
 const GENERIC_LABELS: [&str; 10] = [
     "key details",
@@ -2134,19 +2164,30 @@ async fn generate_digest_mode(
     let label = mode.label;
     let selection = select_digest_topics(day, mode, packets, backend).await?;
     let ids: Vec<_> = selection
-        .notable
+        .long
         .iter()
+        .chain(&selection.notable)
         .chain(&selection.brief)
         .map(String::as_str)
         .collect();
+    let long_ids: Vec<_> = selection.long.iter().map(String::as_str).collect();
     let selected = ids.iter().map(|id| {
         packets
             .iter()
             .find(|packet| packet.id == *id)
             .expect("selected ID was validated against source packets")
     });
+    let long_line = if long_ids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Use exactly these IDs for long-thread headings: {}.\n",
+            long_ids.join(", ")
+        )
+    };
     let user_msg = format!(
         "Date: {day}\n\nSELECTED TOPICS ONLY:\n\
+         {long_line}\
          Use exactly these IDs for notable headings: {}.\n\
          Other entries may only use these in-brief IDs: {}.\n\
          This is a selected subset, not an inventory of all activity.\n\n{}",
@@ -2169,7 +2210,7 @@ async fn generate_digest_mode(
     for attempt in 1.. {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
-            output_contract(mode, &ids),
+            output_contract(mode, &ids, &long_ids),
         );
         let raw = if let Some((draft, findings)) = revision.take() {
             revise_digest_items(
@@ -2428,6 +2469,8 @@ fn trace_digest_attempt(label: &str, attempt: usize, suffix: &str, content: &str
 
 struct AuditSection<'a> {
     topic_id: Option<&'a str>,
+    /// Whether the item sits under `## Long threads`.
+    long: bool,
     lines: Vec<(usize, &'a str)>,
 }
 
@@ -2435,6 +2478,7 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
     let mut sections: Vec<AuditSection<'_>> = Vec::new();
     let mut current = None;
     let mut in_brief = false;
+    let mut in_long = false;
     let mut fenced = false;
     for (index, line) in digest.lines().enumerate() {
         let trimmed = line.trim();
@@ -2443,9 +2487,11 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
                 current = None;
                 let heading = label_key(heading);
                 in_brief = heading == "in brief";
+                in_long = heading == "long threads";
                 if heading == "the day in brief" {
                     sections.push(AuditSection {
                         topic_id: None,
+                        long: false,
                         lines: Vec::new(),
                     });
                     current = Some(sections.len() - 1);
@@ -2461,6 +2507,7 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
             if let Some(topic_id) = item.and_then(|text| split_topic_tag(text).0) {
                 sections.push(AuditSection {
                     topic_id: Some(topic_id),
+                    long: in_long,
                     lines: Vec::new(),
                 });
                 current = Some(sections.len() - 1);
@@ -2618,14 +2665,29 @@ fn parse_audit_verdict(
     Ok(issues)
 }
 
-fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
+fn output_contract(mode: &DigestMode, ids: &[&str], long_ids: &[&str]) -> String {
+    let (long_heading, long_rule) = if long_ids.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            "`## Long threads`, ".to_string(),
+            format!(
+                "- Exactly one level-3 heading for each long-thread ID ({}), all \
+                 between `## Long threads` and `## The day in brief`, each naming \
+                 one thread's actual work and subsystem. No other topic goes under \
+                 `## Long threads`.\n",
+                long_ids.join(", "),
+            ),
+        )
+    };
     format!(
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
          - Length: {}-{} words, excluding internal topic tags. Aim for {} words \
          so there is room for correction. Omit lower-priority topics rather \
          than overrun or strip necessary context.\n\
          - Exactly these level-2 headings, in this order and no others: \
-         `## The day in brief`, `## Notable threads`, `## In brief`.\n\
+         {long_heading}`## The day in brief`, `## Notable threads`, `## In brief`.\n\
+         {long_rule}\
          - Exactly three to six level-3 headings, all between \
          `## Notable threads` and `## In brief`, each naming one thread's \
          actual work and subsystem, and no two alike.\n\
@@ -2634,16 +2696,17 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
          the one topic packet that section is written from. The only valid \
          IDs are: {}.\n\
          - Each selected topic ID appears only once in the whole digest: a topic \
-         is either a notable-thread subsection or an in-brief bullet, never \
-         both, and never twice. You are not required to cover every packet. \
+         is either a long-thread or notable-thread subsection or an in-brief \
+         bullet, never more than one of these, and never twice. You are not \
+         required to cover every notable or in-brief packet. \
          Select only as many topics as fit the word budget with useful context.\n\
          - Never write `no new developments`, `nothing new`, or any other \
          inactivity phrase. A topic you have nothing to say about is left \
          out; it is never described as quiet.\n\
-         - Inside `## Notable threads`: prose only. No deeper headings, no \
-         numbered lists, and no label headings or bold pseudo-labels such as \
-         `Key details`, `Key developments`, `Status`, `Impact`, \
-         `What changed` or `Why it matters`.\n\
+         - Inside `## Long threads` and `## Notable threads`: prose only. No \
+         deeper headings, no numbered lists, and no label headings or bold \
+         pseudo-labels such as `Key details`, `Key developments`, `Status`, \
+         `Impact`, `What changed` or `Why it matters`.\n\
          - Print no date other than the one in the title, and never print a \
          `Thread root:` marker or a date-key such as `2026/05/22`.\n\
          - Add no statistics, roundup, integration-status or outlook section.",
@@ -2834,6 +2897,7 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
     let (mut h2, mut h3, mut tags): (Vec<String>, Vec<String>, Vec<&str>) =
         (Vec::new(), Vec::new(), Vec::new());
     let mut section = 0;
+    let mut notable_h3 = 0;
     let mut fenced = false;
     let mut title_count = 0;
     let mut extra_prose = 0;
@@ -2863,6 +2927,8 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                 in_brief_item = false;
                 let key = label_key(text);
                 section = match key.as_str() {
+                    "long threads" => 3,
+                    "the day in brief" => 0,
                     "notable threads" => 1,
                     "in brief" => 2,
                     _ => section,
@@ -2876,10 +2942,11 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                     None => untagged += 1,
                 }
                 h3.push(label_key(named));
-                outside += usize::from(section != 1);
+                notable_h3 += usize::from(section == 1);
+                outside += usize::from(!matches!(section, 1 | 3));
                 generic += usize::from(is_generic_label(named));
             }
-            0 if section == 1 => {
+            0 if matches!(section, 1 | 3) => {
                 numbered += usize::from(numbered_re.is_match(line));
                 generic += usize::from(
                     bold_re
@@ -2937,18 +3004,19 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                 .into(),
         );
     }
-    if h2 != DIGEST_H2_SEQUENCE {
+    if h2 != DIGEST_H2_SEQUENCE && h2 != DIGEST_H2_SEQUENCE_WITH_LONG {
         issues.push(format!(
             "there are {} level-2 headings; they must be exactly \
+             `## Long threads` (only when long-thread IDs are assigned), \
              `## The day in brief`, `## Notable threads` and `## In brief`, \
              in that order and nothing else",
             h2.len(),
         ));
     }
-    if !(3..=6).contains(&h3.len()) {
+    if !(3..=6).contains(&notable_h3) {
         issues.push(format!(
-            "there are {} level-3 headings; there must be three to six",
-            h3.len(),
+            "there are {notable_h3} level-3 headings under `## Notable \
+             threads`; there must be three to six",
         ));
     }
     if untagged > 0 {
@@ -2984,7 +3052,7 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
     for (count, message) in [
         (
             outside,
-            "level-3 heading(s) sit outside `## Notable threads`",
+            "level-3 heading(s) sit outside `## Notable threads` and `## Long threads`",
         ),
         (
             h3.len() - unique.len(),
@@ -3001,7 +3069,8 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
         ),
         (
             numbered,
-            "numbered list item(s) inside `## Notable threads`; write prose there",
+            "numbered list item(s) inside `## Notable threads` or `## Long threads`; \
+             write prose there",
         ),
         (
             roots,
@@ -4737,6 +4806,7 @@ mod tests {
     #[test]
     fn test_selected_notable_roles_are_enforced() {
         let selection = TopicSelection {
+            long: Vec::new(),
             notable: vec!["T01".into(), "T02".into(), "T03".into()],
             brief: vec!["T04".into()],
         };
@@ -5347,7 +5417,7 @@ Prose about completing subcommands of the new history command.
             }
             let range = format!("{}-{} words", mode.min_words, mode.max_words);
             assert!(DAILY_DIGEST_AGENT.contains(&range));
-            assert!(output_contract(mode, &VALID_IDS).contains(&range));
+            assert!(output_contract(mode, &VALID_IDS, &[]).contains(&range));
         }
     }
 
@@ -7123,5 +7193,71 @@ Prose about completing subcommands of the new history command.
         assert!(ledger.day(days[2]).is_some());
         assert_eq!(ledger.day(days[1]), None);
         assert_eq!(ledger.day(days[0]), None);
+    }
+
+    /// `valid_digest` with a `## Long threads` section ahead of the day
+    /// in brief.
+    fn digest_with_long_threads(ids: &[&str]) -> String {
+        let section: String = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "### [{id}] long discussion {id}\n\n\
+                     Prose about the long discussion {id}.\n\n"
+                )
+            })
+            .collect();
+        valid_digest(&HUMAN_DIGEST_MODE, 0).replace(
+            "## The day in brief",
+            &format!("## Long threads\n\n{section}## The day in brief"),
+        )
+    }
+
+    #[test]
+    fn test_a_long_threads_section_is_bound_to_the_assigned_ids() {
+        let ids = ["T01", "T02", "T03", "T04", "T05", "T06"];
+        let selection = |long: &[&str]| TopicSelection {
+            long: long.iter().map(|id| id.to_string()).collect(),
+            notable: vec!["T01".into(), "T02".into(), "T03".into()],
+            brief: vec!["T04".into()],
+        };
+        let digest = digest_with_long_threads(&["T06", "T05"]);
+
+        // The section is part of a valid shape, and its headings are not
+        // counted as notable ones.
+        assert!(validate_digest(&digest, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY).is_empty());
+        assert_eq!(selection_issue(&digest, &selection(&["T05", "T06"])), None);
+        let fewer = digest.replace("### [T03] completion for git history", "Prose.");
+        let issues = validate_digest(&fewer, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("there are 2 level-3 headings"))
+        );
+        let numbered = digest.replace("Prose about the long discussion T05.", "1. One.\n2. Two.");
+        let issues = validate_digest(&numbered, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("2 numbered list item(s)"))
+        );
+
+        // The headings must be exactly the assigned ones, under the section.
+        let issue = selection_issue(&digest, &selection(&["T05"])).unwrap();
+        assert!(issue.contains("these selected IDs: T05"), "{issue}");
+        let omitted = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let issue = selection_issue(&omitted, &selection(&["T05", "T06"])).unwrap();
+        assert!(issue.contains("long-thread headings"), "{issue}");
+        let issue = selection_issue(&digest, &selection(&[])).unwrap();
+        assert!(
+            issue.contains("no topic is assigned to `## Long threads`"),
+            "{issue}"
+        );
+        let bare = omitted.replace(
+            "## The day in brief",
+            "## Long threads\n\nNothing to report.\n\n## The day in brief",
+        );
+        let issue = selection_issue(&bare, &selection(&[])).unwrap();
+        assert!(issue.contains("no topic is assigned"), "{issue}");
     }
 }
