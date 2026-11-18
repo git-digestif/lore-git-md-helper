@@ -78,7 +78,9 @@ Ollama, GitHub Models, and Azure OpenAI. It includes retry logic with
 exponential backoff for 429 rate limits, 400 Bad Request, and 5xx
 server errors, retry-after header support with a cap, and empty
 response detection. API errors are propagated as hard failures rather
-than producing error markers in the output.
+than producing error markers in the output. The Azure backend
+authenticates with an API key or, with `--azure-cli-token`, with an
+access token from the Azure CLI (`azure_cli_token`).
 
 A `msgid-notes` tool maps Message-IDs to blob OIDs via Git notes
 (stage 3 groundwork).
@@ -232,6 +234,8 @@ rewrite that could have changed file contents.
 - `src/fast_import.rs` — `FastImport` struct for git fast-import protocol
 - `src/ai_backend.rs` — shared AI backend abstraction (API, Copilot CLI,
   Ollama, GitHub Models, Azure OpenAI, Mock for testing)
+- `src/azure_cli_token.rs` — Azure CLI access tokens for the Azure
+  backend, kept until shortly before they expire
 - `src/git_util.rs` — Git helpers: source_commit_from_ref, resolve_ref,
   latest_trailer, latest_digest, last_digest_day
 - `src/cat_file.rs` — `CatFile` struct for git cat-file batch protocol
