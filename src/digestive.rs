@@ -2753,7 +2753,9 @@ fn output_contract(mode: &DigestMode, ids: &[&str], long_ids: &[&str]) -> String
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
          - Length: {}-{} words, excluding internal topic tags. Aim for {} words \
          so there is room for correction. Omit lower-priority topics rather \
-         than overrun or strip necessary context.\n\
+         than overrun or strip necessary context: when over, drop in-brief \
+         bullets first (an empty `## In brief` section is fine), then shorten \
+         notable subsections, and shorten long-thread subsections last.\n\
          - Exactly these level-2 headings, in this order and no others: \
          {long_heading}`## The day in brief`, `## Notable threads`, `## In brief`.\n\
          {long_rule}\

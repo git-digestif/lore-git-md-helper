@@ -175,8 +175,12 @@ do not guess it, and do not spend words remarking on its absence.
 ## Human mode
 
 Write 500-900 words. This range is absolute. Count the words of the draft;
-if it exceeds 900, compress the prose and drop the least consequential
-topics until it fits. Never overrun it in order to cover one more thread.
+if it exceeds 900, cut in this order until it fits: drop in-brief bullets,
+least consequential first, until the `## In brief` section is empty if need
+be; then shorten notable subsections; shorten long-thread subsections last.
+Code requires every assigned long-thread subsection and at least three
+notable ones, so never drop those. Never overrun the range in order to
+cover one more thread.
 Aim for 700 words. Having a packet does not require including that topic;
 select fewer topics rather than removing the context that makes them useful.
 Code supplies up to five long-thread topics, three notable topics and up
@@ -224,8 +228,8 @@ status section, no topic roundup, and no statistics section. Within that
 structure, preserve all technically consequential deltas in dense prose
 suitable as input to a weekly digest, keeping each packet separate.
 
-Write 600-1400 words. This range is hard: compress or drop the least
-consequential material rather than overrunning it.
+Write 600-1400 words. This range is hard: when the draft is over, cut in
+the order given for human mode rather than overrunning it.
 Code supplies up to five long-thread topics, five notable topics and
 twelve in-brief candidates.
 
