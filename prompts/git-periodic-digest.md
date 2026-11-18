@@ -26,10 +26,31 @@ You will receive:
   them, not to re-filter raw data.
 - The **granularity**: "weekly" or "monthly".
 
+Daily digests list the threads that drew the most replies under
+`## Long threads`. A line such as `*Long thread: 77 replies so far from 6
+participants over 56 days; 8 messages that day.*` stands directly under
+the heading of every thread that is long, wherever it appears. Weekly
+digests carry the same line without the part after the semicolon.
+
 ## Structure
 
 Write the digest as free-flowing prose, divided into natural sections with
 Markdown headings. The sections are:
+
+**Long threads.** Only when a sub-period digest has a long-thread line;
+otherwise leave this section out. Open the digest with a `## Long
+threads` section, ahead of the period in brief. Write one `###`
+subsection for every thread that any sub-period digest marks as long,
+merging the days on which it appears (the same work, usually under the
+same or a similar heading), the thread with the most replies first.
+Directly under each heading, copy the long-thread line of the sub-period
+digest in which that thread's reply count is highest, without the part
+after the semicolon, for example `*Long thread: 77 replies so far from 6
+participants over 56 days.*`. Never write such a line yourself and never
+change a figure in one. Follow it with one paragraph of roughly 60--100
+words on how the thread developed during the period and where it stands
+at the end. Do not cover these threads again under Key developments or
+In brief.
 
 **The period in brief.** Two to four sentences. State the period, the
 overall volume and tone (how many active days, whether traffic was heavy or

@@ -122,7 +122,13 @@ that states its size from the archive; the editor never writes it, and
 its words count toward the digest's word window.  The items of the
 leading long threads also see the thread's recent earlier developments
 from its ledger, which are evidence for the audit but never today's
-news.
+news.  Weekly and monthly digests lead with their long threads too: the
+editor merges a thread's days into one subsection and copies the count
+line of the sub-period digest with the most replies, leaving out the
+single-day count after the semicolon.  Code rejects a draft whose count
+lines are not such copies, or whose leading section is missing or
+superfluous, and asks once more; a second failing draft is published
+without the count lines that are not copies.
 
 Prompt files in `prompts/` define the AI agent behavior:
 - `git-digest-email.md`: per-email summarization with taxonomy
