@@ -9,6 +9,8 @@ use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::azure_cli_token::CliToken;
+
 const DEFAULT_API_URL: &str = "https://models.inference.ai.azure.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
 
@@ -193,6 +195,14 @@ impl RequestOptions {
     }
 }
 
+/// How the Azure OpenAI backend authenticates.
+pub enum AzureAuth {
+    /// An API key, sent in the `api-key` header.
+    ApiKey(String),
+    /// Access tokens from the Azure CLI, sent as bearer tokens.
+    CliToken(CliToken),
+}
+
 /// An AI chat backend.
 pub enum Backend {
     /// OpenAI-compatible chat completions API.
@@ -214,11 +224,11 @@ pub enum Backend {
         token: String,
         rate_limits: Mutex<RateLimitState>,
     },
-    /// Azure OpenAI Service — uses `api-key` header for authentication.
+    /// Azure OpenAI Service.
     AzureOpenAI {
         api_url: String,
         model: String,
-        api_key: String,
+        auth: AzureAuth,
         options: RequestOptions,
     },
     /// Deterministic mock for testing.  Returns every Nth word from
@@ -288,10 +298,30 @@ impl Backend {
         api_key: String,
         options: RequestOptions,
     ) -> Self {
+        Self::azure(api_url, model, AzureAuth::ApiKey(api_key), options)
+    }
+
+    /// Like `azure_openai`, but authenticating with the access tokens
+    /// of `tokens` instead of an API key.
+    pub fn azure_openai_with_tokens(
+        api_url: String,
+        model: Option<String>,
+        tokens: CliToken,
+        options: RequestOptions,
+    ) -> Self {
+        Self::azure(api_url, model, AzureAuth::CliToken(tokens), options)
+    }
+
+    fn azure(
+        api_url: String,
+        model: Option<String>,
+        auth: AzureAuth,
+        options: RequestOptions,
+    ) -> Self {
         Self::AzureOpenAI {
             api_url,
             model: model.unwrap_or_else(|| DEFAULT_AZURE_MODEL.to_string()),
-            api_key,
+            auth,
             options,
         }
     }
@@ -378,13 +408,24 @@ impl Backend {
             Backend::AzureOpenAI {
                 api_url,
                 model,
-                api_key,
+                auth,
                 options,
             } => {
+                let token;
+                let auth = match auth {
+                    AzureAuth::ApiKey(api_key) => ApiAuth::ApiKey(api_key),
+                    AzureAuth::CliToken(tokens) => {
+                        token = tokens
+                            .get()
+                            .await
+                            .context("could not get an Azure access token from the Azure CLI")?;
+                        ApiAuth::Bearer(&token)
+                    }
+                };
                 let ep = ApiEndpoint {
                     api_url,
                     model,
-                    auth: ApiAuth::ApiKey(api_key),
+                    auth,
                     rate_limits: None,
                 };
                 chat_api_with(
@@ -414,7 +455,7 @@ impl Backend {
 ///
 /// Embed in any clap `Args` struct with `#[command(flatten)]` to get
 /// `--copilot-cli`, `--ollama`, `--github-models`, `--azure-openai`,
-/// and `--model` flags.
+/// `--azure-cli-token` and `--model` flags.
 #[derive(clap::Args, Clone, Debug)]
 #[command(group = clap::ArgGroup::new("backend-choice").multiple(false))]
 pub struct BackendArgs {
@@ -447,6 +488,11 @@ pub struct BackendArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "", group = "backend-choice")]
     pub azure_openai: Option<String>,
 
+    /// With --azure-openai: authenticate with an access token from the
+    /// Azure CLI, started through powershell.exe, instead of the API key.
+    #[arg(long, requires = "azure_openai")]
+    pub azure_cli_token: bool,
+
     /// Model to use (applies to all backends).
     #[arg(long)]
     pub model: Option<String>,
@@ -473,13 +519,24 @@ impl BackendArgs {
             } else {
                 url
             };
-            let api_key = std::env::var("AZURE_OPENAI_API_KEY")
-                .context("AZURE_OPENAI_API_KEY must be set for --azure-openai")?;
             let model = self
                 .model
                 .or_else(|| std::env::var("AZURE_OPENAI_MODEL").ok());
             let options = azure_request_options(model.as_deref(), |name| std::env::var(name).ok())?;
-            Ok(Backend::azure_openai(api_url, model, api_key, options))
+            if self.azure_cli_token {
+                Ok(Backend::azure_openai_with_tokens(
+                    api_url,
+                    model,
+                    CliToken::via_powershell(),
+                    options,
+                ))
+            } else {
+                let api_key = std::env::var("AZURE_OPENAI_API_KEY").context(
+                    "AZURE_OPENAI_API_KEY must be set for --azure-openai \
+                     (or pass --azure-cli-token)",
+                )?;
+                Ok(Backend::azure_openai(api_url, model, api_key, options))
+            }
         } else {
             let mut b = Backend::api_from_env()?;
             if let Backend::Api { ref mut model, .. } = b
@@ -1106,6 +1163,59 @@ mod tests {
             let backend = Backend::azure_openai(server.uri(), None, "key".into(), options);
             assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn azure_backend_sends_an_api_key_in_the_api_key_header() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|req: &Request| {
+                req.headers.get("api-key").and_then(|v| v.to_str().ok()) == Some("key")
+                    && !req.headers.contains_key("authorization")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend =
+            Backend::azure_openai(server.uri(), None, "key".into(), RequestOptions::default());
+        assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+    }
+
+    /// Not run with a paused clock: it would jump ahead while the token
+    /// command runs and trip that command's timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn azure_backend_sends_a_cli_token_as_a_bearer_token() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|req: &Request| {
+                req.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("Bearer TOKEN-123")
+                    && !req.headers.contains_key("api-key")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tokens = CliToken::new("sh", ["-c", r#"printf '{"accessToken":"TOKEN-123"}'"#]);
+        let backend = Backend::azure_openai_with_tokens(
+            server.uri(),
+            None,
+            tokens,
+            RequestOptions::default(),
+        );
+        assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
     }
 
     #[test]
