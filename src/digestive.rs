@@ -1820,6 +1820,7 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
     out
 }
 
+#[derive(Clone, Copy)]
 struct DigestMode {
     label: &'static str,
     min_words: usize,
@@ -1991,6 +1992,12 @@ const MAX_ISSUES: usize = 8;
 const MAX_STRUCTURAL_REJECTIONS: usize = 4;
 const MAX_AUDIT_ROUNDS: usize = 6;
 
+/// A draft whose only defect is being over the word window is retried
+/// once; if the retry is over as well, the shorter of the two is used
+/// anyway.  Repairs of such a digest may then grow it by this many words,
+/// since the window no longer bounds them.
+const OVERLONG_REVISION_SLACK: usize = 100;
+
 async fn generate_digest_mode(
     day: &str,
     mode: &DigestMode,
@@ -2027,6 +2034,10 @@ async fn generate_digest_mode(
     let mut approved = HashMap::new();
     let mut structural_rejections = 0;
     let mut audit_rounds = 0;
+    // The word window the drafts are checked against, and the shortest
+    // draft since the last audit whose only defect was exceeding it.
+    let mut limits = *mode;
+    let mut too_long: Option<(String, usize)> = None;
 
     for attempt in 1.. {
         let prompt = format!(
@@ -2038,7 +2049,7 @@ async fn generate_digest_mode(
                 &draft,
                 &findings,
                 packets,
-                mode,
+                &limits,
                 backend,
                 &format!("{label}-{attempt}"),
             )
@@ -2050,19 +2061,39 @@ async fn generate_digest_mode(
                 .await
                 .with_context(|| format!("daily digest ({label}) failed"))?
         };
-        let digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
+        let mut digest = normalize_topic_tags(&normalize_typography(&strip_digest_links(
             &summarize::normalize_headings(&raw),
         )));
         trace_digest_attempt(label, attempt, "draft.md", &digest)?;
         if is_mock(backend) {
             return Ok(strip_topic_tags(&digest));
         }
-        let mut structural_issues = validate_digest(&digest, mode, &ids, day);
+        let mut structural_issues = validate_digest(&digest, &limits, &ids, day);
         if let Some(issue) = selection_issue(&digest, &selection) {
             structural_issues.push(issue);
             structural_issues.truncate(MAX_ISSUES);
         }
+        let words = digest_word_count(&digest);
+        if words > limits.max_words && structural_issues.len() == 1 {
+            match too_long.take() {
+                None => too_long = Some((digest.clone(), words)),
+                Some((earlier, earlier_words)) => {
+                    if earlier_words < words {
+                        digest = earlier;
+                    }
+                    let shortest = earlier_words.min(words);
+                    eprintln!(
+                        "[digestive] {day} {label} digest has {shortest} words, over the \
+                         limit of {}; using it anyway",
+                        limits.max_words,
+                    );
+                    limits.max_words = shortest + OVERLONG_REVISION_SLACK;
+                    structural_issues.clear();
+                }
+            }
+        }
         if structural_issues.is_empty() {
+            too_long = None;
             audit_rounds += 1;
             issues = audit_digest(
                 &digest,
@@ -4759,7 +4790,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let clean = valid_digest(&HUMAN_DIGEST_MODE, 0);
-        let too_long = valid_digest(&HUMAN_DIGEST_MODE, HUMAN_DIGEST_MODE.max_words + 1);
+        let malformed = clean.replace("## The day in brief", "## Overview");
         let flawed = clean.replace(
             "Prose about the packfile lookup fast path.",
             "Prose about the packfile lookup fast path. FLAW",
@@ -4775,7 +4806,7 @@ mod tests {
                     r#"["T01","T02","T03","T04"]"#.to_string()
                 } else if system == DAILY_DIGEST_AGENT {
                     if drafts.fetch_add(1, Ordering::Relaxed) < MAX_STRUCTURAL_REJECTIONS - 1 {
-                        too_long.clone()
+                        malformed.clone()
                     } else {
                         flawed.clone()
                     }
@@ -4824,6 +4855,137 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, strip_topic_tags(&clean));
+    }
+
+    /// A backend whose writer returns `drafts` in turn (the last one from
+    /// then on), whose audit flags every line containing `FLAW`, and whose
+    /// reviser answers with `revision` as the item body.  The counter says
+    /// how many drafts the writer was asked for.
+    async fn scripted_digest_backend(
+        drafts: Vec<String>,
+        revision: &'static str,
+    ) -> (
+        wiremock::MockServer,
+        Backend,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let writer_calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&writer_calls);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                let user = body["messages"][1]["content"].as_str().unwrap();
+                let content = if system == DAILY_SELECT_AGENT {
+                    r#"["T01","T02","T03","T04"]"#.to_string()
+                } else if system == DAILY_DIGEST_AGENT {
+                    let nth = counter.fetch_add(1, Ordering::Relaxed);
+                    drafts[nth.min(drafts.len() - 1)].clone()
+                } else if system == DAILY_REVISE_AGENT {
+                    serde_json::json!({"title": "packfile lookup fast path", "body": revision})
+                        .to_string()
+                } else {
+                    assert_eq!(system, DAILY_DIGEST_AUDIT_AGENT);
+                    match user
+                        .lines()
+                        .find(|line| line.starts_with('L') && line.contains("FLAW"))
+                    {
+                        Some(line) => {
+                            let location = user
+                                .lines()
+                                .find_map(|line| line.strip_prefix("AUDIT LOCATION: "))
+                                .unwrap();
+                            let citation = line.split_whitespace().next().unwrap();
+                            format!("- {location} ||| {citation} ||| Remove FLAW")
+                        }
+                        None => "OK".into(),
+                    }
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": content}}]
+                }))
+            })
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        (server, backend, writer_calls)
+    }
+
+    #[tokio::test]
+    async fn test_an_overlong_digest_is_retried_once_and_the_shorter_draft_is_used() {
+        let max = HUMAN_DIGEST_MODE.max_words;
+        let longer = valid_digest(&HUMAN_DIGEST_MODE, max + 40);
+        let shorter = valid_digest(&HUMAN_DIGEST_MODE, max + 10);
+        let (_server, backend, writer_calls) =
+            scripted_digest_backend(vec![longer, shorter.clone()], "").await;
+
+        let result = generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(4),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, strip_topic_tags(&shorter));
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_the_first_overlong_draft_is_kept_when_the_retry_is_not_shorter() {
+        let max = HUMAN_DIGEST_MODE.max_words;
+        let shorter = valid_digest(&HUMAN_DIGEST_MODE, max + 10);
+        let longer = valid_digest(&HUMAN_DIGEST_MODE, max + 40);
+        let (_server, backend, writer_calls) =
+            scripted_digest_backend(vec![shorter.clone(), longer], "").await;
+
+        let result = generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(4),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, strip_topic_tags(&shorter));
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_repair_may_grow_an_overlong_digest_a_little() {
+        let flawed = valid_digest(&HUMAN_DIGEST_MODE, HUMAN_DIGEST_MODE.max_words + 40).replace(
+            "Prose about the packfile lookup fast path.",
+            "Prose about the packfile lookup fast path. FLAW",
+        );
+        let (_server, backend, _writer_calls) = scripted_digest_backend(
+            vec![flawed],
+            "Prose about the packfile lookup fast path, with the benchmark setup clarified.",
+        )
+        .await;
+
+        let result = generate_digest_mode(
+            DIGEST_DAY,
+            &HUMAN_DIGEST_MODE,
+            &selection_packets(4),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("benchmark setup clarified"));
+        assert!(!result.contains("FLAW"));
     }
 
     #[test]
