@@ -59,6 +59,11 @@ impl ThreadDeltas {
     pub fn record(&mut self, day: &str, bullets: Vec<String>) {
         self.days.insert(day.to_string(), bullets);
     }
+
+    /// The bullets recorded for `day`, or `None` if it was not extracted.
+    pub fn day(&self, day: &str) -> Option<&[String]> {
+        self.days.get(day).map(Vec::as_slice)
+    }
 }
 
 /// The ledger files to commit so that every thread in `recorded` (root

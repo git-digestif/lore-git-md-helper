@@ -15,13 +15,13 @@ use regex::Regex;
 use crate::ai_backend::{self, Backend};
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
-use crate::date_util::{add_days, iso_sunday, month_of};
+use crate::date_util::{add_days, day_of, iso_sunday, month_of};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
 use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
-use crate::thread_deltas;
+use crate::thread_deltas::{self, ThreadDeltas};
 use crate::thread_file::{self, ThreadTree};
 use crate::wc_parse::{self, WcTopic};
 
@@ -1540,7 +1540,11 @@ async fn extract_thread_deltas(
     }
     let threads = std::slice::from_ref(thread);
     let input = build_daily_digest_user_msg(day, threads, thread.email_summaries.len());
-    let label = format!("thread-{}", thread.root_dk.replace('/', "-"));
+    let label = format!(
+        "thread-{}-{}",
+        day.replace('/', "-"),
+        thread.root_dk.replace('/', "-"),
+    );
     let mut correction = String::new();
     for attempt in 1..=2 {
         let prompt = format!("{input}{correction}");
@@ -1575,6 +1579,97 @@ async fn extract_thread_deltas(
         }
     }
     unreachable!("the bounded extraction loop always returns")
+}
+
+/// The recent history of a thread before `day`: the days on which it had
+/// messages, newest first, with the bullets recorded for each, until the
+/// days found hold `budget` bytes of bullets.  They are returned oldest
+/// first, without the days that had nothing noteworthy.
+///
+/// A ledger starts when the pipeline first records a day, so a thread
+/// that was already running has no section for its earlier days.  Each
+/// such day that is needed is extracted from that day's complete source
+/// emails, as a daily digest would have done, and recorded in `ledger`.
+/// Days the ledger already has a section for, empty or not, are left
+/// alone, and so are the days older than the ones returned.
+pub async fn recent_history(
+    day: &str,
+    root_dk: &str,
+    ledger: &mut ThreadDeltas,
+    budget: usize,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let Some((_, tree)) = thread_file::load_from_repo(cat, git_ref, root_dk) else {
+        return Ok(Vec::new());
+    };
+    let mut dks_by_day: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for dk in tree.date_keys().filter(|dk| day_of(dk) < day) {
+        dks_by_day.entry(day_of(dk)).or_default().push(dk);
+    }
+    let mut history = Vec::new();
+    let mut used = 0;
+    for (history_day, mut dks) in dks_by_day.into_iter().rev() {
+        if used >= budget {
+            break;
+        }
+        if ledger.day(history_day).is_none() {
+            let bullets =
+                extract_history_day(history_day, &mut dks, root_dk, git_ref, cat, backend).await?;
+            ledger.record(history_day, bullets);
+        }
+        let bullets = ledger.day(history_day).unwrap_or_default();
+        used += bullets.iter().map(String::len).sum::<usize>();
+        if !bullets.is_empty() {
+            history.push((history_day.to_string(), bullets.to_vec()));
+        }
+    }
+    history.reverse();
+    Ok(history)
+}
+
+/// A thread's bullets for one earlier day, extracted from the complete
+/// source emails `dks` of that day.
+async fn extract_history_day(
+    history_day: &str,
+    dks: &mut [&str],
+    root_dk: &str,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<Vec<String>> {
+    dks.sort_unstable();
+    let email_summaries = dks
+        .iter()
+        .map(|dk| {
+            let (from, source_excerpt, source_is_short) = email_evidence(dk, git_ref, cat);
+            DayEmailEvidence {
+                dk: dk.to_string(),
+                ai: String::new(),
+                from,
+                source_excerpt,
+                source_is_short,
+            }
+        })
+        .collect();
+    let activity = ThreadDayActivity {
+        root_dk: root_dk.to_string(),
+        thread_ai_before: None,
+        root_source_excerpt: topic_source_evidence(
+            root_dk,
+            dks.last().expect("a day has at least one message"),
+            git_ref,
+            cat,
+        ),
+        email_summaries,
+        wc_status: None,
+    };
+    Ok(extract_thread_deltas(history_day, &activity, backend)
+        .await?
+        .into_iter()
+        .flat_map(|delta| delta.bullets)
+        .collect())
 }
 
 /// One thread root's same-day delta bullets, recovered from the merged
@@ -6935,5 +7030,98 @@ Prose about completing subcommands of the new history command.
             ledger_days(&mut cat, git_ref, THREAD_OPENED),
             ["2025/03/01", "2025/03/02"],
         );
+    }
+
+    /// A thread with one message a day on four days, whose source emails
+    /// carry their own date-key in the text.
+    fn four_day_thread() -> (MockBlobs, [&'static str; 4], [String; 4]) {
+        let days = ["2025/03/01", "2025/03/02", "2025/03/03", "2025/03/04"];
+        let dks = days.map(|day| format!("{day}/09-00-00"));
+        let thread_md: String = dks
+            .iter()
+            .enumerate()
+            .map(|(depth, dk)| format!("{}- {dk} [topic](x.md) *Alice*\n", "  ".repeat(depth)))
+            .collect();
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert(format!("main:{}.thread.md", dks[0]), thread_md);
+        for dk in &dks {
+            blobs.0.insert(
+                format!("main:{dk}.md"),
+                format!("Subject: topic\nFrom: Alice\n\nSource text of {dk}."),
+            );
+        }
+        (blobs, days, dks)
+    }
+
+    /// A thread that was already running when its ledger started lacks
+    /// its earlier days.  Only those are extracted, each from its own
+    /// day's emails; a day recorded as empty counts as extracted.
+    #[tokio::test]
+    async fn test_history_extraction_fills_only_the_days_a_ledger_lacks() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = four_day_thread();
+        let mut ledger = ThreadDeltas::default();
+        ledger.record(days[0], vec!["recorded earlier".to_string()]);
+        ledger.record(days[2], Vec::new());
+
+        let history = recent_history(
+            days[3],
+            &dks[0],
+            &mut ledger,
+            usize::MAX,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ledger.day(days[0]),
+            Some(&["recorded earlier".to_string()][..])
+        );
+        assert_eq!(ledger.day(days[2]), Some(&[][..]));
+        assert_eq!(ledger.day(days[3]), None, "the day itself is not history");
+        let extracted = ledger.day(days[1]).expect("the missing day is extracted");
+        let extracted = extracted.join("\n");
+        assert!(extracted.contains(&format!("Source text of {}", dks[1])));
+        for later in [&dks[2], &dks[3]] {
+            assert!(!extracted.contains(&format!("Source text of {later}")));
+        }
+        // Oldest first, and without the day that had nothing noteworthy.
+        let returned: Vec<_> = history.iter().map(|(day, _)| day.as_str()).collect();
+        assert_eq!(returned, [days[0], days[1]]);
+        assert_eq!(history[0].1, ["recorded earlier"]);
+    }
+
+    /// The history a digest item shows is bounded, so the days older than
+    /// what fits are neither returned nor extracted.
+    #[tokio::test]
+    async fn test_history_extraction_stops_once_the_budget_is_filled() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = four_day_thread();
+        let mut ledger = ThreadDeltas::default();
+
+        let history = recent_history(
+            days[3],
+            &dks[0],
+            &mut ledger,
+            1,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        let returned: Vec<_> = history.iter().map(|(day, _)| day.as_str()).collect();
+        assert_eq!(returned, [days[2]]);
+        assert!(ledger.day(days[2]).is_some());
+        assert_eq!(ledger.day(days[1]), None);
+        assert_eq!(ledger.day(days[0]), None);
     }
 }
