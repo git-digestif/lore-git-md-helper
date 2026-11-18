@@ -21,6 +21,7 @@ use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
 use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
+use crate::thread_deltas;
 use crate::thread_file::{self, ThreadTree};
 use crate::wc_parse::{self, WcTopic};
 
@@ -755,6 +756,8 @@ impl<'a> Digestive<'a> {
             &threads,
             email_count,
             self.backend.context("backend unavailable")?,
+            self.git_ref,
+            &mut self.cached,
         )
         .await?;
 
@@ -767,6 +770,12 @@ impl<'a> Digestive<'a> {
             format!("{}:{day}/digest.ai.md", self.git_ref),
             digest.ai.clone(),
         );
+        // Keep the ledgers readable before the checkpoint lands, so that a
+        // later day merges into them rather than into a stale copy.
+        for (path, content) in &digest.ledgers {
+            self.cached
+                .insert(format!("{}:{path}", self.git_ref), content.clone());
+        }
 
         let mut msg = format!("digestive: daily digest for {day}");
         if let Some(ref sc) = self.source_commit {
@@ -774,10 +783,16 @@ impl<'a> Digestive<'a> {
         }
         let human_path = format!("{day}/digest.human.md");
         let ai_path = format!("{day}/digest.ai.md");
-        let files = [
+        let mut files = vec![
             (human_path.as_str(), digest.human.as_str()),
             (ai_path.as_str(), digest.ai.as_str()),
         ];
+        files.extend(
+            digest
+                .ledgers
+                .iter()
+                .map(|(path, content)| (path.as_str(), content.as_str())),
+        );
         let fi = self.fi.as_mut().context("fast-import unavailable")?;
         fi.commit(&msg, &files)?;
         fi.checkpoint()?;
@@ -1123,6 +1138,7 @@ impl<'a> Digestive<'a> {
                     || dk.ends_with(".thread")
                     || dk.ends_with(".thread.human")
                     || dk.ends_with(".thread.ai")
+                    || dk.ends_with(".thread.deltas")
                 {
                     continue;
                 }
@@ -1256,6 +1272,9 @@ pub struct DayEmailEvidence {
 pub struct DayDigestOutput {
     pub human: String,
     pub ai: String,
+    /// The ledger of every thread active today with today's bullets
+    /// recorded, as (path, content) pairs to commit with the digests.
+    pub ledgers: Vec<(String, String)>,
 }
 
 /// Build the daily digest input for a given day.
@@ -1462,12 +1481,15 @@ fn lookup_wc_status(
 /// Generate a daily digest from thread deltas.
 ///
 /// Extract developments from each thread's complete same-day source
-/// before presenting the resulting topic packets to the editor.
+/// before presenting the resulting topic packets to the editor, and
+/// record them in the threads' ledgers as of `git_ref`.
 pub async fn generate_daily_digest(
     day: &str,
     threads: &[ThreadDayActivity],
     email_count: usize,
     backend: &Backend,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
 
@@ -1477,9 +1499,19 @@ pub async fn generate_daily_digest(
     );
 
     let mut root_deltas = Vec::new();
+    let mut recorded = Vec::new();
     for thread in threads {
-        root_deltas.extend(extract_thread_deltas(day, thread, backend).await?);
+        let deltas = extract_thread_deltas(day, thread, backend).await?;
+        recorded.push((
+            thread.root_dk.clone(),
+            deltas
+                .iter()
+                .flat_map(|delta| delta.bullets.iter().cloned())
+                .collect(),
+        ));
+        root_deltas.extend(deltas);
     }
+    let ledgers = thread_deltas::record_day(day, &recorded, git_ref, cat);
     let packets = build_topic_packets(day, threads, &root_deltas);
     if packets.is_empty() {
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
@@ -1491,7 +1523,7 @@ pub async fn generate_daily_digest(
     let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &packets, backend).await?;
     let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &packets, backend).await?;
 
-    Ok(DayDigestOutput { human, ai })
+    Ok(DayDigestOutput { human, ai, ledgers })
 }
 
 async fn extract_thread_deltas(
@@ -3258,7 +3290,8 @@ pub async fn redo_daily(
     let before = find_digest_commit(repo_path, git_ref, &prev).unwrap_or_else(|| head_oid.clone());
 
     let (threads, email_count) = build_day_digest_input(&summaries, &before, git_ref, &mut cat);
-    let digest = generate_daily_digest(day, &threads, email_count, backend).await?;
+    let digest =
+        generate_daily_digest(day, &threads, email_count, backend, git_ref, &mut cat).await?;
 
     let mut fi = FastImport::new(repo_path, git_ref)?;
     if let Some(oid) = resolve_ref(repo_path, git_ref) {
@@ -3270,13 +3303,17 @@ pub async fn redo_daily(
     }
     let human_path = format!("{day}/digest.human.md");
     let ai_path = format!("{day}/digest.ai.md");
-    fi.commit(
-        &msg,
-        &[
-            (human_path.as_str(), digest.human.as_str()),
-            (ai_path.as_str(), digest.ai.as_str()),
-        ],
-    )?;
+    let mut files = vec![
+        (human_path.as_str(), digest.human.as_str()),
+        (ai_path.as_str(), digest.ai.as_str()),
+    ];
+    files.extend(
+        digest
+            .ledgers
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str())),
+    );
+    fi.commit(&msg, &files)?;
     fi.checkpoint()?;
     fi.finish()?;
     Ok(())
@@ -6803,6 +6840,100 @@ Prose about completing subcommands of the new history command.
         assert!(
             cat.get_str(&format!("{git_ref}:{SUNDAY}/digest.human.md"))
                 .is_some()
+        );
+    }
+
+    const THREAD_OPENED: &str = "2025/03/01/10-00-00";
+    const THREAD_ANSWERED: &str = "2025/03/02/09-00-00";
+
+    /// A thread opened on one day and answered on the next, both emails
+    /// with summaries.
+    fn seed_thread_over_two_days(repo: &str, git_ref: &str) {
+        let thread_md = [
+            "# Thread",
+            "",
+            &format!("- {THREAD_OPENED} [topic](10-00-00.md) *Alice*"),
+            &format!("  - {THREAD_ANSWERED} [Re: topic](../02/09-00-00.md) *Bob*"),
+            "",
+        ]
+        .join("\n");
+        let mut fi = FastImport::new(repo, git_ref).unwrap();
+        fi.commit_with_symlinks(
+            "seed",
+            &[
+                (
+                    &format!("{THREAD_OPENED}.md"),
+                    "Subject: topic\nFrom: Alice\nDate: Sat, 1 Mar 2025\n\nOpening.",
+                ),
+                (&format!("{THREAD_OPENED}.ai.md"), "Alice opens the topic."),
+                (&format!("{THREAD_OPENED}.thread.md"), &thread_md),
+                (
+                    &format!("{THREAD_ANSWERED}.md"),
+                    "Subject: Re: topic\nFrom: Bob\nDate: Sun, 2 Mar 2025\n\nAnswer.",
+                ),
+                (&format!("{THREAD_ANSWERED}.ai.md"), "Bob answers."),
+            ],
+            &[(
+                &format!("{THREAD_ANSWERED}.thread.md"),
+                "../01/10-00-00.thread.md",
+            )],
+            &[],
+        )
+        .unwrap();
+        fi.finish().unwrap();
+    }
+
+    /// The days that a thread's ledger has a section for.
+    fn ledger_days(cat: &mut CatFile, git_ref: &str, root_dk: &str) -> Vec<String> {
+        cat.get_str(&format!("{git_ref}:{}", thread_deltas::path(root_dk)))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The daily digests of one run each add their day to the ledger of
+    /// the thread, so the second day must not replace the first.
+    #[tokio::test]
+    async fn test_pipeline_collects_a_threads_days_in_its_ledger() {
+        use crate::ai_backend::Backend;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_thread_over_two_days(repo, git_ref);
+
+        let backend = Backend::Mock { nth_word: 3 };
+        run_pipeline(repo, git_ref, None, None, 5, Some(&backend), false)
+            .await
+            .unwrap();
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert_eq!(
+            ledger_days(&mut cat, git_ref, THREAD_OPENED),
+            ["2025/03/01", "2025/03/02"],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redo_daily_keeps_the_other_days_of_the_thread_ledger() {
+        use crate::ai_backend::Backend;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_thread_over_two_days(repo, git_ref);
+
+        let backend = Backend::Mock { nth_word: 1 };
+        for day in ["2025/03/01", "2025/03/02", "2025/03/01"] {
+            redo_daily(repo, git_ref, day, &backend).await.unwrap();
+        }
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert_eq!(
+            ledger_days(&mut cat, git_ref, THREAD_OPENED),
+            ["2025/03/01", "2025/03/02"],
         );
     }
 }
