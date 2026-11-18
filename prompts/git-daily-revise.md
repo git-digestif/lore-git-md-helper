@@ -15,6 +15,8 @@ Retain supported statements. If a finding is overbroad, express the
 source-supported meaning plainly rather than strengthening or reversing
 it. Use short direct quotations where they make a position unambiguous.
 Do not infer acceptance, integration, consensus, or successful outcomes.
+The evidence of a long thread may end with EARLIER DEVELOPMENTS: use them
+only to say how the thread got to today, never as today's news.
 
 Keep approximately the existing item's length within the supplied word
 range. Restore useful source-backed context when removing a false claim

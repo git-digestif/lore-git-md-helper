@@ -10,6 +10,11 @@ message. Its subject may supersede the name in the older thread root.
 Unquoted text is the sender's contribution; quoted passages identify
 earlier proposals and referents, not new contributions by that sender.
 Topic background may explain the topic's purpose and technical effects.
+A long thread's evidence may end with EARLIER DEVELOPMENTS, bullets
+extracted from earlier days of the thread. They support statements about
+what happened earlier, never about today: an earlier development
+presented as something that happened today is an old event presented as
+new.
 Read the whole exchange, including corrections and retractions.
 
 The special location T00 is the opening overview. Its evidence consists

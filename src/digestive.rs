@@ -5,6 +5,7 @@
 //! repository via fast-import.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -1489,7 +1490,8 @@ fn lookup_wc_status(
 ///
 /// Extract developments from each thread's complete same-day source
 /// before presenting the resulting topic packets to the editor, and
-/// record them in the threads' ledgers as of `git_ref`.
+/// record them in the threads' ledgers as of `git_ref`.  The longest
+/// threads also get their recent history from those ledgers.
 pub async fn generate_daily_digest(
     day: &str,
     threads: &[ThreadDayActivity],
@@ -1518,11 +1520,13 @@ pub async fn generate_daily_digest(
         ));
         root_deltas.extend(deltas);
     }
-    let ledgers = thread_deltas::record_day(day, &recorded, git_ref, cat);
-    let packets = build_topic_packets(day, threads, &root_deltas);
+    let mut packets = build_topic_packets(day, threads, &root_deltas);
     if packets.is_empty() {
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
     }
+    let mut loaded = BTreeMap::new();
+    attach_history(day, &mut packets, &mut loaded, git_ref, cat, backend).await?;
+    let ledgers = thread_deltas::record_day(day, &recorded, loaded, git_ref, cat);
     let evidence = render_topic_packets(&packets);
     trace_digest_attempt("editor", 0, "evidence.txt", &evidence)?;
     eprintln!("[digestive] generating daily digest for {day} ...");
@@ -1531,6 +1535,44 @@ pub async fn generate_daily_digest(
     let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &packets, backend).await?;
 
     Ok(DayDigestOutput { human, ai, ledgers })
+}
+
+/// Give the topics that lead a digest, in either mode, the recent history
+/// of their threads.  Each thread's ledger is read into `ledgers`,
+/// completed there where it lacks the days needed, and stays there for
+/// the caller to save.
+async fn attach_history(
+    day: &str,
+    packets: &mut [TopicPacket],
+    ledgers: &mut BTreeMap<String, ThreadDeltas>,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<()> {
+    let mut leading = BTreeSet::new();
+    for mode in [&HUMAN_DIGEST_MODE, &AI_DIGEST_MODE] {
+        leading.extend(long_tier(packets, mode));
+    }
+    for packet in packets.iter_mut().filter(|p| leading.contains(&p.id)) {
+        let ledger = ledgers
+            .entry(packet.root_dk.clone())
+            .or_insert_with(|| thread_deltas::load(&packet.root_dk, git_ref, cat));
+        let history = recent_history(
+            day,
+            &packet.root_dk,
+            ledger,
+            HISTORY_BUDGET,
+            git_ref,
+            cat,
+            backend,
+        )
+        .await?;
+        packet.history = history
+            .into_iter()
+            .flat_map(|(_, bullets)| bullets)
+            .collect();
+    }
+    Ok(())
 }
 
 async fn extract_thread_deltas(
@@ -1588,10 +1630,16 @@ async fn extract_thread_deltas(
     unreachable!("the bounded extraction loop always returns")
 }
 
+/// The most days of a thread's history that `recent_history` looks at,
+/// so that a quiet thread whose days hold nothing noteworthy cannot make
+/// it extract one day after another without ever filling its budget.
+const MAX_HISTORY_DAYS: usize = 10;
+
 /// The recent history of a thread before `day`: the days on which it had
 /// messages, newest first, with the bullets recorded for each, until the
-/// days found hold `budget` bytes of bullets.  They are returned oldest
-/// first, without the days that had nothing noteworthy.
+/// days found hold `budget` bytes of bullets or `MAX_HISTORY_DAYS` days
+/// were looked at.  They are returned oldest first, without the days that
+/// had nothing noteworthy.
 ///
 /// A ledger starts when the pipeline first records a day, so a thread
 /// that was already running has no section for its earlier days.  Each
@@ -1617,7 +1665,7 @@ pub async fn recent_history(
     }
     let mut history = Vec::new();
     let mut used = 0;
-    for (history_day, mut dks) in dks_by_day.into_iter().rev() {
+    for (history_day, mut dks) in dks_by_day.into_iter().rev().take(MAX_HISTORY_DAYS) {
         if used >= budget {
             break;
         }
@@ -1690,7 +1738,8 @@ struct RootDelta {
 
 /// One topic as the final editor sees it: an opaque ID, the thread root
 /// author's own background words, and today's delta bullets, colocated
-/// so that no cross-topic lookup is possible.
+/// so that no cross-topic lookup is possible.  A long thread also carries
+/// its recent history.
 #[derive(Clone)]
 struct TopicPacket {
     id: String,
@@ -1700,6 +1749,42 @@ struct TopicPacket {
     source: String,
     activity: Option<ThreadActivity>,
     root_dk: String,
+    /// The most recent bullets of the thread's earlier days, oldest
+    /// first, or none.
+    history: Vec<String>,
+}
+
+impl TopicPacket {
+    /// Everything the factual audit and an item revision may check the
+    /// topic's item against.
+    fn evidence(&self) -> String {
+        if self.history.is_empty() {
+            self.source.clone()
+        } else {
+            format!(
+                "{}\n{}",
+                self.source,
+                render_history(&self.id, &self.history)
+            )
+        }
+    }
+}
+
+/// How many bytes of a long thread's earlier bullets its packet carries,
+/// give or take the last day taken.
+const HISTORY_BUDGET: usize = 6 * 1024;
+
+fn render_history(id: &str, bullets: &[String]) -> String {
+    let mut out = format!(
+        "EARLIER DEVELOPMENTS FOR {id} -- THE MOST RECENT ONES BEFORE TODAY, IN \
+         CHRONOLOGICAL ORDER; OLDER ONES MAY BE MISSING. THEY SAY HOW THE THREAD \
+         GOT HERE AND ARE NEVER TODAY'S NEWS:\n",
+    );
+    for bullet in bullets {
+        out.push_str(&format!("- {bullet}\n"));
+    }
+    out.push('\n');
+    out
 }
 
 /// Bind each delta to its cited email's source metadata, not to the
@@ -1920,6 +2005,7 @@ fn build_topic_packets(
                 ),
                 activity: thread.activity.clone(),
                 root_dk: thread.root_dk.clone(),
+                history: Vec::new(),
             }
         })
         .collect()
@@ -1932,6 +2018,7 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
         current_subject,
         background,
         bullets,
+        history,
         ..
     } in packets
     {
@@ -1948,6 +2035,9 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
             None => out.push_str(&format!(
                 "NO BACKGROUND FOR {id} -- WRITE ONLY FROM ITS DELTAS.\n\n",
             )),
+        }
+        if !history.is_empty() {
+            out.push_str(&render_history(id, history));
         }
         out.push_str(&format!(
             "TODAY'S VERIFIED DELTAS FOR {id}, IN CHRONOLOGICAL ORDER:\n",
@@ -2434,8 +2524,7 @@ async fn revise_digest_items(
                 .iter()
                 .find(|packet| packet.id == id)
                 .with_context(|| format!("missing original source for revision {id}"))?
-                .source
-                .clone(),
+                .evidence(),
             None => sections
                 .iter()
                 .filter(|section| section.topic_id.is_some())
@@ -2615,7 +2704,8 @@ async fn audit_digest(
             .collect::<Vec<_>>()
             .join("\n");
         if approved.get(id) != Some(&text) {
-            let findings = audit_section(id, &packet.source, section, backend, trace_label).await?;
+            let findings =
+                audit_section(id, &packet.evidence(), section, backend, trace_label).await?;
             if !findings.is_empty() {
                 issues.extend(findings);
                 if issues.len() >= MAX_ISSUES {
@@ -4937,6 +5027,7 @@ mod tests {
                 source: format!("Source {index}."),
                 activity: None,
                 root_dk: format!("2026/10/01/00-00-{index:02}"),
+                history: Vec::new(),
             })
             .collect()
     }
@@ -7268,11 +7359,25 @@ Prose about completing subcommands of the new history command.
         );
     }
 
-    /// A thread with one message a day on four days, whose source emails
-    /// carry their own date-key in the text.
-    fn four_day_thread() -> (MockBlobs, [&'static str; 4], [String; 4]) {
-        let days = ["2025/03/01", "2025/03/02", "2025/03/03", "2025/03/04"];
-        let dks = days.map(|day| format!("{day}/09-00-00"));
+    /// A thread with one message a day on `count` days from 2025/03/01,
+    /// whose source emails carry their own date-key in the text.
+    fn daily_thread(count: usize) -> (MockBlobs, &'static [&'static str], Vec<String>) {
+        const DAYS: [&str; 12] = [
+            "2025/03/01",
+            "2025/03/02",
+            "2025/03/03",
+            "2025/03/04",
+            "2025/03/05",
+            "2025/03/06",
+            "2025/03/07",
+            "2025/03/08",
+            "2025/03/09",
+            "2025/03/10",
+            "2025/03/11",
+            "2025/03/12",
+        ];
+        let days = &DAYS[..count];
+        let dks: Vec<String> = days.iter().map(|day| format!("{day}/09-00-00")).collect();
         let thread_md: String = dks
             .iter()
             .enumerate()
@@ -7298,7 +7403,7 @@ Prose about completing subcommands of the new history command.
     async fn test_history_extraction_fills_only_the_days_a_ledger_lacks() {
         use crate::ai_backend::Backend;
 
-        let (mut blobs, days, dks) = four_day_thread();
+        let (mut blobs, days, dks) = daily_thread(4);
         let mut ledger = ThreadDeltas::default();
         ledger.record(days[0], vec!["recorded earlier".to_string()]);
         ledger.record(days[2], Vec::new());
@@ -7339,7 +7444,7 @@ Prose about completing subcommands of the new history command.
     async fn test_history_extraction_stops_once_the_budget_is_filled() {
         use crate::ai_backend::Backend;
 
-        let (mut blobs, days, dks) = four_day_thread();
+        let (mut blobs, days, dks) = daily_thread(4);
         let mut ledger = ThreadDeltas::default();
 
         let history = recent_history(
@@ -7359,6 +7464,64 @@ Prose about completing subcommands of the new history command.
         assert!(ledger.day(days[2]).is_some());
         assert_eq!(ledger.day(days[1]), None);
         assert_eq!(ledger.day(days[0]), None);
+    }
+
+    /// A quiet thread whose days hold nothing noteworthy must not make the
+    /// extraction go back day after day.
+    #[tokio::test]
+    async fn test_history_extraction_looks_at_a_bounded_number_of_days() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(12);
+        let mut ledger = ThreadDeltas::default();
+
+        recent_history(
+            days[11],
+            &dks[0],
+            &mut ledger,
+            usize::MAX,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        // Eleven days precede the last one; only the newest ten are looked at.
+        let extracted = days.iter().filter(|day| ledger.day(day).is_some()).count();
+        assert_eq!(extracted, MAX_HISTORY_DAYS);
+        assert!(ledger.day(days[1]).is_some());
+        assert_eq!(ledger.day(days[0]), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_long_threads_recent_history_is_attached_and_kept_in_its_ledger() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(4);
+        let mut packets = selection_packets(4);
+        packets[0].root_dk = dks[0].clone();
+        packets[0].activity = long_activity(30, 1);
+        let mut ledgers = BTreeMap::new();
+
+        attach_history(
+            days[3],
+            &mut packets,
+            &mut ledgers,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        let history = packets[0].history.join("\n");
+        assert!(history.contains(&format!("Source text of {}", dks[2])));
+        assert!(!history.contains(&format!("Source text of {}", dks[3])));
+        assert!(packets[1..].iter().all(|packet| packet.history.is_empty()));
+        // The days that were backfilled are in the ledger that gets saved.
+        assert_eq!(ledgers.keys().collect::<Vec<_>>(), [&dks[0]]);
+        assert!(ledgers[&dks[0]].day(days[2]).is_some());
     }
 
     fn long_activity(replies: usize, messages_today: usize) -> Option<ThreadActivity> {
@@ -7642,5 +7805,36 @@ Prose right below the heading.
         // The first draft fits the window on its own, but not with the notes.
         assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(digest_word_count(&result), max);
+    }
+
+    #[tokio::test]
+    async fn test_a_long_threads_history_reaches_the_editor_and_the_audit() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        packets[5].history = vec!["[2026/09/30/08-00-00 by Alice] Alice posted v1.".to_string()];
+        let draft = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, _) = scripted_digest_backend(vec![draft], "").await;
+
+        generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let editor = &inputs_to(&requests, DAILY_DIGEST_AGENT)[0];
+        let history = editor.find("EARLIER DEVELOPMENTS FOR T06").unwrap();
+        let deltas = editor.find("TODAY'S VERIFIED DELTAS FOR T06").unwrap();
+        assert!(history < deltas, "the history comes before today's deltas");
+        assert!(editor.contains("Alice posted v1."));
+        assert!(!editor.contains("EARLIER DEVELOPMENTS FOR T05"));
+        let audits = inputs_to(&requests, DAILY_DIGEST_AUDIT_AGENT);
+        let audit_of = |id: &str| {
+            audits
+                .iter()
+                .find(|input| input.contains(&format!("AUDIT LOCATION: {id}")))
+                .unwrap()
+        };
+        assert!(audit_of("T06").contains("EARLIER DEVELOPMENTS FOR T06"));
+        assert!(!audit_of("T05").contains("EARLIER DEVELOPMENTS"));
     }
 }

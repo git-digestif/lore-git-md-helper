@@ -66,26 +66,34 @@ impl ThreadDeltas {
     }
 }
 
+/// The ledger of the thread whose root has date-key `root_dk` as of
+/// `git_ref`, empty if it has none yet.
+pub fn load(root_dk: &str, git_ref: &str, cat: &mut impl BlobRead) -> ThreadDeltas {
+    cat.get_str(&format!("{git_ref}:{}", path(root_dk)))
+        .map(|md| ThreadDeltas::parse(&md))
+        .unwrap_or_default()
+}
+
 /// The ledger files to commit so that every thread in `recorded` (root
 /// date-key and its bullets for `day`) has `day` in its ledger, as
-/// (path, content) pairs.  The days already in a ledger at `git_ref`
-/// are kept.
+/// (path, content) pairs.  A thread's ledger is taken from `loaded` if
+/// it is there, and otherwise read from `git_ref`; the days already in
+/// it are kept.
 pub fn record_day(
     day: &str,
     recorded: &[(String, Vec<String>)],
+    mut loaded: BTreeMap<String, ThreadDeltas>,
     git_ref: &str,
     cat: &mut impl BlobRead,
 ) -> Vec<(String, String)> {
     recorded
         .iter()
         .map(|(root_dk, bullets)| {
-            let path = path(root_dk);
-            let mut ledger = cat
-                .get_str(&format!("{git_ref}:{path}"))
-                .map(|md| ThreadDeltas::parse(&md))
-                .unwrap_or_default();
+            let mut ledger = loaded
+                .remove(root_dk)
+                .unwrap_or_else(|| load(root_dk, git_ref, cat));
             ledger.record(day, bullets.clone());
-            (path, ledger.render())
+            (path(root_dk), ledger.render())
         })
         .collect()
 }
@@ -169,6 +177,7 @@ mod tests {
                 (ROOT.to_string(), vec!["answered".to_string()]),
                 (NEW_ROOT.to_string(), Vec::new()),
             ],
+            BTreeMap::new(),
             "main",
             &mut blobs,
         );
@@ -182,6 +191,38 @@ mod tests {
                 ),
                 (path(NEW_ROOT), ledger(&[("2026/10/08", &[])]).render()),
             ],
+        );
+    }
+
+    #[test]
+    fn record_day_prefers_a_ledger_that_was_completed_in_memory() {
+        const ROOT: &str = "2026/10/07/10-00-00";
+        let mut blobs = MockBlobs(Default::default());
+        blobs.0.insert(
+            format!("main:{}", path(ROOT)),
+            ledger(&[("2026/10/07", &["opened"])]).render(),
+        );
+        let completed = ledger(&[("2026/10/06", &["backfilled"]), ("2026/10/07", &["opened"])]);
+
+        let files = record_day(
+            "2026/10/08",
+            &[(ROOT.to_string(), vec!["answered".to_string()])],
+            BTreeMap::from([(ROOT.to_string(), completed)]),
+            "main",
+            &mut blobs,
+        );
+
+        assert_eq!(
+            files,
+            vec![(
+                path(ROOT),
+                ledger(&[
+                    ("2026/10/06", &["backfilled"]),
+                    ("2026/10/07", &["opened"]),
+                    ("2026/10/08", &["answered"]),
+                ])
+                .render(),
+            )],
         );
     }
 }

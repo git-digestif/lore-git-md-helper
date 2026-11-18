@@ -24,6 +24,10 @@ contains only that topic's material:
   or user-visible behavior it affects, the kind of change it is, and its
   concrete technical or practical impact. Some packets have no background
   at all; then write from the deltas alone.
+- `EARLIER DEVELOPMENTS FOR TNN` appears only for some long threads. It
+  lists the thread's most recent developments before today, in
+  chronological order; older ones may be missing. It says how the thread
+  got to today. It is never today's news.
 - `TODAY'S VERIFIED DELTAS FOR TNN` contains only developments that
   happened today, in chronological order. Only these may be presented as
   today's news.
@@ -55,27 +59,37 @@ Write the surrounding prose as if they were not there.
 
 ## Absolute rules
 
-Every factual statement must be directly traceable to the `BACKGROUND` or
-to one delta bullet of the *same* packet as the section it appears in.
+Every factual statement must be directly traceable to the `BACKGROUND`,
+to an `EARLIER DEVELOPMENTS` bullet or to one delta bullet of the *same*
+packet as the section it appears in.
 
 - Never add background, motivation, consequences, predictions, or status
   from memory or general Git knowledge.
-- Never present a fact found only in `BACKGROUND` as something that
-  happened today. In particular, do not resurface an old patch revision,
-  review, decision, or integration milestone as a new development.
+- Never present a fact found only in `BACKGROUND` or `EARLIER
+  DEVELOPMENTS` as something that happened today. In particular, do not
+  resurface an old patch revision, review, decision, or integration
+  milestone as a new development.
 - `BACKGROUND` never establishes readiness, integration status,
   positions, review findings, agreement, consensus, controversy, urgency,
   quality, or any future outcome. Every statement of that kind must come
-  from an explicit delta bullet in the same packet, or be omitted. This
-  holds even when the thread root's own text calls the work finished,
-  tested, ready, or urgent.
+  from an explicit delta bullet in the same packet (or, as something that
+  happened earlier, from an `EARLIER DEVELOPMENTS` bullet), or be
+  omitted. This holds even when the thread root's own text calls the work
+  finished, tested, ready, or urgent.
 - The background text may be weeks old and may describe an earlier
   revision than today's. Never date it, never present it as today's
   posting, and never infer from it what has happened since.
-- Within one packet the bullets are chronological. When a later bullet
-  corrects, retracts, narrows, or supersedes an earlier one, report the
-  later state; state the correction itself whenever it is material. Never
-  publish a claim that a later bullet in the same packet withdrew.
+- Use `EARLIER DEVELOPMENTS` only to say, in a sentence or two after
+  today's news, how the thread got to today: what was proposed, what was
+  objected to, which revisions followed. Write it in the past tense and
+  say "earlier" or "previously", never a date. Older developments may be
+  missing, so never say how the thread began, and never repeat an earlier
+  status such as "queued" or "ready" as current.
+- Within one packet the bullets are chronological, `EARLIER DEVELOPMENTS`
+  first. When a later bullet corrects, retracts, narrows, or supersedes an
+  earlier one, report the later state; state the correction itself
+  whenever it is material. Never publish a claim that a later bullet in
+  the same packet withdrew.
 - When a delta reports a new revision or a resend of a series, report
   only the changes that today's text states. The series' standing
   purpose, feature list, or motivation carried into the cover letter is
