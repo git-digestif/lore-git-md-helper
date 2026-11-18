@@ -21,6 +21,7 @@ use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
 use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
+use crate::thread_activity::ThreadActivity;
 use crate::thread_deltas::{self, ThreadDeltas};
 use crate::thread_file::{self, ThreadTree};
 use crate::wc_parse::{self, WcTopic};
@@ -1258,6 +1259,9 @@ pub struct ThreadDayActivity {
     /// `None` when Junio has not published a verdict for this thread,
     /// or when today has no "What's cooking" email at all.
     pub wc_status: Option<WcTopic>,
+    /// How much attention the thread has drawn by the end of today, or
+    /// `None` when its thread tree cannot be loaded.
+    pub activity: Option<ThreadActivity>,
 }
 
 pub struct DayEmailEvidence {
@@ -1323,12 +1327,15 @@ pub fn build_day_digest_input(
                 .expect("a grouped thread has at least one email");
             let root_source_excerpt = topic_source_evidence(&root_dk, latest_dk, git_ref, cat);
             let wc_status = lookup_wc_status(&root_dk, git_ref, cat, &wc_map);
+            let activity = thread_file::load_from_repo(cat, git_ref, &root_dk)
+                .and_then(|(_, tree)| ThreadActivity::as_of(&tree, day_of(latest_dk)));
             ThreadDayActivity {
                 root_dk,
                 thread_ai_before,
                 root_source_excerpt,
                 email_summaries: emails,
                 wc_status,
+                activity,
             }
         })
         .collect();
@@ -1664,6 +1671,7 @@ async fn extract_history_day(
         ),
         email_summaries,
         wc_status: None,
+        activity: None,
     };
     Ok(extract_thread_deltas(history_day, &activity, backend)
         .await?
@@ -1683,12 +1691,14 @@ struct RootDelta {
 /// One topic as the final editor sees it: an opaque ID, the thread root
 /// author's own background words, and today's delta bullets, colocated
 /// so that no cross-topic lookup is possible.
+#[derive(Clone)]
 struct TopicPacket {
     id: String,
     current_subject: Option<String>,
     background: Option<String>,
     bullets: Vec<String>,
     source: String,
+    activity: Option<ThreadActivity>,
 }
 
 /// Bind each delta to its cited email's source metadata, not to the
@@ -1907,6 +1917,7 @@ fn build_topic_packets(
                     std::slice::from_ref(thread),
                     thread.email_summaries.len(),
                 ),
+                activity: thread.activity.clone(),
             }
         })
         .collect()
@@ -1952,6 +1963,7 @@ struct DigestMode {
     label: &'static str,
     min_words: usize,
     max_words: usize,
+    long_limit: usize,
     notable_count: usize,
     brief_limit: usize,
 }
@@ -1960,6 +1972,7 @@ const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
     label: "human",
     min_words: 500,
     max_words: 900,
+    long_limit: 5,
     notable_count: 3,
     brief_limit: 8,
 };
@@ -1968,6 +1981,7 @@ const AI_DIGEST_MODE: DigestMode = DigestMode {
     label: "ai",
     min_words: 600,
     max_words: 1400,
+    long_limit: 8,
     notable_count: 5,
     brief_limit: 12,
 };
@@ -1990,6 +2004,29 @@ impl TopicSelection {
             brief,
         }
     }
+}
+
+/// The topics that lead a digest: the longest threads among the topics
+/// with a noteworthy update today, as many as the mode has room for.  At
+/// least three topics are always left for the ranking.
+fn long_tier(packets: &[TopicPacket], mode: &DigestMode) -> Vec<String> {
+    let mut long: Vec<_> = packets
+        .iter()
+        .filter_map(|packet| {
+            let activity = packet.activity.as_ref().filter(|a| a.is_long())?;
+            Some((activity, &packet.id))
+        })
+        .collect();
+    long.sort_by(|(a, a_id), (b, b_id)| {
+        b.replies
+            .cmp(&a.replies)
+            .then(b.messages_today.cmp(&a.messages_today))
+            .then(a_id.cmp(b_id))
+    });
+    long.into_iter()
+        .take(mode.long_limit.min(packets.len().saturating_sub(3)))
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 
 fn response_json(raw: &str) -> Result<&str> {
@@ -2041,6 +2078,12 @@ async fn select_digest_topics(
         packets.len() >= 3,
         "daily digest needs at least three source-grounded topics",
     );
+    let long = long_tier(packets, mode);
+    let pool: Vec<TopicPacket> = packets
+        .iter()
+        .filter(|packet| !long.contains(&packet.id))
+        .cloned()
+        .collect();
     let input = format!(
         "Date: {day}\nMode: {}\nThe editor has room for {} notable topics and \
          at most {} in-brief topics. Rank the supplied topics by their \
@@ -2048,7 +2091,7 @@ async fn select_digest_topics(
         mode.label,
         mode.notable_count,
         mode.brief_limit,
-        render_topic_packets(packets),
+        render_topic_packets(&pool),
     );
     let mut correction = String::new();
     for attempt in 1..=2 {
@@ -2059,8 +2102,13 @@ async fn select_digest_topics(
             .await
             .context("daily topic selection failed")?;
         trace_digest_attempt(mode.label, attempt, "selection-output.txt", &raw)?;
-        match parse_topic_ranking(&raw, packets) {
-            Ok(ranking) => return Ok(TopicSelection::from_ranking(ranking, mode)),
+        match parse_topic_ranking(&raw, &pool) {
+            Ok(ranking) => {
+                return Ok(TopicSelection {
+                    long,
+                    ..TopicSelection::from_ranking(ranking, mode)
+                });
+            }
             Err(err) if attempt == 1 => {
                 eprintln!("[digestive] topic selection rejected: {err:#}");
                 correction = format!(
@@ -4007,6 +4055,16 @@ mod tests {
         assert!(!context.contains("Original rebase proposal."));
         assert!(!context.contains("Individual patch"));
         assert!(!context.contains("Future context"));
+        assert_eq!(
+            threads[0].activity,
+            Some(ThreadActivity {
+                replies: 1,
+                participants: 1,
+                messages_today: 1,
+                days: 61,
+            }),
+            "the thread's activity counts what has happened by the day of its latest email",
+        );
         let earlier =
             topic_source_evidence(root, "2026/07/01/00-00-00", "test", &mut blobs).unwrap();
         assert!(earlier.contains("Original rebase proposal."));
@@ -4199,6 +4257,7 @@ mod tests {
             root_dk: "2026/06/26/05-48-11".into(),
             thread_ai_before: Some("prior summary claiming merged to master".into()),
             root_source_excerpt: None,
+            activity: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/07/01/08-50-41".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -4259,6 +4318,7 @@ mod tests {
             root_dk: "2026/05/01/21-35-37".into(),
             thread_ai_before: Some("poisoned prior rationale".into()),
             root_source_excerpt: None,
+            activity: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/07/13-09-14".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -4407,6 +4467,7 @@ mod tests {
             root_source_excerpt: source.map(str::to_string),
             email_summaries: Vec::new(),
             wc_status: None,
+            activity: None,
         }
     }
 
@@ -4771,6 +4832,7 @@ mod tests {
                 background: None,
                 bullets: vec![format!("New development {index}.")],
                 source: format!("Source {index}."),
+                activity: None,
             })
             .collect()
     }
@@ -7195,6 +7257,15 @@ Prose about completing subcommands of the new history command.
         assert_eq!(ledger.day(days[0]), None);
     }
 
+    fn long_activity(replies: usize, messages_today: usize) -> Option<ThreadActivity> {
+        Some(ThreadActivity {
+            replies,
+            participants: 3,
+            messages_today,
+            days: 10,
+        })
+    }
+
     /// `valid_digest` with a `## Long threads` section ahead of the day
     /// in brief.
     fn digest_with_long_threads(ids: &[&str]) -> String {
@@ -7211,6 +7282,47 @@ Prose about completing subcommands of the new history command.
             "## The day in brief",
             &format!("## Long threads\n\n{section}## The day in brief"),
         )
+    }
+
+    fn inputs_to(requests: &[wiremock::Request], system: &str) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                (body["messages"][0]["content"].as_str() == Some(system))
+                    .then(|| body["messages"][1]["content"].as_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_the_longest_threads_lead_and_three_topics_stay_for_the_ranking() {
+        let mut packets = selection_packets(12);
+        for (index, activity) in [
+            (1, long_activity(25, 1)),
+            (3, long_activity(40, 2)),
+            (5, long_activity(25, 9)),
+            (7, long_activity(3, 8)),
+            (9, long_activity(19, 7)),
+        ] {
+            packets[index].activity = activity;
+        }
+        // Longest first, then the busier day; T10 is not long.
+        assert_eq!(
+            long_tier(&packets, &HUMAN_DIGEST_MODE),
+            ["T04", "T06", "T02", "T08"],
+        );
+        let capped = DigestMode {
+            long_limit: 2,
+            ..HUMAN_DIGEST_MODE
+        };
+        assert_eq!(long_tier(&packets, &capped), ["T04", "T06"]);
+
+        let mut few = selection_packets(5);
+        for packet in &mut few {
+            packet.activity = long_activity(30, 1);
+        }
+        assert_eq!(long_tier(&few, &HUMAN_DIGEST_MODE), ["T01", "T02"]);
     }
 
     #[test]
@@ -7259,5 +7371,55 @@ Prose about completing subcommands of the new history command.
         );
         let issue = selection_issue(&bare, &selection(&[])).unwrap();
         assert!(issue.contains("no topic is assigned"), "{issue}");
+    }
+
+    #[tokio::test]
+    async fn test_long_threads_lead_the_digest_and_skip_the_ranking() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let draft = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, _) = scripted_digest_backend(vec![draft.clone()], "").await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(result, strip_topic_tags(&draft));
+        assert!(result.contains("## Long threads\n\n### long discussion T06"));
+        let requests = server.received_requests().await.unwrap();
+        let ranker = inputs_to(&requests, DAILY_SELECT_AGENT);
+        assert_eq!(ranker.len(), 1);
+        assert!(ranker[0].contains("TOPIC T04\n"));
+        assert!(!ranker[0].contains("TOPIC T05\n") && !ranker[0].contains("TOPIC T06\n"));
+        let editor = inputs_to(&requests, DAILY_DIGEST_AGENT);
+        assert_eq!(editor.len(), 1);
+        assert!(editor[0].contains("Use exactly these IDs for long-thread headings: T06, T05."));
+        assert!(editor[0].find("TOPIC T06").unwrap() < editor[0].find("TOPIC T01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_a_digest_that_omits_its_long_threads_is_rejected() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let good = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, writer_calls) =
+            scripted_digest_backend(vec![valid_digest(&HUMAN_DIGEST_MODE, 0), good.clone()], "")
+                .await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        assert_eq!(result, strip_topic_tags(&good));
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let editor = inputs_to(
+            &server.received_requests().await.unwrap(),
+            DAILY_DIGEST_AGENT,
+        );
+        assert!(editor[1].contains(
+            "long-thread headings under `## Long threads` must use exactly these selected IDs: T06, T05"
+        ));
     }
 }

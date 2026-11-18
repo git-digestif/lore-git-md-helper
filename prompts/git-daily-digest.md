@@ -179,7 +179,8 @@ if it exceeds 900, compress the prose and drop the least consequential
 topics until it fits. Never overrun it in order to cover one more thread.
 Aim for 700 words. Having a packet does not require including that topic;
 select fewer topics rather than removing the context that makes them useful.
-Code supplies three notable topics and up to eight in-brief candidates.
+Code supplies up to five long-thread topics, three notable topics and up
+to eight in-brief candidates.
 
 Use exactly these sections, in this order, at these heading levels:
 
@@ -221,7 +222,8 @@ suitable as input to a weekly digest, keeping each packet separate.
 
 Write 600-1400 words. This range is hard: compress or drop the least
 consequential material rather than overrunning it.
-Code supplies up to five notable topics and twelve in-brief candidates.
+Code supplies up to eight long-thread topics, five notable topics and
+twelve in-brief candidates.
 
 ## Style
 
