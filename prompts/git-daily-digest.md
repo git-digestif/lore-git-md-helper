@@ -226,7 +226,7 @@ suitable as input to a weekly digest, keeping each packet separate.
 
 Write 600-1400 words. This range is hard: compress or drop the least
 consequential material rather than overrunning it.
-Code supplies up to eight long-thread topics, five notable topics and
+Code supplies up to five long-thread topics, five notable topics and
 twelve in-brief candidates.
 
 ## Style

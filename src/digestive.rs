@@ -1987,7 +1987,7 @@ const AI_DIGEST_MODE: DigestMode = DigestMode {
     label: "ai",
     min_words: 600,
     max_words: 1400,
-    long_limit: 8,
+    long_limit: 5,
     thread_roots: true,
     notable_count: 5,
     brief_limit: 12,
