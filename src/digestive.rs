@@ -1699,6 +1699,7 @@ struct TopicPacket {
     bullets: Vec<String>,
     source: String,
     activity: Option<ThreadActivity>,
+    root_dk: String,
 }
 
 /// Bind each delta to its cited email's source metadata, not to the
@@ -1918,6 +1919,7 @@ fn build_topic_packets(
                     thread.email_summaries.len(),
                 ),
                 activity: thread.activity.clone(),
+                root_dk: thread.root_dk.clone(),
             }
         })
         .collect()
@@ -1964,6 +1966,9 @@ struct DigestMode {
     min_words: usize,
     max_words: usize,
     long_limit: usize,
+    /// Whether the note on a long thread names its root date-key, which is
+    /// how a reader finds the thread file.
+    thread_roots: bool,
     notable_count: usize,
     brief_limit: usize,
 }
@@ -1973,6 +1978,7 @@ const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
     min_words: 500,
     max_words: 900,
     long_limit: 5,
+    thread_roots: false,
     notable_count: 3,
     brief_limit: 8,
 };
@@ -1982,6 +1988,7 @@ const AI_DIGEST_MODE: DigestMode = DigestMode {
     min_words: 600,
     max_words: 1400,
     long_limit: 8,
+    thread_roots: true,
     notable_count: 5,
     brief_limit: 12,
 };
@@ -2250,15 +2257,28 @@ async fn generate_digest_mode(
     let mut approved = HashMap::new();
     let mut structural_rejections = 0;
     let mut audit_rounds = 0;
+    // Code adds a note to every long thread once the digest has passed the
+    // audit.  Those words count toward the window like the rest of the
+    // published digest, so the editor's own words get what is left.
+    let note_words: usize = packets
+        .iter()
+        .filter(|packet| ids.contains(&packet.id.as_str()))
+        .filter_map(|packet| long_thread_note(packet, mode))
+        .map(|note| digest_word_count(&note))
+        .sum();
+    let window = DigestMode {
+        max_words: mode.max_words.saturating_sub(note_words),
+        ..*mode
+    };
     // The word window the drafts are checked against, and the shortest
     // draft since the last audit whose only defect was exceeding it.
-    let mut limits = *mode;
+    let mut limits = window;
     let mut too_long: Option<(String, usize)> = None;
 
     for attempt in 1.. {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
-            output_contract(mode, &ids, &long_ids),
+            output_contract(&window, &ids, &long_ids),
         );
         let raw = if let Some((draft, findings)) = revision.take() {
             revise_digest_items(
@@ -2320,7 +2340,8 @@ async fn generate_digest_mode(
             )
             .await?;
             if issues.is_empty() {
-                return Ok(drop_empty_brief_section(&strip_topic_tags(&digest)));
+                let marked = mark_long_threads(&digest, packets, mode);
+                return Ok(drop_empty_brief_section(&strip_topic_tags(&marked)));
             }
             revision = Some((digest.clone(), issues.clone()));
         } else {
@@ -2757,6 +2778,9 @@ fn output_contract(mode: &DigestMode, ids: &[&str], long_ids: &[&str]) -> String
          `Impact`, `What changed` or `Why it matters`.\n\
          - Print no date other than the one in the title, and never print a \
          `Thread root:` marker or a date-key such as `2026/05/22`.\n\
+         - Never state how many replies, messages, participants or days a \
+         thread has, and never call a thread long: code adds the size of \
+         every long thread.\n\
          - Add no statistics, roundup, integration-status or outlook section.",
         mode.min_words,
         mode.max_words,
@@ -2878,6 +2902,83 @@ fn drop_empty_brief_section(md: &str) -> String {
         }
         _ => md.to_string(),
     }
+}
+
+/// The sentence that states how large a long thread is, from the
+/// archive's counts rather than from the editor's words; `None` for a
+/// thread that is not long.
+fn long_thread_note(packet: &TopicPacket, mode: &DigestMode) -> Option<String> {
+    let activity = packet.activity.as_ref().filter(|a| a.is_long())?;
+    let count =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let root = if mode.thread_roots {
+        format!(" (root {})", packet.root_dk)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "*Long thread{root}: {} so far from {} over {}; {} that day.*",
+        count(activity.replies, "reply", "replies"),
+        count(activity.participants, "participant", "participants"),
+        count(activity.days, "day", "days"),
+        count(activity.messages_today, "message", "messages"),
+    ))
+}
+
+/// Say how large every long thread is, as a line under its heading or at
+/// the end of its in-brief bullet.  This runs once a digest has passed
+/// validation and the factual audit, so the editor can neither state the
+/// numbers wrongly nor be audited on figures that come from the archive.
+fn mark_long_threads(digest: &str, packets: &[TopicPacket], mode: &DigestMode) -> String {
+    // Line number -> (the note goes on its own line below, the note)
+    let mut notes = HashMap::new();
+    for section in audit_sections(digest) {
+        let Some(note) = section
+            .topic_id
+            .and_then(|id| packets.iter().find(|packet| packet.id == id))
+            .and_then(|packet| long_thread_note(packet, mode))
+        else {
+            continue;
+        };
+        let (first, heading) = section.lines[0];
+        if heading.trim_start().starts_with("### ") {
+            notes.insert(first, (true, note));
+        } else if let Some((last, _)) = section
+            .lines
+            .iter()
+            .rev()
+            .find(|(_, l)| !l.trim().is_empty())
+        {
+            notes.insert(*last, (false, note));
+        }
+    }
+    if notes.is_empty() {
+        return digest.to_string();
+    }
+    let lines: Vec<_> = digest.lines().collect();
+    let mut out = String::with_capacity(digest.len() + 200 * notes.len());
+    for (index, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        match notes.get(&(index + 1)) {
+            Some((true, note)) => {
+                out.push_str("\n\n");
+                out.push_str(note);
+                if lines
+                    .get(index + 1)
+                    .is_some_and(|next| !next.trim().is_empty())
+                {
+                    out.push('\n');
+                }
+            }
+            Some((false, note)) => {
+                out.push(' ');
+                out.push_str(note);
+            }
+            None => {}
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn normalize_typography(md: &str) -> String {
@@ -4833,6 +4934,7 @@ mod tests {
                 bullets: vec![format!("New development {index}.")],
                 source: format!("Source {index}."),
                 activity: None,
+                root_dk: format!("2026/10/01/00-00-{index:02}"),
             })
             .collect()
     }
@@ -7385,9 +7487,20 @@ Prose about completing subcommands of the new history command.
             .await
             .unwrap();
 
-        assert_eq!(result, strip_topic_tags(&draft));
         assert!(result.contains("## Long threads\n\n### long discussion T06"));
+        // The archive's counts are added by code, after the audit.
+        assert!(result.contains(
+            "### long discussion T06\n\n\
+             *Long thread: 45 replies so far from 3 participants over 10 days; \
+             1 message that day.*\n\n"
+        ));
+        assert!(result.contains(
+            "*Long thread: 30 replies so far from 3 participants over 10 days; \
+             2 messages that day.*"
+        ));
         let requests = server.received_requests().await.unwrap();
+        let audit = inputs_to(&requests, DAILY_DIGEST_AUDIT_AGENT);
+        assert!(!audit.is_empty() && audit.iter().all(|input| !input.contains("Long thread")));
         let ranker = inputs_to(&requests, DAILY_SELECT_AGENT);
         assert_eq!(ranker.len(), 1);
         assert!(ranker[0].contains("TOPIC T04\n"));
@@ -7412,7 +7525,7 @@ Prose about completing subcommands of the new history command.
             .await
             .unwrap();
 
-        assert_eq!(result, strip_topic_tags(&good));
+        assert!(result.contains("## Long threads\n\n### long discussion T06"));
         assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         let editor = inputs_to(
             &server.received_requests().await.unwrap(),
@@ -7421,5 +7534,111 @@ Prose about completing subcommands of the new history command.
         assert!(editor[1].contains(
             "long-thread headings under `## Long threads` must use exactly these selected IDs: T06, T05"
         ));
+    }
+
+    #[test]
+    fn test_long_threads_are_marked_with_their_size() {
+        let mut packets = selection_packets(5);
+        packets[1].activity = long_activity(42, 8);
+        packets[2].activity = Some(ThreadActivity {
+            replies: 1,
+            participants: 1,
+            messages_today: 9,
+            days: 1,
+        });
+        packets[3].activity = long_activity(20, 1);
+        let digest = "\
+# Title
+
+## The day in brief
+
+Overview.
+
+## Notable threads
+
+### [T01] Short topic
+
+Prose.
+
+### [T02] Long topic
+
+Prose.
+
+### [T03] Busy day
+Prose right below the heading.
+
+## In brief
+
+- [T04] **Wrapped**: a bullet that
+  wraps onto a second line.
+- [T05] A short one.
+";
+
+        let t02 = "*Long thread: 42 replies so far from 3 participants over 10 days; \
+                   8 messages that day.*";
+        let t03 = "*Long thread: 1 reply so far from 1 participant over 1 day; \
+                   9 messages that day.*";
+        let t04 = "*Long thread: 20 replies so far from 3 participants over 10 days; \
+                   1 message that day.*";
+        let expected = digest
+            .replace(
+                "### [T02] Long topic\n",
+                &format!("### [T02] Long topic\n\n{t02}\n"),
+            )
+            .replace(
+                "### [T03] Busy day\n",
+                &format!("### [T03] Busy day\n\n{t03}\n\n"),
+            )
+            .replace(
+                "onto a second line.\n",
+                &format!("onto a second line. {t04}\n"),
+            );
+        assert_eq!(
+            mark_long_threads(digest, &packets, &HUMAN_DIGEST_MODE),
+            expected
+        );
+
+        // The AI digest also says where to find the thread.
+        assert!(
+            mark_long_threads(digest, &packets, &AI_DIGEST_MODE).contains(
+                "*Long thread (root 2026/10/01/00-00-02): 42 replies so far from 3 \
+                 participants over 10 days; 8 messages that day.*"
+            )
+        );
+
+        // Nothing changes for a digest without long threads.
+        let none = selection_packets(5);
+        assert_eq!(mark_long_threads(digest, &none, &HUMAN_DIGEST_MODE), digest);
+    }
+
+    #[tokio::test]
+    async fn test_long_thread_notes_count_toward_the_word_window() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let notes: usize = packets
+            .iter()
+            .filter_map(|packet| long_thread_note(packet, &HUMAN_DIGEST_MODE))
+            .map(|note| digest_word_count(&note))
+            .sum();
+        let padded = |words: usize| {
+            let digest = digest_with_long_threads(&["T06", "T05"]);
+            let have = digest_word_count(&digest);
+            digest.replace(
+                "\n\n## In brief",
+                &format!(" {}\n\n## In brief", vec!["alpha"; words - have].join(" ")),
+            )
+        };
+        let max = HUMAN_DIGEST_MODE.max_words;
+        let (_server, backend, writer_calls) =
+            scripted_digest_backend(vec![padded(max - notes + 1), padded(max - notes)], "").await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        // The first draft fits the window on its own, but not with the notes.
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(digest_word_count(&result), max);
     }
 }

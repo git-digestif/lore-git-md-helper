@@ -209,6 +209,10 @@ such as `### Key technical details`, `### Key developments`, `### Impact`
 or `### Status`, and no numbered lists. Never repeat the same `###`
 heading text.
 
+Code adds a line stating the size of every long thread under its heading,
+or at the end of its in-brief bullet. Never state a thread's replies,
+messages, participants or days yourself, and never call a thread long.
+
 Select and compress; do not mention every delta merely to fill space.
 
 ## AI mode
