@@ -3725,6 +3725,63 @@ pub async fn redo_daily(
     )
 }
 
+/// Regenerate the weekly digest files (`digest.weekly.human.md`,
+/// `digest.weekly.ai.md`) of the ISO week that ends on `sunday`, from
+/// the human daily digests at the tip of `git_ref`.
+///
+/// Meant to follow `redo_daily`: a weekly digest is built from the
+/// daily digests of its week, so it is out of date once they have been
+/// redone.
+///
+/// Writes a single fast-import commit `digestive: redo weekly digest
+/// for <sunday>` containing both files.
+pub async fn redo_weekly(
+    repo_path: &str,
+    git_ref: &str,
+    sunday: &str,
+    backend: &Backend,
+) -> Result<()> {
+    if iso_sunday(sunday).as_deref() != Some(sunday) {
+        anyhow::bail!("{sunday} is not a Sunday");
+    }
+    let monday = add_days(sunday, -6).ok_or_else(|| anyhow::anyhow!("bad day: {sunday}"))?;
+
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+    let digests: Vec<SubDigest> = (0..7)
+        .filter_map(|offset| add_days(&monday, offset))
+        .filter_map(|day| {
+            let content = cat.get_str(&format!("{git_ref}:{day}/digest.human.md"))?;
+            Some(SubDigest {
+                label: day,
+                content,
+            })
+        })
+        .collect();
+    if digests.is_empty() {
+        anyhow::bail!("no daily digests found for {monday}..{sunday}");
+    }
+
+    let result = generate_periodic_digest(
+        &format!("{monday} -- {sunday}"),
+        Granularity::Weekly,
+        &digests,
+        backend,
+    )
+    .await?;
+
+    let human_path = format!("{sunday}/digest.weekly.human.md");
+    let ai_path = format!("{sunday}/digest.weekly.ai.md");
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: redo weekly digest for {sunday}"),
+        &[
+            (human_path.as_str(), result.human.as_str()),
+            (ai_path.as_str(), result.ai.as_str()),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7358,6 +7415,113 @@ Prose about completing subcommands of the new history command.
             ledger_days(&mut cat, git_ref, THREAD_OPENED),
             ["2025/03/01", "2025/03/02"],
         );
+    }
+
+    /// Commit `files` to `git_ref` of the repository at `repo`.
+    fn seed_files(repo: &str, git_ref: &str, files: &[(&str, &str)]) {
+        let mut fi = FastImport::new(repo, git_ref).unwrap();
+        fi.commit("seed", files).unwrap();
+        fi.finish().unwrap();
+    }
+
+    /// A backend that answers every request with "A digest.", and the
+    /// server that records the requests.
+    async fn recording_backend() -> (wiremock::MockServer, Backend) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "A digest."}}]
+            })))
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        (server, backend)
+    }
+
+    /// The user message of every request the server has received.
+    async fn user_messages(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["messages"][1]["content"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_redo_weekly_reads_the_human_digests_of_that_week_only() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(
+            repo,
+            git_ref,
+            &[
+                ("2025/01/05/digest.human.md", "Digest of the Sunday before."),
+                ("2025/01/06/digest.human.md", "Digest of the Monday."),
+                ("2025/01/08/digest.ai.md", "AI digest of the Wednesday."),
+                ("2025/01/12/digest.human.md", "Digest of the Sunday."),
+                ("2025/01/13/digest.human.md", "Digest of the Monday after."),
+            ],
+        );
+        let (server, backend) = recording_backend().await;
+
+        redo_weekly(repo, git_ref, "2025/01/12", &backend)
+            .await
+            .unwrap();
+
+        let asked = user_messages(&server).await;
+        assert_eq!(asked.len(), 2, "one request for each mode");
+        for message in &asked {
+            assert!(message.contains("Sub-period digests: 2"));
+            assert!(message.contains("Digest of the Monday."));
+            assert!(message.contains("Digest of the Sunday."));
+            assert!(!message.contains("Sunday before"));
+            assert!(!message.contains("Monday after"));
+            assert!(!message.contains("AI digest"));
+        }
+        let mut cat = CatFile::new(repo).unwrap();
+        for file in ["digest.weekly.human.md", "digest.weekly.ai.md"] {
+            let spec = format!("{git_ref}:2025/01/12/{file}");
+            assert!(
+                cat.get_str(&spec)
+                    .is_some_and(|text| text.contains("A digest."))
+            );
+        }
+        assert_eq!(
+            git_util::git(repo, &["log", "-1", "--format=%s", git_ref]).unwrap(),
+            "digestive: redo weekly digest for 2025/01/12"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redo_weekly_needs_a_sunday_with_daily_digests() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(repo, git_ref, &[("2025/01/06/digest.human.md", "Digest.")]);
+        let (server, backend) = recording_backend().await;
+
+        let error = redo_weekly(repo, git_ref, "2025/01/08", &backend)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a Sunday"));
+        let error = redo_weekly(repo, git_ref, "2025/01/19", &backend)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no daily digests"));
+        assert!(user_messages(&server).await.is_empty());
     }
 
     /// A thread with one message a day on `count` days from 2025/03/01,

@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use lore_git_md_helper::ai_backend::BackendArgs;
-use lore_git_md_helper::digestive::{Digestive, redo_daily, resummarize_email, resummarize_thread};
+use lore_git_md_helper::digestive::{
+    Digestive, redo_daily, redo_weekly, resummarize_email, resummarize_thread,
+};
 use lore_git_md_helper::git_util::last_digest_day;
 
 #[derive(Parser)]
@@ -78,6 +80,14 @@ enum Cmd {
         /// The day (e.g. "2026/07/02").
         day: String,
     },
+    /// Regenerate `digest.weekly.human.md` and `digest.weekly.ai.md`
+    /// for the week that ends on a given Sunday from the human daily
+    /// digests at the current tip.  Run it after `redo-daily` has
+    /// redone the days of that week.
+    RedoWeekly {
+        /// The Sunday that ends the week (e.g. "2026/07/05").
+        sunday: String,
+    },
 }
 
 #[tokio::main]
@@ -135,6 +145,12 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .context("--dry-run is not supported for redo-daily")?;
             redo_daily(&target_repo, &git_ref, &day, backend).await
+        }
+        Some(Cmd::RedoWeekly { sunday }) => {
+            let backend = backend
+                .as_ref()
+                .context("--dry-run is not supported for redo-weekly")?;
+            redo_weekly(&target_repo, &git_ref, &sunday, backend).await
         }
     }
 }
