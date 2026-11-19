@@ -3427,6 +3427,28 @@ pub(crate) fn build_daily_digest_user_msg(
     user_msg
 }
 
+/// Commit `files` on top of the tip of `git_ref`.  The commit carries the
+/// tip's `Source-Commit` trailer, which `update-lore-git-md` compares with
+/// the one of the notes ref.
+fn commit_on_tip(
+    repo_path: &str,
+    git_ref: &str,
+    subject: &str,
+    files: &[(&str, &str)],
+) -> Result<()> {
+    let mut fi = FastImport::new(repo_path, git_ref)?;
+    if let Some(oid) = resolve_ref(repo_path, git_ref) {
+        fi.set_parent(oid);
+    }
+    let mut msg = subject.to_string();
+    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
+        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+    }
+    fi.commit(&msg, files)?;
+    fi.checkpoint()?;
+    fi.finish()
+}
+
 /// Rebuild one thread's `.thread.ai.md` and `.thread.human.md` from
 /// scratch by walking the thread's emails in chronological order and
 /// feeding each per-email `.ai.md` back through the thread agent.
@@ -3506,26 +3528,17 @@ pub async fn resummarize_thread(
     let final_ai = prev_ai.ok_or_else(|| anyhow::anyhow!("no per-email .ai.md found in thread"))?;
     let final_human = prev_human.expect("populated alongside prev_ai");
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: resummarize thread {root_dk}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let ai_path = format!("{root_dk}.thread.ai.md");
     let human_path = format!("{root_dk}.thread.human.md");
-    fi.commit(
-        &msg,
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: resummarize thread {root_dk}"),
         &[
             (ai_path.as_str(), final_ai.as_str()),
             (human_path.as_str(), final_human.as_str()),
         ],
-    )?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    )
 }
 
 /// Regenerate every per-email `.ai.md` and `.human.md` file within
@@ -3624,22 +3637,16 @@ pub async fn resummarize_email(
         files.push((format!("{root_dk}.thread.human.md"), human));
     }
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: resummarize per-email briefs in thread {root_dk}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect();
-    fi.commit(&msg, &refs)?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: resummarize per-email briefs in thread {root_dk}"),
+        &refs,
+    )
 }
 
 /// Regenerate the daily digest files (`digest.human.md`, `digest.ai.md`)
@@ -3698,14 +3705,6 @@ pub async fn redo_daily(
     let digest =
         generate_daily_digest(day, &threads, email_count, backend, git_ref, &mut cat).await?;
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: redo daily digest for {day}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let human_path = format!("{day}/digest.human.md");
     let ai_path = format!("{day}/digest.ai.md");
     let mut files = vec![
@@ -3718,10 +3717,12 @@ pub async fn redo_daily(
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str())),
     );
-    fi.commit(&msg, &files)?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: redo daily digest for {day}"),
+        &files,
+    )
 }
 
 #[cfg(test)]
