@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 use lore_git_md_helper::ai_backend::BackendArgs;
 use lore_git_md_helper::digestive::{
-    Digestive, redo_daily, redo_weekly, resummarize_email, resummarize_thread,
+    Digestive, redo_daily, redo_monthly, redo_weekly, resummarize_email, resummarize_thread,
 };
 use lore_git_md_helper::git_util::last_digest_day;
 
@@ -88,6 +88,14 @@ enum Cmd {
         /// The Sunday that ends the week (e.g. "2026/07/05").
         sunday: String,
     },
+    /// Regenerate `digest.monthly.human.md` and `digest.monthly.ai.md`
+    /// for a month from the human weekly digests of the weeks that
+    /// overlap it at the current tip.  Run it after `redo-weekly` has
+    /// redone those weeks.
+    RedoMonthly {
+        /// The month (e.g. "2026/07").
+        month: String,
+    },
 }
 
 #[tokio::main]
@@ -151,6 +159,12 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .context("--dry-run is not supported for redo-weekly")?;
             redo_weekly(&target_repo, &git_ref, &sunday, backend).await
+        }
+        Some(Cmd::RedoMonthly { month }) => {
+            let backend = backend
+                .as_ref()
+                .context("--dry-run is not supported for redo-monthly")?;
+            redo_monthly(&target_repo, &git_ref, &month, backend).await
         }
     }
 }
