@@ -27,6 +27,15 @@ impl Granularity {
             Granularity::Monthly => "monthly",
         }
     }
+
+    /// The most threads that the leading `## Long threads` section of a
+    /// digest may have; the prompt states the same numbers.
+    fn long_thread_limit(self) -> usize {
+        match self {
+            Granularity::Weekly => 8,
+            Granularity::Monthly => 10,
+        }
+    }
 }
 
 /// A single sub-period digest to include in the periodic rollup.
@@ -106,11 +115,26 @@ fn is_long_threads_heading(heading: &str) -> bool {
         .eq_ignore_ascii_case("long threads")
 }
 
+/// The number of subsections of the leading `## Long threads` section.
+fn long_thread_count(digest: &str) -> usize {
+    let mut lines = digest.lines().skip_while(|line| {
+        !line
+            .strip_prefix("## ")
+            .is_some_and(is_long_threads_heading)
+    });
+    lines.next();
+    lines
+        .take_while(|line| !line.starts_with("## "))
+        .filter(|line| line.starts_with("### "))
+        .count()
+}
+
 /// What is wrong with the way a periodic digest treats long threads.
 /// Their lines are code's figures, so the editor may only copy them from
 /// a sub-period digest.  A digest leads with its long threads when the
-/// sub-period digests mark any, and has no such section otherwise.
-fn long_thread_issues(digest: &str, digests: &[SubDigest]) -> Vec<String> {
+/// sub-period digests mark any, has no such section otherwise, and
+/// gives at most `limit` threads a subsection.
+fn long_thread_issues(digest: &str, digests: &[SubDigest], limit: usize) -> Vec<String> {
     let known = known_long_thread_keys(digests);
     let mut issues: Vec<_> = long_thread_lines(digest)
         .filter(|line| !known.contains(long_thread_key(line)))
@@ -137,6 +161,13 @@ fn long_thread_issues(digest: &str, digests: &[SubDigest]) -> Vec<String> {
              `## Long threads` section"
                 .to_string(),
         );
+    }
+    let threads = long_thread_count(digest);
+    if threads > limit {
+        issues.push(format!(
+            "the `## Long threads` section has {threads} subsections; keep \
+             the {limit} threads with the most replies and leave out the others"
+        ));
     }
     issues
 }
@@ -167,9 +198,11 @@ async fn generate_mode(
     user_msg: &str,
     digests: &[SubDigest],
     backend: &Backend,
-    label: &str,
+    granularity: Granularity,
     clean: fn(&str) -> String,
 ) -> Result<String> {
+    let label = granularity.label();
+    let limit = granularity.long_thread_limit();
     let prompt = format!("Mode: {mode}\n\n{user_msg}");
     let chat = |prompt: String| async move {
         let draft = backend
@@ -179,7 +212,7 @@ async fn generate_mode(
         anyhow::Ok(clean(&draft))
     };
     let draft = chat(prompt.clone()).await?;
-    let issues = long_thread_issues(&draft, digests);
+    let issues = long_thread_issues(&draft, digests, limit);
     if issues.is_empty() {
         return Ok(draft);
     }
@@ -193,12 +226,14 @@ async fn generate_mode(
          Write the whole digest again and fix every point."
     ))
     .await?;
-    if long_thread_issues(&draft, digests).is_empty() {
+    let issues = long_thread_issues(&draft, digests, limit);
+    if issues.is_empty() {
         return Ok(draft);
     }
     eprintln!(
-        "[periodic] {label} digest ({mode}) rejected again; publishing it without \
-         the long-thread lines that no sub-period digest has"
+        "[periodic] {label} digest ({mode}) rejected again: {}; publishing it \
+         without the long-thread lines that no sub-period digest has",
+        issues.join("; ")
     );
     Ok(without_invented_long_thread_lines(&draft, digests))
 }
@@ -223,14 +258,13 @@ pub async fn generate_periodic_digest(
         },
     );
 
-    let label = granularity.label();
     let human = generate_mode(
         "human",
         &system,
         &user_msg,
         digests,
         backend,
-        label,
+        granularity,
         normalize_headings,
     )
     .await?;
@@ -240,7 +274,7 @@ pub async fn generate_periodic_digest(
         &user_msg,
         digests,
         backend,
-        label,
+        granularity,
         str::to_string,
     )
     .await?;
@@ -334,19 +368,20 @@ mod tests {
     #[test]
     fn test_long_thread_lines_are_copied_and_lead_the_digest() {
         let digests = a_day_with_a_long_thread();
+        let limit = Granularity::Weekly.long_thread_limit();
         let led = a_period_that_leads_with_it();
-        assert!(long_thread_issues(&led, &digests).is_empty());
+        assert!(long_thread_issues(&led, &digests, limit).is_empty());
 
         // A figure the editor changed or wrote itself.
         let changed = led.replace("31 replies", "33 replies");
-        let issues = long_thread_issues(&changed, &digests);
+        let issues = long_thread_issues(&changed, &digests, limit);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("33 replies"));
 
         // The section has to come first.
         let late =
             format!("## The period in brief\n\nText.\n\n## Long threads\n\n{LONG_THREAD_LINE}\n");
-        let issues = long_thread_issues(&late, &digests);
+        let issues = long_thread_issues(&late, &digests, limit);
         assert!(issues.iter().any(|issue| issue.contains("must open")));
 
         // Without a marked thread there is no such section.
@@ -354,9 +389,28 @@ mod tests {
             label: "2025/01/06".into(),
             content: "A quiet day.".into(),
         }];
-        assert!(long_thread_issues("## The period in brief\n\nText.\n", &quiet).is_empty());
-        let issues = long_thread_issues(&led, &quiet);
+        assert!(long_thread_issues("## The period in brief\n\nText.\n", &quiet, limit).is_empty());
+        let issues = long_thread_issues(&led, &quiet, limit);
         assert!(issues.iter().any(|issue| issue.contains("leave out")));
+    }
+
+    /// Only the subsections of the leading section count, not the items
+    /// of the sections after it.
+    #[test]
+    fn test_the_long_threads_section_has_at_most_as_many_threads_as_the_limit() {
+        let digests = a_day_with_a_long_thread();
+        let subsections: String = (0..3)
+            .map(|n| format!("### thread {n}\n\n{LONG_THREAD_LINE}\n\nText.\n\n"))
+            .collect();
+        let digest = format!(
+            "## Long threads\n\n{subsections}## Key developments\n\n### item one\n\nText.\n\n\
+             ### item two\n\nText.\n"
+        );
+        assert!(long_thread_issues(&digest, &digests, 3).is_empty());
+        let issues = long_thread_issues(&digest, &digests, 2);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("has 3 subsections"));
+        assert!(issues[0].contains("keep the 2 threads"));
     }
 
     #[tokio::test]

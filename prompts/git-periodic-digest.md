@@ -40,9 +40,12 @@ Markdown headings. The sections are:
 **Long threads.** Only when a sub-period digest has a long-thread line;
 otherwise leave this section out. Open the digest with a `## Long
 threads` section, ahead of the period in brief. Write one `###`
-subsection for every thread that any sub-period digest marks as long,
-merging the days on which it appears (the same work, usually under the
-same or a similar heading), the thread with the most replies first.
+subsection for each of the threads that any sub-period digest marks as
+long, at most eight for a weekly digest and ten for a monthly digest;
+when there are more, keep the threads with the most replies and treat
+the others like any other topic. Merge the days on which a thread
+appears (the same work, usually under the same or a similar heading),
+the thread with the most replies first.
 Directly under each heading, copy the long-thread line of the sub-period
 digest in which that thread's reply count is highest, without the part
 after the semicolon, for example `*Long thread: 77 replies so far from 6
@@ -50,7 +53,7 @@ participants over 56 days.*`. Never write such a line yourself and never
 change a figure in one. Follow it with one paragraph of roughly 60--100
 words on how the thread developed during the period and where it stands
 at the end. Do not cover these threads again under Key developments or
-In brief.
+In brief. This section counts toward the word range below.
 
 **The period in brief.** Two to four sentences. State the period, the
 overall volume and tone (how many active days, whether traffic was heavy or
