@@ -17,20 +17,16 @@ You will receive:
 
 - The **period** being covered (e.g. "2025/01/01 -- 2025/01/05",
   "2025 January", "2025 Q1").
-- For **weekly** digests: the **daily digests** for each day in the
-  period, delimited by `---` and labelled with the date. Weekend and
-  holiday days with no traffic will be absent.
-- For **monthly** digests: the **weekly digests** for each week in the
-  period, delimited by `---` and labelled with the date range. Each
-  weekly digest has already been filtered; your job is to synthesize
-  them, not to re-filter raw data.
+- The **daily digests** for each day in the period, delimited by `---`
+  and labelled with the date. Weekend and holiday days with no traffic
+  will be absent. Each daily digest has already been filtered; your job
+  is to synthesize them, not to re-filter raw data.
 - The **granularity**: "weekly" or "monthly".
 
 Daily digests list the threads that drew the most replies under
 `## Long threads`. A line such as `*Long thread: 77 replies so far from 6
 participants over 56 days; 8 messages that day.*` stands directly under
-the heading of every thread that is long, wherever it appears. Weekly
-digests carry the same line without the part after the semicolon.
+the heading of every thread that is long, wherever it appears.
 
 ## Structure
 

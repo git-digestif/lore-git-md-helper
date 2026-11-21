@@ -89,9 +89,8 @@ enum Cmd {
         sunday: String,
     },
     /// Regenerate `digest.monthly.human.md` and `digest.monthly.ai.md`
-    /// for a month from the human weekly digests of the weeks that
-    /// overlap it at the current tip.  Run it after `redo-weekly` has
-    /// redone those weeks.
+    /// for a month from the human daily digests of its days at the
+    /// current tip.  Run it after `redo-daily` has redone those days.
     RedoMonthly {
         /// The month (e.g. "2026/07").
         month: String,

@@ -16,7 +16,7 @@ use regex::Regex;
 use crate::ai_backend::{self, Backend};
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
-use crate::date_util::{add_days, day_of, iso_sunday, month_of};
+use crate::date_util::{add_days, day_of, iso_sunday, month_of, parse_day};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
@@ -422,8 +422,6 @@ pub struct Digestive<'a> {
     /// Days (e.g. "2025/01/02") with a daily `digest.ai.md`, seen in
     /// ls-tree or generated this run.  Content is read via CachedReader.
     daily_digest_days: std::collections::BTreeSet<String>,
-    /// Sundays (e.g. "2025/01/05") with a weekly `digest.weekly.ai.md`.
-    weekly_digest_sundays: std::collections::BTreeSet<String>,
     /// Resolved OID of the commit whose tree represents the "before
     /// today" thread state for daily digest generation.  Cleared after
     /// each daily digest commit so that the next day re-resolves it
@@ -501,7 +499,6 @@ impl<'a> Digestive<'a> {
             dry_run,
             batch_size,
             daily_digest_days: std::collections::BTreeSet::new(),
-            weekly_digest_sundays: std::collections::BTreeSet::new(),
             before_oid,
             last_digested_day,
             total_processed: 0,
@@ -924,7 +921,6 @@ impl<'a> Digestive<'a> {
         )
         .await?;
 
-        self.weekly_digest_sundays.insert(week_sunday.to_string());
         self.cached.insert(
             format!("{}:{week_sunday}/digest.weekly.human.md", self.git_ref),
             result.human.clone(),
@@ -966,39 +962,30 @@ impl<'a> Digestive<'a> {
             return Ok(());
         }
 
-        // Collect weekly digests from the precomputed set, reading
-        // content via CachedReader.  A week overlaps this month if
-        // its Monday..Sunday range intersects the month's day range.
-        let month_start = format!("{month}/01");
-        let month_end = format!("{month}/31");
+        // Collect the month's daily digests from the precomputed set,
+        // reading content via CachedReader.  Weekly digests would also
+        // bring in the days of the neighboring months.
+        let from = format!("{month}/01");
+        let to = format!("{month}/31");
         let digests: Vec<_> = self
-            .weekly_digest_sundays
-            .iter()
-            .filter_map(|sunday| {
-                let monday = add_days(sunday, -6)?;
-                let overlaps = sunday.as_str() >= month_start.as_str()
-                    && monday.as_str() <= month_end.as_str();
-                if !overlaps {
-                    return None;
-                }
-                let spec = format!("{}:{sunday}/digest.weekly.human.md", self.git_ref,);
-                let content = self.cached.get_str(&spec)?;
-                Some(SubDigest {
-                    label: format!("{monday} -- {sunday}"),
+            .daily_digest_days
+            .range(from.clone()..=to.clone())
+            .filter_map(|day| {
+                let spec = format!("{}:{day}/digest.human.md", self.git_ref);
+                self.cached.get_str(&spec).map(|content| SubDigest {
+                    label: day.clone(),
                     content,
                 })
             })
             .collect();
         if digests.is_empty() {
             eprintln!(
-                "[digestive] no weekly digests for {month}, \
+                "[digestive] no daily digests for {month}, \
                 skipping monthly digest"
             );
             return Ok(());
         }
 
-        let from = format!("{month}/01");
-        let to = format!("{month}/31");
         let label = format!("{from} -- {to}");
         let result = generate_periodic_digest(
             &label,
@@ -1126,7 +1113,6 @@ impl<'a> Digestive<'a> {
                 } else if dk.ends_with("/digest.weekly") {
                     state.week_has_digest = true;
                     state.month_has_content = true;
-                    self.weekly_digest_sundays.insert(day.to_string());
                 } else if dk.ends_with("/digest.monthly") {
                     state.month_has_digest = true;
                 } else if !dk.ends_with(".thread") {
@@ -3783,12 +3769,12 @@ pub async fn redo_weekly(
 }
 
 /// Regenerate the monthly digest files (`digest.monthly.human.md`,
-/// `digest.monthly.ai.md`) of `month` ("YYYY/MM"), from the human weekly
-/// digests of the weeks that overlap it at the tip of `git_ref`.
+/// `digest.monthly.ai.md`) of `month` ("YYYY/MM"), from the human daily
+/// digests of its days at the tip of `git_ref`.
 ///
-/// Meant to follow `redo_weekly`: a monthly digest is built from the
-/// weekly digests of its month, so it is out of date once they have
-/// been redone.
+/// Meant to follow `redo_daily`: a monthly digest is built from the
+/// daily digests of its month, so it is out of date once they have been
+/// redone.
 ///
 /// Writes a single fast-import commit `digestive: redo monthly digest
 /// for <month>` containing both files.
@@ -3798,28 +3784,25 @@ pub async fn redo_monthly(
     month: &str,
     backend: &Backend,
 ) -> Result<()> {
-    // As in the pipeline, a week overlaps the month when it ends on or
-    // after the 1st and starts on or before the 31st.
     let first = format!("{month}/01");
     let last = format!("{month}/31");
-    let mut sunday = iso_sunday(&first)
-        .filter(|_| month.len() == 7)
-        .ok_or_else(|| anyhow::anyhow!("{month} is not a month like 2026/07"))?;
+    if month.len() != 7 || parse_day(&first).is_none() {
+        anyhow::bail!("{month} is not a month like 2026/07");
+    }
 
     let mut cat = CatFile::new(repo_path).context("open target repo")?;
-    let mut digests = Vec::new();
-    while let Some(monday) = add_days(&sunday, -6).filter(|monday| *monday <= last) {
-        let spec = format!("{git_ref}:{sunday}/digest.weekly.human.md");
-        if let Some(content) = cat.get_str(&spec) {
-            digests.push(SubDigest {
-                label: format!("{monday} -- {sunday}"),
+    let digests: Vec<SubDigest> = (1..=31)
+        .map(|day| format!("{month}/{day:02}"))
+        .filter_map(|day| {
+            let content = cat.get_str(&format!("{git_ref}:{day}/digest.human.md"))?;
+            Some(SubDigest {
+                label: day,
                 content,
-            });
-        }
-        sunday = add_days(&sunday, 7).ok_or_else(|| anyhow::anyhow!("bad day: {sunday}"))?;
-    }
+            })
+        })
+        .collect();
     if digests.is_empty() {
-        anyhow::bail!("no weekly digests found for {month}");
+        anyhow::bail!("no daily digests found for {month}");
     }
 
     let result = generate_periodic_digest(
@@ -6758,14 +6741,17 @@ Prose about completing subcommands of the new history command.
         let monthly_jan = cat
             .get_str(&format!("{git_ref}:2025/01/digest.monthly.human.md"))
             .expect("monthly digest for Jan should exist");
-        // Monthly rolls up both weekly digests.
+        // Monthly rolls up the daily digests of January, and not the
+        // December day that belongs to the week ending Jan 05.
+        for day in ["2025/01/01", "2025/01/02", "2025/01/06"] {
+            assert!(
+                monthly_jan.contains(day),
+                "monthly Jan should include the daily digest of {day}"
+            );
+        }
         assert!(
-            monthly_jan.contains("2024/12/30"),
-            "monthly Jan should include week of Jan 05 (contains Dec 30)"
-        );
-        assert!(
-            monthly_jan.contains("2025/01/06"),
-            "monthly Jan should include week of Jan 12 (contains Jan 06)"
+            !monthly_jan.contains("2024/12/30"),
+            "monthly Jan must NOT include a daily digest of December"
         );
 
         // --- git fsck ---
@@ -7586,7 +7572,7 @@ Prose about completing subcommands of the new history command.
     }
 
     #[tokio::test]
-    async fn test_redo_monthly_reads_the_human_digests_of_the_weeks_overlapping_the_month() {
+    async fn test_redo_monthly_reads_the_human_digests_of_the_days_of_the_month() {
         let dir = crate::git_util::tests::init_bare_repo();
         let repo = dir.path().to_str().unwrap();
         let git_ref = "refs/heads/main";
@@ -7594,18 +7580,12 @@ Prose about completing subcommands of the new history command.
             repo,
             git_ref,
             &[
-                (
-                    "2024/12/29/digest.weekly.human.md",
-                    "Week before the month.",
-                ),
-                (
-                    "2025/01/05/digest.weekly.human.md",
-                    "Week of the first days.",
-                ),
-                ("2025/01/12/digest.weekly.ai.md", "AI weekly digest."),
-                ("2025/01/19/digest.weekly.human.md", "Week in the middle."),
-                ("2025/02/02/digest.weekly.human.md", "Week into February."),
-                ("2025/02/09/digest.weekly.human.md", "Week after the month."),
+                ("2024/12/31/digest.human.md", "Day before the month."),
+                ("2025/01/01/digest.human.md", "First day."),
+                ("2025/01/15/digest.ai.md", "AI digest of a day."),
+                ("2025/01/15/digest.human.md", "Day in the middle."),
+                ("2025/01/31/digest.human.md", "Last day."),
+                ("2025/02/01/digest.human.md", "Day after the month."),
             ],
         );
         let (server, backend) = recording_backend().await;
@@ -7618,12 +7598,12 @@ Prose about completing subcommands of the new history command.
         assert_eq!(asked.len(), 2, "one request for each mode");
         for message in &asked {
             assert!(message.contains("Sub-period digests: 3"));
-            assert!(message.contains("Week of the first days."));
-            assert!(message.contains("Week in the middle."));
-            assert!(message.contains("Date: 2025/01/27 -- 2025/02/02\n\nWeek into February."));
+            assert!(message.contains("Date: 2025/01/01\n\nFirst day."));
+            assert!(message.contains("Day in the middle."));
+            assert!(message.contains("Date: 2025/01/31\n\nLast day."));
             assert!(!message.contains("before the month"));
             assert!(!message.contains("after the month"));
-            assert!(!message.contains("AI weekly digest"));
+            assert!(!message.contains("AI digest"));
         }
         let mut cat = CatFile::new(repo).unwrap();
         for file in ["digest.monthly.human.md", "digest.monthly.ai.md"] {
@@ -7640,15 +7620,11 @@ Prose about completing subcommands of the new history command.
     }
 
     #[tokio::test]
-    async fn test_redo_monthly_needs_a_month_with_weekly_digests() {
+    async fn test_redo_monthly_needs_a_month_with_daily_digests() {
         let dir = crate::git_util::tests::init_bare_repo();
         let repo = dir.path().to_str().unwrap();
         let git_ref = "refs/heads/main";
-        seed_files(
-            repo,
-            git_ref,
-            &[("2025/01/05/digest.weekly.human.md", "Week.")],
-        );
+        seed_files(repo, git_ref, &[("2025/01/05/digest.human.md", "Day.")]);
         let (server, backend) = recording_backend().await;
 
         for month in ["2025/13", "2025/01/05", "2025/1"] {
@@ -7660,7 +7636,7 @@ Prose about completing subcommands of the new history command.
         let error = redo_monthly(repo, git_ref, "2025/03", &backend)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("no weekly digests"));
+        assert!(error.to_string().contains("no daily digests"));
         assert!(user_messages(&server).await.is_empty());
     }
 

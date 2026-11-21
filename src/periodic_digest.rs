@@ -38,10 +38,7 @@ impl Granularity {
     }
 }
 
-/// A single sub-period digest to include in the periodic rollup.
-///
-/// For weekly digests, this holds one day's daily digest.
-/// For monthly digests, this holds one week's weekly digest.
+/// A single daily digest to include in the periodic rollup.
 pub struct SubDigest {
     pub label: String,
     pub content: String,
@@ -249,13 +246,9 @@ pub async fn generate_periodic_digest(
     let user_msg = build_periodic_input(period_label, granularity, digests);
 
     eprintln!(
-        "[periodic] generating {} digest for {period_label} ({} {} digests) ...",
+        "[periodic] generating {} digest for {period_label} ({} daily digests) ...",
         granularity.label(),
         digests.len(),
-        match granularity {
-            Granularity::Weekly => "daily",
-            Granularity::Monthly => "weekly",
-        },
     );
 
     let human = generate_mode(
