@@ -76,11 +76,6 @@ patches, test modernization, and anything that deserves a mention but not
 a full paragraph. This section should be generous -- it costs only one
 sentence per topic and ensures the digest has no blind spots.
 
-**Looking ahead.** Optional. One or two paragraphs noting topics that are
-likely to dominate the next period: series that were posted late and will
-see review, "What's cooking" items flagged as needing discussion, ongoing
-efforts that made progress but did not conclude.
-
 ## Editorial judgment
 
 Your primary job is compression with minimal information loss. The daily
@@ -88,7 +83,7 @@ digests already filter for signal; your job is to filter the filtered.
 
 **Before writing, build an inventory.** Read every sub-period digest
 and list each distinct topic together with the sub-periods it appears
-in, its section placement (Key development / In brief / Looking ahead),
+in, its section placement (Key development / In brief),
 and a rough importance ranking based on how much discussion or review
 attention it received. Sort this inventory in descending order of
 importance.
@@ -115,10 +110,6 @@ Use the inventory to drive section placement:
   of whether they produced patches.
 - "What's cooking" reports from Junio are always notable. If one
   appeared during the period, mention the most consequential moves.
-- A topic with substantial discussion during the period must not appear
-  only in "Looking ahead". That section is exclusively for topics that
-  were posted late and will see review in the *next* period, or ongoing
-  work that saw no meaningful progress during this period.
 
 ## Style guidelines
 
