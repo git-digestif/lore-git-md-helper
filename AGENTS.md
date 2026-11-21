@@ -98,6 +98,13 @@ and hierarchical digest generation:
 - `periodic_digest`: weekly and monthly digest generation from
   sub-period digests, with cache-aware collection that checks
   in-memory caches before falling back to the repository
+- `thread_activity`: how much attention a thread has drawn as of a
+  day (replies so far, participants, messages that day with a patch
+  series counted as one, days), counted from its `.thread.md` tree; a
+  thread is long with 20 or more replies or 8 or more messages that day
+- `thread_deltas`: the per-thread ledger of cited daily delta bullets,
+  `<root date-key>.thread.deltas.md`, committed with each daily digest
+  and read back as the history of long threads
 - `date_util`: day-level date helpers (ISO week boundaries, month
   extraction, day arithmetic)
 - `fast_import`: a `FastImport` struct mirroring the `CatFile`
@@ -106,6 +113,23 @@ and hierarchical digest generation:
 - `digestive` binary: thin CLI shim that constructs a `Digestive`
   struct, computes the starting point via auto-resume from the
   latest digest commit, and delegates to the library
+
+Daily digests lead with a `## Long threads` section.  Code picks up to
+five long threads with a noteworthy update that day, longest first, and
+the editor writes one subsection for each.  Code adds a line under the
+heading of every long thread (or at the end of its in-brief bullet)
+that states its size from the archive; the editor never writes it, and
+its words count toward the digest's word window.  The items of the
+leading long threads also see the thread's recent earlier developments
+from its ledger, which are evidence for the audit but never today's
+news.  Weekly and monthly digests lead with their long threads too, at
+most eight and ten: the editor merges a thread's days into one
+subsection and copies the count line of the sub-period digest with the
+most replies, leaving out the single-day count after the semicolon.
+Code rejects a draft whose count lines are not such copies, whose
+leading section is missing or superfluous, or that has more threads than
+the limit, and asks once more; a second failing draft is published
+without the count lines that are not copies.
 
 Prompt files in `prompts/` define the AI agent behavior:
 - `git-digest-email.md`: per-email summarization with taxonomy
@@ -230,6 +254,9 @@ rewrite that could have changed file contents.
 - `src/periodic_digest.rs` — weekly and monthly digest generation from
   sub-period digests, with cache-aware collection
 - `src/summarize.rs` — per-email summarization (four AI calls per email)
+- `src/thread_activity.rs` — thread size counts and the long-thread
+  thresholds
+- `src/thread_deltas.rs` — per-thread ledger of daily delta bullets
 - `src/date_util.rs` — day-level date helpers (ISO weeks, months, arithmetic)
 - `src/fast_import.rs` — `FastImport` struct for git fast-import protocol
 - `src/ai_backend.rs` — shared AI backend abstraction (API, Copilot CLI,

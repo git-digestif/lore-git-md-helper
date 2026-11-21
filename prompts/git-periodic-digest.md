@@ -17,19 +17,39 @@ You will receive:
 
 - The **period** being covered (e.g. "2025/01/01 -- 2025/01/05",
   "2025 January", "2025 Q1").
-- For **weekly** digests: the **daily digests** for each day in the
-  period, delimited by `---` and labelled with the date. Weekend and
-  holiday days with no traffic will be absent.
-- For **monthly** digests: the **weekly digests** for each week in the
-  period, delimited by `---` and labelled with the date range. Each
-  weekly digest has already been filtered; your job is to synthesize
-  them, not to re-filter raw data.
+- The **daily digests** for each day in the period, delimited by `---`
+  and labelled with the date. Weekend and holiday days with no traffic
+  will be absent. Each daily digest has already been filtered; your job
+  is to synthesize them, not to re-filter raw data.
 - The **granularity**: "weekly" or "monthly".
+
+Daily digests list the threads that drew the most replies under
+`## Long threads`. A line such as `*Long thread: 77 replies so far from 6
+participants over 56 days; 8 messages that day.*` stands directly under
+the heading of every thread that is long, wherever it appears.
 
 ## Structure
 
 Write the digest as free-flowing prose, divided into natural sections with
 Markdown headings. The sections are:
+
+**Long threads.** Only when a sub-period digest has a long-thread line;
+otherwise leave this section out. Open the digest with a `## Long
+threads` section, ahead of the period in brief. Write one `###`
+subsection for each of the threads that any sub-period digest marks as
+long, at most eight for a weekly digest and ten for a monthly digest;
+when there are more, keep the threads with the most replies and treat
+the others like any other topic. Merge the days on which a thread
+appears (the same work, usually under the same or a similar heading),
+the thread with the most replies first.
+Directly under each heading, copy the long-thread line of the sub-period
+digest in which that thread's reply count is highest, without the part
+after the semicolon, for example `*Long thread: 77 replies so far from 6
+participants over 56 days.*`. Never write such a line yourself and never
+change a figure in one. Follow it with one paragraph of roughly 60--100
+words on how the thread developed during the period and where it stands
+at the end. Do not cover these threads again under Key developments or
+In brief. This section counts toward the word range below.
 
 **The period in brief.** Two to four sentences. State the period, the
 overall volume and tone (how many active days, whether traffic was heavy or
@@ -56,11 +76,6 @@ patches, test modernization, and anything that deserves a mention but not
 a full paragraph. This section should be generous -- it costs only one
 sentence per topic and ensures the digest has no blind spots.
 
-**Looking ahead.** Optional. One or two paragraphs noting topics that are
-likely to dominate the next period: series that were posted late and will
-see review, "What's cooking" items flagged as needing discussion, ongoing
-efforts that made progress but did not conclude.
-
 ## Editorial judgment
 
 Your primary job is compression with minimal information loss. The daily
@@ -68,7 +83,7 @@ digests already filter for signal; your job is to filter the filtered.
 
 **Before writing, build an inventory.** Read every sub-period digest
 and list each distinct topic together with the sub-periods it appears
-in, its section placement (Key development / In brief / Looking ahead),
+in, its section placement (Key development / In brief),
 and a rough importance ranking based on how much discussion or review
 attention it received. Sort this inventory in descending order of
 importance.
@@ -95,10 +110,6 @@ Use the inventory to drive section placement:
   of whether they produced patches.
 - "What's cooking" reports from Junio are always notable. If one
   appeared during the period, mention the most consequential moves.
-- A topic with substantial discussion during the period must not appear
-  only in "Looking ahead". That section is exclusively for topics that
-  were posted late and will see review in the *next* period, or ongoing
-  work that saw no meaningful progress during this period.
 
 ## Style guidelines
 
@@ -109,7 +120,15 @@ Refer to Git commands in back-ticks.
 Use contributor names exactly as they appear in the daily digests.
 
 Do not fabricate context. If the daily digests do not explain an outcome,
-say so rather than guessing.
+say so rather than guessing. Every topic, name and figure in the digest
+comes from a daily digest.
+
+Keep each event with the version, day and person that the daily digests
+give it. Do not move an event to another version of a series, do not
+write "earlier" or "by vN" unless a daily digest does, and do not credit
+one person's statement to someone else or to two people. State a status
+("queued", "ready for `next`", "merged") as the last daily digest that
+mentions the topic gives it, never as more final than that.
 
 Do not use bullet lists anywhere in the digest. Every section is prose.
 

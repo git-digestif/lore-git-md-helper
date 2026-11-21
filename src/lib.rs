@@ -24,6 +24,8 @@ pub mod digestive;
 pub mod fast_import;
 pub mod periodic_digest;
 pub mod summarize;
+pub mod thread_activity;
+pub mod thread_deltas;
 pub mod wc_parse;
 
 pub mod rag_db;

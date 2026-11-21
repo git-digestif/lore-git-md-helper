@@ -5,6 +5,7 @@
 //! repository via fast-import.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -15,12 +16,14 @@ use regex::Regex;
 use crate::ai_backend::{self, Backend};
 use crate::cached_reader::CachedReader;
 use crate::cat_file::{BlobRead, CatFile};
-use crate::date_util::{add_days, iso_sunday, month_of};
+use crate::date_util::{add_days, day_of, iso_sunday, month_of, parse_day};
 use crate::fast_import::FastImport;
 use crate::git_util::{self, latest_digest, resolve_ref, source_commit_from_ref};
 use crate::periodic_digest::{Granularity, SubDigest, generate_periodic_digest};
 use crate::rag_parse;
 use crate::summarize::{self, EmailContext};
+use crate::thread_activity::ThreadActivity;
+use crate::thread_deltas::{self, ThreadDeltas};
 use crate::thread_file::{self, ThreadTree};
 use crate::wc_parse::{self, WcTopic};
 
@@ -419,8 +422,6 @@ pub struct Digestive<'a> {
     /// Days (e.g. "2025/01/02") with a daily `digest.ai.md`, seen in
     /// ls-tree or generated this run.  Content is read via CachedReader.
     daily_digest_days: std::collections::BTreeSet<String>,
-    /// Sundays (e.g. "2025/01/05") with a weekly `digest.weekly.ai.md`.
-    weekly_digest_sundays: std::collections::BTreeSet<String>,
     /// Resolved OID of the commit whose tree represents the "before
     /// today" thread state for daily digest generation.  Cleared after
     /// each daily digest commit so that the next day re-resolves it
@@ -498,7 +499,6 @@ impl<'a> Digestive<'a> {
             dry_run,
             batch_size,
             daily_digest_days: std::collections::BTreeSet::new(),
-            weekly_digest_sundays: std::collections::BTreeSet::new(),
             before_oid,
             last_digested_day,
             total_processed: 0,
@@ -755,6 +755,8 @@ impl<'a> Digestive<'a> {
             &threads,
             email_count,
             self.backend.context("backend unavailable")?,
+            self.git_ref,
+            &mut self.cached,
         )
         .await?;
 
@@ -767,6 +769,12 @@ impl<'a> Digestive<'a> {
             format!("{}:{day}/digest.ai.md", self.git_ref),
             digest.ai.clone(),
         );
+        // Keep the ledgers readable before the checkpoint lands, so that a
+        // later day merges into them rather than into a stale copy.
+        for (path, content) in &digest.ledgers {
+            self.cached
+                .insert(format!("{}:{path}", self.git_ref), content.clone());
+        }
 
         let mut msg = format!("digestive: daily digest for {day}");
         if let Some(ref sc) = self.source_commit {
@@ -774,10 +782,16 @@ impl<'a> Digestive<'a> {
         }
         let human_path = format!("{day}/digest.human.md");
         let ai_path = format!("{day}/digest.ai.md");
-        let files = [
+        let mut files = vec![
             (human_path.as_str(), digest.human.as_str()),
             (ai_path.as_str(), digest.ai.as_str()),
         ];
+        files.extend(
+            digest
+                .ledgers
+                .iter()
+                .map(|(path, content)| (path.as_str(), content.as_str())),
+        );
         let fi = self.fi.as_mut().context("fast-import unavailable")?;
         fi.commit(&msg, &files)?;
         fi.checkpoint()?;
@@ -907,7 +921,6 @@ impl<'a> Digestive<'a> {
         )
         .await?;
 
-        self.weekly_digest_sundays.insert(week_sunday.to_string());
         self.cached.insert(
             format!("{}:{week_sunday}/digest.weekly.human.md", self.git_ref),
             result.human.clone(),
@@ -949,39 +962,30 @@ impl<'a> Digestive<'a> {
             return Ok(());
         }
 
-        // Collect weekly digests from the precomputed set, reading
-        // content via CachedReader.  A week overlaps this month if
-        // its Monday..Sunday range intersects the month's day range.
-        let month_start = format!("{month}/01");
-        let month_end = format!("{month}/31");
+        // Collect the month's daily digests from the precomputed set,
+        // reading content via CachedReader.  Weekly digests would also
+        // bring in the days of the neighboring months.
+        let from = format!("{month}/01");
+        let to = format!("{month}/31");
         let digests: Vec<_> = self
-            .weekly_digest_sundays
-            .iter()
-            .filter_map(|sunday| {
-                let monday = add_days(sunday, -6)?;
-                let overlaps = sunday.as_str() >= month_start.as_str()
-                    && monday.as_str() <= month_end.as_str();
-                if !overlaps {
-                    return None;
-                }
-                let spec = format!("{}:{sunday}/digest.weekly.human.md", self.git_ref,);
-                let content = self.cached.get_str(&spec)?;
-                Some(SubDigest {
-                    label: format!("{monday} -- {sunday}"),
+            .daily_digest_days
+            .range(from.clone()..=to.clone())
+            .filter_map(|day| {
+                let spec = format!("{}:{day}/digest.human.md", self.git_ref);
+                self.cached.get_str(&spec).map(|content| SubDigest {
+                    label: day.clone(),
                     content,
                 })
             })
             .collect();
         if digests.is_empty() {
             eprintln!(
-                "[digestive] no weekly digests for {month}, \
+                "[digestive] no daily digests for {month}, \
                 skipping monthly digest"
             );
             return Ok(());
         }
 
-        let from = format!("{month}/01");
-        let to = format!("{month}/31");
         let label = format!("{from} -- {to}");
         let result = generate_periodic_digest(
             &label,
@@ -1109,7 +1113,6 @@ impl<'a> Digestive<'a> {
                 } else if dk.ends_with("/digest.weekly") {
                     state.week_has_digest = true;
                     state.month_has_content = true;
-                    self.weekly_digest_sundays.insert(day.to_string());
                 } else if dk.ends_with("/digest.monthly") {
                     state.month_has_digest = true;
                 } else if !dk.ends_with(".thread") {
@@ -1123,6 +1126,7 @@ impl<'a> Digestive<'a> {
                     || dk.ends_with(".thread")
                     || dk.ends_with(".thread.human")
                     || dk.ends_with(".thread.ai")
+                    || dk.ends_with(".thread.deltas")
                 {
                     continue;
                 }
@@ -1242,6 +1246,9 @@ pub struct ThreadDayActivity {
     /// `None` when Junio has not published a verdict for this thread,
     /// or when today has no "What's cooking" email at all.
     pub wc_status: Option<WcTopic>,
+    /// How much attention the thread has drawn by the end of today, or
+    /// `None` when its thread tree cannot be loaded.
+    pub activity: Option<ThreadActivity>,
 }
 
 pub struct DayEmailEvidence {
@@ -1256,6 +1263,9 @@ pub struct DayEmailEvidence {
 pub struct DayDigestOutput {
     pub human: String,
     pub ai: String,
+    /// The ledger of every thread active today with today's bullets
+    /// recorded, as (path, content) pairs to commit with the digests.
+    pub ledgers: Vec<(String, String)>,
 }
 
 /// Build the daily digest input for a given day.
@@ -1304,12 +1314,15 @@ pub fn build_day_digest_input(
                 .expect("a grouped thread has at least one email");
             let root_source_excerpt = topic_source_evidence(&root_dk, latest_dk, git_ref, cat);
             let wc_status = lookup_wc_status(&root_dk, git_ref, cat, &wc_map);
+            let activity = thread_file::load_from_repo(cat, git_ref, &root_dk)
+                .and_then(|(_, tree)| ThreadActivity::as_of(&tree, day_of(latest_dk)));
             ThreadDayActivity {
                 root_dk,
                 thread_ai_before,
                 root_source_excerpt,
                 email_summaries: emails,
                 wc_status,
+                activity,
             }
         })
         .collect();
@@ -1462,12 +1475,16 @@ fn lookup_wc_status(
 /// Generate a daily digest from thread deltas.
 ///
 /// Extract developments from each thread's complete same-day source
-/// before presenting the resulting topic packets to the editor.
+/// before presenting the resulting topic packets to the editor, and
+/// record them in the threads' ledgers as of `git_ref`.  The longest
+/// threads also get their recent history from those ledgers.
 pub async fn generate_daily_digest(
     day: &str,
     threads: &[ThreadDayActivity],
     email_count: usize,
     backend: &Backend,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
 ) -> Result<DayDigestOutput> {
     let thread_count = threads.len();
 
@@ -1477,13 +1494,25 @@ pub async fn generate_daily_digest(
     );
 
     let mut root_deltas = Vec::new();
+    let mut recorded = Vec::new();
     for thread in threads {
-        root_deltas.extend(extract_thread_deltas(day, thread, backend).await?);
+        let deltas = extract_thread_deltas(day, thread, backend).await?;
+        recorded.push((
+            thread.root_dk.clone(),
+            deltas
+                .iter()
+                .flat_map(|delta| delta.bullets.iter().cloned())
+                .collect(),
+        ));
+        root_deltas.extend(deltas);
     }
-    let packets = build_topic_packets(day, threads, &root_deltas);
+    let mut packets = build_topic_packets(day, threads, &root_deltas);
     if packets.is_empty() {
         anyhow::bail!("no same-day thread delta survived extraction for {day}");
     }
+    let mut loaded = BTreeMap::new();
+    attach_history(day, &mut packets, &mut loaded, git_ref, cat, backend).await?;
+    let ledgers = thread_deltas::record_day(day, &recorded, loaded, git_ref, cat);
     let evidence = render_topic_packets(&packets);
     trace_digest_attempt("editor", 0, "evidence.txt", &evidence)?;
     eprintln!("[digestive] generating daily digest for {day} ...");
@@ -1491,7 +1520,45 @@ pub async fn generate_daily_digest(
     let human = generate_digest_mode(day, &HUMAN_DIGEST_MODE, &packets, backend).await?;
     let ai = generate_digest_mode(day, &AI_DIGEST_MODE, &packets, backend).await?;
 
-    Ok(DayDigestOutput { human, ai })
+    Ok(DayDigestOutput { human, ai, ledgers })
+}
+
+/// Give the topics that lead a digest, in either mode, the recent history
+/// of their threads.  Each thread's ledger is read into `ledgers`,
+/// completed there where it lacks the days needed, and stays there for
+/// the caller to save.
+async fn attach_history(
+    day: &str,
+    packets: &mut [TopicPacket],
+    ledgers: &mut BTreeMap<String, ThreadDeltas>,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<()> {
+    let mut leading = BTreeSet::new();
+    for mode in [&HUMAN_DIGEST_MODE, &AI_DIGEST_MODE] {
+        leading.extend(long_tier(packets, mode));
+    }
+    for packet in packets.iter_mut().filter(|p| leading.contains(&p.id)) {
+        let ledger = ledgers
+            .entry(packet.root_dk.clone())
+            .or_insert_with(|| thread_deltas::load(&packet.root_dk, git_ref, cat));
+        let history = recent_history(
+            day,
+            &packet.root_dk,
+            ledger,
+            HISTORY_BUDGET,
+            git_ref,
+            cat,
+            backend,
+        )
+        .await?;
+        packet.history = history
+            .into_iter()
+            .flat_map(|(_, bullets)| bullets)
+            .collect();
+    }
+    Ok(())
 }
 
 async fn extract_thread_deltas(
@@ -1508,7 +1575,11 @@ async fn extract_thread_deltas(
     }
     let threads = std::slice::from_ref(thread);
     let input = build_daily_digest_user_msg(day, threads, thread.email_summaries.len());
-    let label = format!("thread-{}", thread.root_dk.replace('/', "-"));
+    let label = format!(
+        "thread-{}-{}",
+        day.replace('/', "-"),
+        thread.root_dk.replace('/', "-"),
+    );
     let mut correction = String::new();
     for attempt in 1..=2 {
         let prompt = format!("{input}{correction}");
@@ -1545,6 +1616,104 @@ async fn extract_thread_deltas(
     unreachable!("the bounded extraction loop always returns")
 }
 
+/// The most days of a thread's history that `recent_history` looks at,
+/// so that a quiet thread whose days hold nothing noteworthy cannot make
+/// it extract one day after another without ever filling its budget.
+const MAX_HISTORY_DAYS: usize = 10;
+
+/// The recent history of a thread before `day`: the days on which it had
+/// messages, newest first, with the bullets recorded for each, until the
+/// days found hold `budget` bytes of bullets or `MAX_HISTORY_DAYS` days
+/// were looked at.  They are returned oldest first, without the days that
+/// had nothing noteworthy.
+///
+/// A ledger starts when the pipeline first records a day, so a thread
+/// that was already running has no section for its earlier days.  Each
+/// such day that is needed is extracted from that day's complete source
+/// emails, as a daily digest would have done, and recorded in `ledger`.
+/// Days the ledger already has a section for, empty or not, are left
+/// alone, and so are the days older than the ones returned.
+pub async fn recent_history(
+    day: &str,
+    root_dk: &str,
+    ledger: &mut ThreadDeltas,
+    budget: usize,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let Some((_, tree)) = thread_file::load_from_repo(cat, git_ref, root_dk) else {
+        return Ok(Vec::new());
+    };
+    let mut dks_by_day: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for dk in tree.date_keys().filter(|dk| day_of(dk) < day) {
+        dks_by_day.entry(day_of(dk)).or_default().push(dk);
+    }
+    let mut history = Vec::new();
+    let mut used = 0;
+    for (history_day, mut dks) in dks_by_day.into_iter().rev().take(MAX_HISTORY_DAYS) {
+        if used >= budget {
+            break;
+        }
+        if ledger.day(history_day).is_none() {
+            let bullets =
+                extract_history_day(history_day, &mut dks, root_dk, git_ref, cat, backend).await?;
+            ledger.record(history_day, bullets);
+        }
+        let bullets = ledger.day(history_day).unwrap_or_default();
+        used += bullets.iter().map(String::len).sum::<usize>();
+        if !bullets.is_empty() {
+            history.push((history_day.to_string(), bullets.to_vec()));
+        }
+    }
+    history.reverse();
+    Ok(history)
+}
+
+/// A thread's bullets for one earlier day, extracted from the complete
+/// source emails `dks` of that day.
+async fn extract_history_day(
+    history_day: &str,
+    dks: &mut [&str],
+    root_dk: &str,
+    git_ref: &str,
+    cat: &mut impl BlobRead,
+    backend: &Backend,
+) -> Result<Vec<String>> {
+    dks.sort_unstable();
+    let email_summaries = dks
+        .iter()
+        .map(|dk| {
+            let (from, source_excerpt, source_is_short) = email_evidence(dk, git_ref, cat);
+            DayEmailEvidence {
+                dk: dk.to_string(),
+                ai: String::new(),
+                from,
+                source_excerpt,
+                source_is_short,
+            }
+        })
+        .collect();
+    let activity = ThreadDayActivity {
+        root_dk: root_dk.to_string(),
+        thread_ai_before: None,
+        root_source_excerpt: topic_source_evidence(
+            root_dk,
+            dks.last().expect("a day has at least one message"),
+            git_ref,
+            cat,
+        ),
+        email_summaries,
+        wc_status: None,
+        activity: None,
+    };
+    Ok(extract_thread_deltas(history_day, &activity, backend)
+        .await?
+        .into_iter()
+        .flat_map(|delta| delta.bullets)
+        .collect())
+}
+
 /// One thread root's same-day delta bullets, recovered from the merged
 /// output of the two delta extractors.
 #[derive(Debug, PartialEq)]
@@ -1555,13 +1724,53 @@ struct RootDelta {
 
 /// One topic as the final editor sees it: an opaque ID, the thread root
 /// author's own background words, and today's delta bullets, colocated
-/// so that no cross-topic lookup is possible.
+/// so that no cross-topic lookup is possible.  A long thread also carries
+/// its recent history.
+#[derive(Clone)]
 struct TopicPacket {
     id: String,
     current_subject: Option<String>,
     background: Option<String>,
     bullets: Vec<String>,
     source: String,
+    activity: Option<ThreadActivity>,
+    root_dk: String,
+    /// The most recent bullets of the thread's earlier days, oldest
+    /// first, or none.
+    history: Vec<String>,
+}
+
+impl TopicPacket {
+    /// Everything the factual audit and an item revision may check the
+    /// topic's item against.
+    fn evidence(&self) -> String {
+        if self.history.is_empty() {
+            self.source.clone()
+        } else {
+            format!(
+                "{}\n{}",
+                self.source,
+                render_history(&self.id, &self.history)
+            )
+        }
+    }
+}
+
+/// How many bytes of a long thread's earlier bullets its packet carries,
+/// give or take the last day taken.
+const HISTORY_BUDGET: usize = 6 * 1024;
+
+fn render_history(id: &str, bullets: &[String]) -> String {
+    let mut out = format!(
+        "EARLIER DEVELOPMENTS FOR {id} -- THE MOST RECENT ONES BEFORE TODAY, IN \
+         CHRONOLOGICAL ORDER; OLDER ONES MAY BE MISSING. THEY SAY HOW THE THREAD \
+         GOT HERE AND ARE NEVER TODAY'S NEWS:\n",
+    );
+    for bullet in bullets {
+        out.push_str(&format!("- {bullet}\n"));
+    }
+    out.push('\n');
+    out
 }
 
 /// Bind each delta to its cited email's source metadata, not to the
@@ -1780,6 +1989,9 @@ fn build_topic_packets(
                     std::slice::from_ref(thread),
                     thread.email_summaries.len(),
                 ),
+                activity: thread.activity.clone(),
+                root_dk: thread.root_dk.clone(),
+                history: Vec::new(),
             }
         })
         .collect()
@@ -1792,6 +2004,7 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
         current_subject,
         background,
         bullets,
+        history,
         ..
     } in packets
     {
@@ -1809,6 +2022,9 @@ fn render_topic_packets<'a>(packets: impl IntoIterator<Item = &'a TopicPacket>) 
                 "NO BACKGROUND FOR {id} -- WRITE ONLY FROM ITS DELTAS.\n\n",
             )),
         }
+        if !history.is_empty() {
+            out.push_str(&render_history(id, history));
+        }
         out.push_str(&format!(
             "TODAY'S VERIFIED DELTAS FOR {id}, IN CHRONOLOGICAL ORDER:\n",
         ));
@@ -1825,6 +2041,10 @@ struct DigestMode {
     label: &'static str,
     min_words: usize,
     max_words: usize,
+    long_limit: usize,
+    /// Whether the note on a long thread names its root date-key, which is
+    /// how a reader finds the thread file.
+    thread_roots: bool,
     notable_count: usize,
     brief_limit: usize,
 }
@@ -1833,6 +2053,8 @@ const HUMAN_DIGEST_MODE: DigestMode = DigestMode {
     label: "human",
     min_words: 500,
     max_words: 900,
+    long_limit: 5,
+    thread_roots: false,
     notable_count: 3,
     brief_limit: 8,
 };
@@ -1841,12 +2063,16 @@ const AI_DIGEST_MODE: DigestMode = DigestMode {
     label: "ai",
     min_words: 600,
     max_words: 1400,
+    long_limit: 5,
+    thread_roots: true,
     notable_count: 5,
     brief_limit: 12,
 };
 
 #[derive(Debug)]
 struct TopicSelection {
+    /// Long threads with a noteworthy update today; they lead the digest.
+    long: Vec<String>,
     notable: Vec<String>,
     brief: Vec<String>,
 }
@@ -1856,10 +2082,34 @@ impl TopicSelection {
         let mut brief = ranking.split_off(mode.notable_count.min(ranking.len()));
         brief.truncate(mode.brief_limit);
         Self {
+            long: Vec::new(),
             notable: ranking,
             brief,
         }
     }
+}
+
+/// The topics that lead a digest: the longest threads among the topics
+/// with a noteworthy update today, as many as the mode has room for.  At
+/// least three topics are always left for the ranking.
+fn long_tier(packets: &[TopicPacket], mode: &DigestMode) -> Vec<String> {
+    let mut long: Vec<_> = packets
+        .iter()
+        .filter_map(|packet| {
+            let activity = packet.activity.as_ref().filter(|a| a.is_long())?;
+            Some((activity, &packet.id))
+        })
+        .collect();
+    long.sort_by(|(a, a_id), (b, b_id)| {
+        b.replies
+            .cmp(&a.replies)
+            .then(b.messages_today.cmp(&a.messages_today))
+            .then(a_id.cmp(b_id))
+    });
+    long.into_iter()
+        .take(mode.long_limit.min(packets.len().saturating_sub(3)))
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 
 fn response_json(raw: &str) -> Result<&str> {
@@ -1902,6 +2152,7 @@ async fn select_digest_topics(
 ) -> Result<TopicSelection> {
     if is_mock(backend) {
         return Ok(TopicSelection {
+            long: Vec::new(),
             notable: packets.iter().map(|packet| packet.id.clone()).collect(),
             brief: Vec::new(),
         });
@@ -1910,6 +2161,12 @@ async fn select_digest_topics(
         packets.len() >= 3,
         "daily digest needs at least three source-grounded topics",
     );
+    let long = long_tier(packets, mode);
+    let pool: Vec<TopicPacket> = packets
+        .iter()
+        .filter(|packet| !long.contains(&packet.id))
+        .cloned()
+        .collect();
     let input = format!(
         "Date: {day}\nMode: {}\nThe editor has room for {} notable topics and \
          at most {} in-brief topics. Rank the supplied topics by their \
@@ -1917,7 +2174,7 @@ async fn select_digest_topics(
         mode.label,
         mode.notable_count,
         mode.brief_limit,
-        render_topic_packets(packets),
+        render_topic_packets(&pool),
     );
     let mut correction = String::new();
     for attempt in 1..=2 {
@@ -1928,8 +2185,13 @@ async fn select_digest_topics(
             .await
             .context("daily topic selection failed")?;
         trace_digest_attempt(mode.label, attempt, "selection-output.txt", &raw)?;
-        match parse_topic_ranking(&raw, packets) {
-            Ok(ranking) => return Ok(TopicSelection::from_ranking(ranking, mode)),
+        match parse_topic_ranking(&raw, &pool) {
+            Ok(ranking) => {
+                return Ok(TopicSelection {
+                    long,
+                    ..TopicSelection::from_ranking(ranking, mode)
+                });
+            }
             Err(err) if attempt == 1 => {
                 eprintln!("[digestive] topic selection rejected: {err:#}");
                 correction = format!(
@@ -1944,32 +2206,58 @@ async fn select_digest_topics(
 }
 
 fn selection_issue(digest: &str, selection: &TopicSelection) -> Option<String> {
-    let notable: Vec<_> = audit_sections(digest)
-        .into_iter()
-        .filter(|section| {
-            section
-                .lines
-                .first()
-                .is_some_and(|(_, line)| line.trim_start().starts_with("### "))
-        })
-        .filter_map(|section| section.topic_id)
-        .collect();
-    if notable.len() == selection.notable.len()
-        && selection
-            .notable
+    let sections = audit_sections(digest);
+    let headings = |long: bool| -> Vec<&str> {
+        sections
             .iter()
-            .all(|id| notable.contains(&id.as_str()))
-    {
-        None
-    } else {
-        Some(format!(
+            .filter(|section| section.long == long)
+            .filter(|section| {
+                section
+                    .lines
+                    .first()
+                    .is_some_and(|(_, line)| line.trim_start().starts_with("### "))
+            })
+            .filter_map(|section| section.topic_id)
+            .collect()
+    };
+    let is_exactly = |found: Vec<&str>, expected: &[String]| {
+        found.len() == expected.len() && expected.iter().all(|id| found.contains(&id.as_str()))
+    };
+    let has_long_section = digest.lines().any(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .is_some_and(|heading| label_key(heading) == "long threads")
+    });
+    let mut issues = Vec::new();
+    if selection.long.is_empty() {
+        if has_long_section {
+            issues.push(
+                "no topic is assigned to `## Long threads`; leave that section out".to_string(),
+            );
+        }
+    } else if !is_exactly(headings(true), &selection.long) {
+        issues.push(format!(
+            "long-thread headings under `## Long threads` must use exactly \
+             these selected IDs: {}",
+            selection.long.join(", ")
+        ));
+    }
+    if !is_exactly(headings(false), &selection.notable) {
+        issues.push(format!(
             "notable headings must use exactly these selected IDs: {}",
             selection.notable.join(", ")
-        ))
+        ));
     }
+    (!issues.is_empty()).then(|| issues.join("; "))
 }
 
 const DIGEST_H2_SEQUENCE: [&str; 3] = ["the day in brief", "notable threads", "in brief"];
+const DIGEST_H2_SEQUENCE_WITH_LONG: [&str; 4] = [
+    "long threads",
+    "the day in brief",
+    "notable threads",
+    "in brief",
+];
 
 const GENERIC_LABELS: [&str; 10] = [
     "key details",
@@ -2007,19 +2295,30 @@ async fn generate_digest_mode(
     let label = mode.label;
     let selection = select_digest_topics(day, mode, packets, backend).await?;
     let ids: Vec<_> = selection
-        .notable
+        .long
         .iter()
+        .chain(&selection.notable)
         .chain(&selection.brief)
         .map(String::as_str)
         .collect();
+    let long_ids: Vec<_> = selection.long.iter().map(String::as_str).collect();
     let selected = ids.iter().map(|id| {
         packets
             .iter()
             .find(|packet| packet.id == *id)
             .expect("selected ID was validated against source packets")
     });
+    let long_line = if long_ids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Use exactly these IDs for long-thread headings: {}.\n",
+            long_ids.join(", ")
+        )
+    };
     let user_msg = format!(
         "Date: {day}\n\nSELECTED TOPICS ONLY:\n\
+         {long_line}\
          Use exactly these IDs for notable headings: {}.\n\
          Other entries may only use these in-brief IDs: {}.\n\
          This is a selected subset, not an inventory of all activity.\n\n{}",
@@ -2034,15 +2333,28 @@ async fn generate_digest_mode(
     let mut approved = HashMap::new();
     let mut structural_rejections = 0;
     let mut audit_rounds = 0;
+    // Code adds a note to every long thread once the digest has passed the
+    // audit.  Those words count toward the window like the rest of the
+    // published digest, so the editor's own words get what is left.
+    let note_words: usize = packets
+        .iter()
+        .filter(|packet| ids.contains(&packet.id.as_str()))
+        .filter_map(|packet| long_thread_note(packet, mode))
+        .map(|note| digest_word_count(&note))
+        .sum();
+    let window = DigestMode {
+        max_words: mode.max_words.saturating_sub(note_words),
+        ..*mode
+    };
     // The word window the drafts are checked against, and the shortest
     // draft since the last audit whose only defect was exceeding it.
-    let mut limits = *mode;
+    let mut limits = window;
     let mut too_long: Option<(String, usize)> = None;
 
     for attempt in 1.. {
         let prompt = format!(
             "Mode: {label}\n\n{user_msg}\n\n{}{correction}",
-            output_contract(mode, &ids),
+            output_contract(&window, &ids, &long_ids),
         );
         let raw = if let Some((draft, findings)) = revision.take() {
             revise_digest_items(
@@ -2104,7 +2416,8 @@ async fn generate_digest_mode(
             )
             .await?;
             if issues.is_empty() {
-                return Ok(drop_empty_brief_section(&strip_topic_tags(&digest)));
+                let marked = mark_long_threads(&digest, packets, mode);
+                return Ok(drop_empty_brief_section(&strip_topic_tags(&marked)));
             }
             revision = Some((digest.clone(), issues.clone()));
         } else {
@@ -2197,8 +2510,7 @@ async fn revise_digest_items(
                 .iter()
                 .find(|packet| packet.id == id)
                 .with_context(|| format!("missing original source for revision {id}"))?
-                .source
-                .clone(),
+                .evidence(),
             None => sections
                 .iter()
                 .filter(|section| section.topic_id.is_some())
@@ -2301,6 +2613,8 @@ fn trace_digest_attempt(label: &str, attempt: usize, suffix: &str, content: &str
 
 struct AuditSection<'a> {
     topic_id: Option<&'a str>,
+    /// Whether the item sits under `## Long threads`.
+    long: bool,
     lines: Vec<(usize, &'a str)>,
 }
 
@@ -2308,6 +2622,7 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
     let mut sections: Vec<AuditSection<'_>> = Vec::new();
     let mut current = None;
     let mut in_brief = false;
+    let mut in_long = false;
     let mut fenced = false;
     for (index, line) in digest.lines().enumerate() {
         let trimmed = line.trim();
@@ -2316,9 +2631,11 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
                 current = None;
                 let heading = label_key(heading);
                 in_brief = heading == "in brief";
+                in_long = heading == "long threads";
                 if heading == "the day in brief" {
                     sections.push(AuditSection {
                         topic_id: None,
+                        long: false,
                         lines: Vec::new(),
                     });
                     current = Some(sections.len() - 1);
@@ -2334,6 +2651,7 @@ fn audit_sections(digest: &str) -> Vec<AuditSection<'_>> {
             if let Some(topic_id) = item.and_then(|text| split_topic_tag(text).0) {
                 sections.push(AuditSection {
                     topic_id: Some(topic_id),
+                    long: in_long,
                     lines: Vec::new(),
                 });
                 current = Some(sections.len() - 1);
@@ -2372,7 +2690,8 @@ async fn audit_digest(
             .collect::<Vec<_>>()
             .join("\n");
         if approved.get(id) != Some(&text) {
-            let findings = audit_section(id, &packet.source, section, backend, trace_label).await?;
+            let findings =
+                audit_section(id, &packet.evidence(), section, backend, trace_label).await?;
             if !findings.is_empty() {
                 issues.extend(findings);
                 if issues.len() >= MAX_ISSUES {
@@ -2491,14 +2810,31 @@ fn parse_audit_verdict(
     Ok(issues)
 }
 
-fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
+fn output_contract(mode: &DigestMode, ids: &[&str], long_ids: &[&str]) -> String {
+    let (long_heading, long_rule) = if long_ids.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            "`## Long threads`, ".to_string(),
+            format!(
+                "- Exactly one level-3 heading for each long-thread ID ({}), all \
+                 between `## Long threads` and `## The day in brief`, each naming \
+                 one thread's actual work and subsystem. No other topic goes under \
+                 `## Long threads`.\n",
+                long_ids.join(", "),
+            ),
+        )
+    };
     format!(
         "FINAL OUTPUT CONTRACT -- CHECKED MECHANICALLY BEFORE PUBLICATION:\n\
          - Length: {}-{} words, excluding internal topic tags. Aim for {} words \
          so there is room for correction. Omit lower-priority topics rather \
-         than overrun or strip necessary context.\n\
+         than overrun or strip necessary context: when over, drop in-brief \
+         bullets first (an empty `## In brief` section is fine), then shorten \
+         notable subsections, and shorten long-thread subsections last.\n\
          - Exactly these level-2 headings, in this order and no others: \
-         `## The day in brief`, `## Notable threads`, `## In brief`.\n\
+         {long_heading}`## The day in brief`, `## Notable threads`, `## In brief`.\n\
+         {long_rule}\
          - Exactly three to six level-3 headings, all between \
          `## Notable threads` and `## In brief`, each naming one thread's \
          actual work and subsystem, and no two alike.\n\
@@ -2507,18 +2843,22 @@ fn output_contract(mode: &DigestMode, ids: &[&str]) -> String {
          the one topic packet that section is written from. The only valid \
          IDs are: {}.\n\
          - Each selected topic ID appears only once in the whole digest: a topic \
-         is either a notable-thread subsection or an in-brief bullet, never \
-         both, and never twice. You are not required to cover every packet. \
+         is either a long-thread or notable-thread subsection or an in-brief \
+         bullet, never more than one of these, and never twice. You are not \
+         required to cover every notable or in-brief packet. \
          Select only as many topics as fit the word budget with useful context.\n\
          - Never write `no new developments`, `nothing new`, or any other \
          inactivity phrase. A topic you have nothing to say about is left \
          out; it is never described as quiet.\n\
-         - Inside `## Notable threads`: prose only. No deeper headings, no \
-         numbered lists, and no label headings or bold pseudo-labels such as \
-         `Key details`, `Key developments`, `Status`, `Impact`, \
-         `What changed` or `Why it matters`.\n\
+         - Inside `## Long threads` and `## Notable threads`: prose only. No \
+         deeper headings, no numbered lists, and no label headings or bold \
+         pseudo-labels such as `Key details`, `Key developments`, `Status`, \
+         `Impact`, `What changed` or `Why it matters`.\n\
          - Print no date other than the one in the title, and never print a \
          `Thread root:` marker or a date-key such as `2026/05/22`.\n\
+         - Never state how many replies, messages, participants or days a \
+         thread has, and never call a thread long: code adds the size of \
+         every long thread.\n\
          - Add no statistics, roundup, integration-status or outlook section.",
         mode.min_words,
         mode.max_words,
@@ -2642,6 +2982,83 @@ fn drop_empty_brief_section(md: &str) -> String {
     }
 }
 
+/// The sentence that states how large a long thread is, from the
+/// archive's counts rather than from the editor's words; `None` for a
+/// thread that is not long.
+fn long_thread_note(packet: &TopicPacket, mode: &DigestMode) -> Option<String> {
+    let activity = packet.activity.as_ref().filter(|a| a.is_long())?;
+    let count =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let root = if mode.thread_roots {
+        format!(" (root {})", packet.root_dk)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "*Long thread{root}: {} so far from {} over {}; {} that day.*",
+        count(activity.replies, "reply", "replies"),
+        count(activity.participants, "participant", "participants"),
+        count(activity.days, "day", "days"),
+        count(activity.messages_today, "message", "messages"),
+    ))
+}
+
+/// Say how large every long thread is, as a line under its heading or at
+/// the end of its in-brief bullet.  This runs once a digest has passed
+/// validation and the factual audit, so the editor can neither state the
+/// numbers wrongly nor be audited on figures that come from the archive.
+fn mark_long_threads(digest: &str, packets: &[TopicPacket], mode: &DigestMode) -> String {
+    // Line number -> (the note goes on its own line below, the note)
+    let mut notes = HashMap::new();
+    for section in audit_sections(digest) {
+        let Some(note) = section
+            .topic_id
+            .and_then(|id| packets.iter().find(|packet| packet.id == id))
+            .and_then(|packet| long_thread_note(packet, mode))
+        else {
+            continue;
+        };
+        let (first, heading) = section.lines[0];
+        if heading.trim_start().starts_with("### ") {
+            notes.insert(first, (true, note));
+        } else if let Some((last, _)) = section
+            .lines
+            .iter()
+            .rev()
+            .find(|(_, l)| !l.trim().is_empty())
+        {
+            notes.insert(*last, (false, note));
+        }
+    }
+    if notes.is_empty() {
+        return digest.to_string();
+    }
+    let lines: Vec<_> = digest.lines().collect();
+    let mut out = String::with_capacity(digest.len() + 200 * notes.len());
+    for (index, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        match notes.get(&(index + 1)) {
+            Some((true, note)) => {
+                out.push_str("\n\n");
+                out.push_str(note);
+                if lines
+                    .get(index + 1)
+                    .is_some_and(|next| !next.trim().is_empty())
+                {
+                    out.push('\n');
+                }
+            }
+            Some((false, note)) => {
+                out.push(' ');
+                out.push_str(note);
+            }
+            None => {}
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn normalize_typography(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     for ch in md.chars() {
@@ -2707,6 +3124,7 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
     let (mut h2, mut h3, mut tags): (Vec<String>, Vec<String>, Vec<&str>) =
         (Vec::new(), Vec::new(), Vec::new());
     let mut section = 0;
+    let mut notable_h3 = 0;
     let mut fenced = false;
     let mut title_count = 0;
     let mut extra_prose = 0;
@@ -2736,6 +3154,8 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                 in_brief_item = false;
                 let key = label_key(text);
                 section = match key.as_str() {
+                    "long threads" => 3,
+                    "the day in brief" => 0,
                     "notable threads" => 1,
                     "in brief" => 2,
                     _ => section,
@@ -2749,10 +3169,11 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                     None => untagged += 1,
                 }
                 h3.push(label_key(named));
-                outside += usize::from(section != 1);
+                notable_h3 += usize::from(section == 1);
+                outside += usize::from(!matches!(section, 1 | 3));
                 generic += usize::from(is_generic_label(named));
             }
-            0 if section == 1 => {
+            0 if matches!(section, 1 | 3) => {
                 numbered += usize::from(numbered_re.is_match(line));
                 generic += usize::from(
                     bold_re
@@ -2810,18 +3231,19 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
                 .into(),
         );
     }
-    if h2 != DIGEST_H2_SEQUENCE {
+    if h2 != DIGEST_H2_SEQUENCE && h2 != DIGEST_H2_SEQUENCE_WITH_LONG {
         issues.push(format!(
             "there are {} level-2 headings; they must be exactly \
+             `## Long threads` (only when long-thread IDs are assigned), \
              `## The day in brief`, `## Notable threads` and `## In brief`, \
              in that order and nothing else",
             h2.len(),
         ));
     }
-    if !(3..=6).contains(&h3.len()) {
+    if !(3..=6).contains(&notable_h3) {
         issues.push(format!(
-            "there are {} level-3 headings; there must be three to six",
-            h3.len(),
+            "there are {notable_h3} level-3 headings under `## Notable \
+             threads`; there must be three to six",
         ));
     }
     if untagged > 0 {
@@ -2857,7 +3279,7 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
     for (count, message) in [
         (
             outside,
-            "level-3 heading(s) sit outside `## Notable threads`",
+            "level-3 heading(s) sit outside `## Notable threads` and `## Long threads`",
         ),
         (
             h3.len() - unique.len(),
@@ -2874,7 +3296,8 @@ fn validate_digest(md: &str, mode: &DigestMode, ids: &[&str], day: &str) -> Vec<
         ),
         (
             numbered,
-            "numbered list item(s) inside `## Notable threads`; write prose there",
+            "numbered list item(s) inside `## Notable threads` or `## Long threads`; \
+             write prose there",
         ),
         (
             roots,
@@ -2990,6 +3413,28 @@ pub(crate) fn build_daily_digest_user_msg(
     user_msg
 }
 
+/// Commit `files` on top of the tip of `git_ref`.  The commit carries the
+/// tip's `Source-Commit` trailer, which `update-lore-git-md` compares with
+/// the one of the notes ref.
+fn commit_on_tip(
+    repo_path: &str,
+    git_ref: &str,
+    subject: &str,
+    files: &[(&str, &str)],
+) -> Result<()> {
+    let mut fi = FastImport::new(repo_path, git_ref)?;
+    if let Some(oid) = resolve_ref(repo_path, git_ref) {
+        fi.set_parent(oid);
+    }
+    let mut msg = subject.to_string();
+    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
+        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
+    }
+    fi.commit(&msg, files)?;
+    fi.checkpoint()?;
+    fi.finish()
+}
+
 /// Rebuild one thread's `.thread.ai.md` and `.thread.human.md` from
 /// scratch by walking the thread's emails in chronological order and
 /// feeding each per-email `.ai.md` back through the thread agent.
@@ -3069,26 +3514,17 @@ pub async fn resummarize_thread(
     let final_ai = prev_ai.ok_or_else(|| anyhow::anyhow!("no per-email .ai.md found in thread"))?;
     let final_human = prev_human.expect("populated alongside prev_ai");
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: resummarize thread {root_dk}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let ai_path = format!("{root_dk}.thread.ai.md");
     let human_path = format!("{root_dk}.thread.human.md");
-    fi.commit(
-        &msg,
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: resummarize thread {root_dk}"),
         &[
             (ai_path.as_str(), final_ai.as_str()),
             (human_path.as_str(), final_human.as_str()),
         ],
-    )?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    )
 }
 
 /// Regenerate every per-email `.ai.md` and `.human.md` file within
@@ -3187,22 +3623,16 @@ pub async fn resummarize_email(
         files.push((format!("{root_dk}.thread.human.md"), human));
     }
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: resummarize per-email briefs in thread {root_dk}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect();
-    fi.commit(&msg, &refs)?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: resummarize per-email briefs in thread {root_dk}"),
+        &refs,
+    )
 }
 
 /// Regenerate the daily digest files (`digest.human.md`, `digest.ai.md`)
@@ -3258,28 +3688,142 @@ pub async fn redo_daily(
     let before = find_digest_commit(repo_path, git_ref, &prev).unwrap_or_else(|| head_oid.clone());
 
     let (threads, email_count) = build_day_digest_input(&summaries, &before, git_ref, &mut cat);
-    let digest = generate_daily_digest(day, &threads, email_count, backend).await?;
+    let digest =
+        generate_daily_digest(day, &threads, email_count, backend, git_ref, &mut cat).await?;
 
-    let mut fi = FastImport::new(repo_path, git_ref)?;
-    if let Some(oid) = resolve_ref(repo_path, git_ref) {
-        fi.set_parent(oid);
-    }
-    let mut msg = format!("digestive: redo daily digest for {day}");
-    if let Some(sc) = source_commit_from_ref(repo_path, git_ref) {
-        msg.push_str(&format!("\n\nSource-Commit: {sc}"));
-    }
     let human_path = format!("{day}/digest.human.md");
     let ai_path = format!("{day}/digest.ai.md");
-    fi.commit(
-        &msg,
+    let mut files = vec![
+        (human_path.as_str(), digest.human.as_str()),
+        (ai_path.as_str(), digest.ai.as_str()),
+    ];
+    files.extend(
+        digest
+            .ledgers
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str())),
+    );
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: redo daily digest for {day}"),
+        &files,
+    )
+}
+
+/// Regenerate the weekly digest files (`digest.weekly.human.md`,
+/// `digest.weekly.ai.md`) of the ISO week that ends on `sunday`, from
+/// the human daily digests at the tip of `git_ref`.
+///
+/// Meant to follow `redo_daily`: a weekly digest is built from the
+/// daily digests of its week, so it is out of date once they have been
+/// redone.
+///
+/// Writes a single fast-import commit `digestive: redo weekly digest
+/// for <sunday>` containing both files.
+pub async fn redo_weekly(
+    repo_path: &str,
+    git_ref: &str,
+    sunday: &str,
+    backend: &Backend,
+) -> Result<()> {
+    if iso_sunday(sunday).as_deref() != Some(sunday) {
+        anyhow::bail!("{sunday} is not a Sunday");
+    }
+    let monday = add_days(sunday, -6).ok_or_else(|| anyhow::anyhow!("bad day: {sunday}"))?;
+
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+    let digests: Vec<SubDigest> = (0..7)
+        .filter_map(|offset| add_days(&monday, offset))
+        .filter_map(|day| {
+            let content = cat.get_str(&format!("{git_ref}:{day}/digest.human.md"))?;
+            Some(SubDigest {
+                label: day,
+                content,
+            })
+        })
+        .collect();
+    if digests.is_empty() {
+        anyhow::bail!("no daily digests found for {monday}..{sunday}");
+    }
+
+    let result = generate_periodic_digest(
+        &format!("{monday} -- {sunday}"),
+        Granularity::Weekly,
+        &digests,
+        backend,
+    )
+    .await?;
+
+    let human_path = format!("{sunday}/digest.weekly.human.md");
+    let ai_path = format!("{sunday}/digest.weekly.ai.md");
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: redo weekly digest for {sunday}"),
         &[
-            (human_path.as_str(), digest.human.as_str()),
-            (ai_path.as_str(), digest.ai.as_str()),
+            (human_path.as_str(), result.human.as_str()),
+            (ai_path.as_str(), result.ai.as_str()),
         ],
-    )?;
-    fi.checkpoint()?;
-    fi.finish()?;
-    Ok(())
+    )
+}
+
+/// Regenerate the monthly digest files (`digest.monthly.human.md`,
+/// `digest.monthly.ai.md`) of `month` ("YYYY/MM"), from the human daily
+/// digests of its days at the tip of `git_ref`.
+///
+/// Meant to follow `redo_daily`: a monthly digest is built from the
+/// daily digests of its month, so it is out of date once they have been
+/// redone.
+///
+/// Writes a single fast-import commit `digestive: redo monthly digest
+/// for <month>` containing both files.
+pub async fn redo_monthly(
+    repo_path: &str,
+    git_ref: &str,
+    month: &str,
+    backend: &Backend,
+) -> Result<()> {
+    let first = format!("{month}/01");
+    let last = format!("{month}/31");
+    if month.len() != 7 || parse_day(&first).is_none() {
+        anyhow::bail!("{month} is not a month like 2026/07");
+    }
+
+    let mut cat = CatFile::new(repo_path).context("open target repo")?;
+    let digests: Vec<SubDigest> = (1..=31)
+        .map(|day| format!("{month}/{day:02}"))
+        .filter_map(|day| {
+            let content = cat.get_str(&format!("{git_ref}:{day}/digest.human.md"))?;
+            Some(SubDigest {
+                label: day,
+                content,
+            })
+        })
+        .collect();
+    if digests.is_empty() {
+        anyhow::bail!("no daily digests found for {month}");
+    }
+
+    let result = generate_periodic_digest(
+        &format!("{first} -- {last}"),
+        Granularity::Monthly,
+        &digests,
+        backend,
+    )
+    .await?;
+
+    let human_path = format!("{month}/digest.monthly.human.md");
+    let ai_path = format!("{month}/digest.monthly.ai.md");
+    commit_on_tip(
+        repo_path,
+        git_ref,
+        &format!("digestive: redo monthly digest for {month}"),
+        &[
+            (human_path.as_str(), result.human.as_str()),
+            (ai_path.as_str(), result.ai.as_str()),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -3806,6 +4350,16 @@ mod tests {
         assert!(!context.contains("Original rebase proposal."));
         assert!(!context.contains("Individual patch"));
         assert!(!context.contains("Future context"));
+        assert_eq!(
+            threads[0].activity,
+            Some(ThreadActivity {
+                replies: 1,
+                participants: 1,
+                messages_today: 1,
+                days: 61,
+            }),
+            "the thread's activity counts what has happened by the day of its latest email",
+        );
         let earlier =
             topic_source_evidence(root, "2026/07/01/00-00-00", "test", &mut blobs).unwrap();
         assert!(earlier.contains("Original rebase proposal."));
@@ -3998,6 +4552,7 @@ mod tests {
             root_dk: "2026/06/26/05-48-11".into(),
             thread_ai_before: Some("prior summary claiming merged to master".into()),
             root_source_excerpt: None,
+            activity: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/07/01/08-50-41".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -4058,6 +4613,7 @@ mod tests {
             root_dk: "2026/05/01/21-35-37".into(),
             thread_ai_before: Some("poisoned prior rationale".into()),
             root_source_excerpt: None,
+            activity: None,
             email_summaries: vec![DayEmailEvidence {
                 dk: "2026/08/07/13-09-14".into(),
                 ai: "poisoned candidate rationale".into(),
@@ -4206,6 +4762,7 @@ mod tests {
             root_source_excerpt: source.map(str::to_string),
             email_summaries: Vec::new(),
             wc_status: None,
+            activity: None,
         }
     }
 
@@ -4570,6 +5127,9 @@ mod tests {
                 background: None,
                 bullets: vec![format!("New development {index}.")],
                 source: format!("Source {index}."),
+                activity: None,
+                root_dk: format!("2026/10/01/00-00-{index:02}"),
+                history: Vec::new(),
             })
             .collect()
     }
@@ -4605,6 +5165,7 @@ mod tests {
     #[test]
     fn test_selected_notable_roles_are_enforced() {
         let selection = TopicSelection {
+            long: Vec::new(),
             notable: vec!["T01".into(), "T02".into(), "T03".into()],
             brief: vec!["T04".into()],
         };
@@ -5215,7 +5776,7 @@ Prose about completing subcommands of the new history command.
             }
             let range = format!("{}-{} words", mode.min_words, mode.max_words);
             assert!(DAILY_DIGEST_AGENT.contains(&range));
-            assert!(output_contract(mode, &VALID_IDS).contains(&range));
+            assert!(output_contract(mode, &VALID_IDS, &[]).contains(&range));
         }
     }
 
@@ -6180,14 +6741,17 @@ Prose about completing subcommands of the new history command.
         let monthly_jan = cat
             .get_str(&format!("{git_ref}:2025/01/digest.monthly.human.md"))
             .expect("monthly digest for Jan should exist");
-        // Monthly rolls up both weekly digests.
+        // Monthly rolls up the daily digests of January, and not the
+        // December day that belongs to the week ending Jan 05.
+        for day in ["2025/01/01", "2025/01/02", "2025/01/06"] {
+            assert!(
+                monthly_jan.contains(day),
+                "monthly Jan should include the daily digest of {day}"
+            );
+        }
         assert!(
-            monthly_jan.contains("2024/12/30"),
-            "monthly Jan should include week of Jan 05 (contains Dec 30)"
-        );
-        assert!(
-            monthly_jan.contains("2025/01/06"),
-            "monthly Jan should include week of Jan 12 (contains Jan 06)"
+            !monthly_jan.contains("2024/12/30"),
+            "monthly Jan must NOT include a daily digest of December"
         );
 
         // --- git fsck ---
@@ -6804,5 +7368,754 @@ Prose about completing subcommands of the new history command.
             cat.get_str(&format!("{git_ref}:{SUNDAY}/digest.human.md"))
                 .is_some()
         );
+    }
+
+    const THREAD_OPENED: &str = "2025/03/01/10-00-00";
+    const THREAD_ANSWERED: &str = "2025/03/02/09-00-00";
+
+    /// A thread opened on one day and answered on the next, both emails
+    /// with summaries.
+    fn seed_thread_over_two_days(repo: &str, git_ref: &str) {
+        let thread_md = [
+            "# Thread",
+            "",
+            &format!("- {THREAD_OPENED} [topic](10-00-00.md) *Alice*"),
+            &format!("  - {THREAD_ANSWERED} [Re: topic](../02/09-00-00.md) *Bob*"),
+            "",
+        ]
+        .join("\n");
+        let mut fi = FastImport::new(repo, git_ref).unwrap();
+        fi.commit_with_symlinks(
+            "seed",
+            &[
+                (
+                    &format!("{THREAD_OPENED}.md"),
+                    "Subject: topic\nFrom: Alice\nDate: Sat, 1 Mar 2025\n\nOpening.",
+                ),
+                (&format!("{THREAD_OPENED}.ai.md"), "Alice opens the topic."),
+                (&format!("{THREAD_OPENED}.thread.md"), &thread_md),
+                (
+                    &format!("{THREAD_ANSWERED}.md"),
+                    "Subject: Re: topic\nFrom: Bob\nDate: Sun, 2 Mar 2025\n\nAnswer.",
+                ),
+                (&format!("{THREAD_ANSWERED}.ai.md"), "Bob answers."),
+            ],
+            &[(
+                &format!("{THREAD_ANSWERED}.thread.md"),
+                "../01/10-00-00.thread.md",
+            )],
+            &[],
+        )
+        .unwrap();
+        fi.finish().unwrap();
+    }
+
+    /// The days that a thread's ledger has a section for.
+    fn ledger_days(cat: &mut CatFile, git_ref: &str, root_dk: &str) -> Vec<String> {
+        cat.get_str(&format!("{git_ref}:{}", thread_deltas::path(root_dk)))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The daily digests of one run each add their day to the ledger of
+    /// the thread, so the second day must not replace the first.
+    #[tokio::test]
+    async fn test_pipeline_collects_a_threads_days_in_its_ledger() {
+        use crate::ai_backend::Backend;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_thread_over_two_days(repo, git_ref);
+
+        let backend = Backend::Mock { nth_word: 3 };
+        run_pipeline(repo, git_ref, None, None, 5, Some(&backend), false)
+            .await
+            .unwrap();
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert_eq!(
+            ledger_days(&mut cat, git_ref, THREAD_OPENED),
+            ["2025/03/01", "2025/03/02"],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redo_daily_keeps_the_other_days_of_the_thread_ledger() {
+        use crate::ai_backend::Backend;
+
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_thread_over_two_days(repo, git_ref);
+
+        let backend = Backend::Mock { nth_word: 1 };
+        for day in ["2025/03/01", "2025/03/02", "2025/03/01"] {
+            redo_daily(repo, git_ref, day, &backend).await.unwrap();
+        }
+
+        let mut cat = CatFile::new(repo).unwrap();
+        assert_eq!(
+            ledger_days(&mut cat, git_ref, THREAD_OPENED),
+            ["2025/03/01", "2025/03/02"],
+        );
+    }
+
+    /// Commit `files` to `git_ref` of the repository at `repo`.
+    fn seed_files(repo: &str, git_ref: &str, files: &[(&str, &str)]) {
+        let mut fi = FastImport::new(repo, git_ref).unwrap();
+        fi.commit("seed", files).unwrap();
+        fi.finish().unwrap();
+    }
+
+    /// A backend that answers every request with "A digest.", and the
+    /// server that records the requests.
+    async fn recording_backend() -> (wiremock::MockServer, Backend) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "A digest."}}]
+            })))
+            .mount(&server)
+            .await;
+        let backend = Backend::Api {
+            api_url: server.uri(),
+            model: "test".into(),
+            token: None,
+        };
+        (server, backend)
+    }
+
+    /// The user message of every request the server has received.
+    async fn user_messages(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["messages"][1]["content"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_redo_weekly_reads_the_human_digests_of_that_week_only() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(
+            repo,
+            git_ref,
+            &[
+                ("2025/01/05/digest.human.md", "Digest of the Sunday before."),
+                ("2025/01/06/digest.human.md", "Digest of the Monday."),
+                ("2025/01/08/digest.ai.md", "AI digest of the Wednesday."),
+                ("2025/01/12/digest.human.md", "Digest of the Sunday."),
+                ("2025/01/13/digest.human.md", "Digest of the Monday after."),
+            ],
+        );
+        let (server, backend) = recording_backend().await;
+
+        redo_weekly(repo, git_ref, "2025/01/12", &backend)
+            .await
+            .unwrap();
+
+        let asked = user_messages(&server).await;
+        assert_eq!(asked.len(), 2, "one request for each mode");
+        for message in &asked {
+            assert!(message.contains("Sub-period digests: 2"));
+            assert!(message.contains("Digest of the Monday."));
+            assert!(message.contains("Digest of the Sunday."));
+            assert!(!message.contains("Sunday before"));
+            assert!(!message.contains("Monday after"));
+            assert!(!message.contains("AI digest"));
+        }
+        let mut cat = CatFile::new(repo).unwrap();
+        for file in ["digest.weekly.human.md", "digest.weekly.ai.md"] {
+            let spec = format!("{git_ref}:2025/01/12/{file}");
+            assert!(
+                cat.get_str(&spec)
+                    .is_some_and(|text| text.contains("A digest."))
+            );
+        }
+        assert_eq!(
+            git_util::git(repo, &["log", "-1", "--format=%s", git_ref]).unwrap(),
+            "digestive: redo weekly digest for 2025/01/12"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redo_weekly_needs_a_sunday_with_daily_digests() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(repo, git_ref, &[("2025/01/06/digest.human.md", "Digest.")]);
+        let (server, backend) = recording_backend().await;
+
+        let error = redo_weekly(repo, git_ref, "2025/01/08", &backend)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a Sunday"));
+        let error = redo_weekly(repo, git_ref, "2025/01/19", &backend)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no daily digests"));
+        assert!(user_messages(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_redo_monthly_reads_the_human_digests_of_the_days_of_the_month() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(
+            repo,
+            git_ref,
+            &[
+                ("2024/12/31/digest.human.md", "Day before the month."),
+                ("2025/01/01/digest.human.md", "First day."),
+                ("2025/01/15/digest.ai.md", "AI digest of a day."),
+                ("2025/01/15/digest.human.md", "Day in the middle."),
+                ("2025/01/31/digest.human.md", "Last day."),
+                ("2025/02/01/digest.human.md", "Day after the month."),
+            ],
+        );
+        let (server, backend) = recording_backend().await;
+
+        redo_monthly(repo, git_ref, "2025/01", &backend)
+            .await
+            .unwrap();
+
+        let asked = user_messages(&server).await;
+        assert_eq!(asked.len(), 2, "one request for each mode");
+        for message in &asked {
+            assert!(message.contains("Sub-period digests: 3"));
+            assert!(message.contains("Date: 2025/01/01\n\nFirst day."));
+            assert!(message.contains("Day in the middle."));
+            assert!(message.contains("Date: 2025/01/31\n\nLast day."));
+            assert!(!message.contains("before the month"));
+            assert!(!message.contains("after the month"));
+            assert!(!message.contains("AI digest"));
+        }
+        let mut cat = CatFile::new(repo).unwrap();
+        for file in ["digest.monthly.human.md", "digest.monthly.ai.md"] {
+            let spec = format!("{git_ref}:2025/01/{file}");
+            assert!(
+                cat.get_str(&spec)
+                    .is_some_and(|text| text.contains("A digest."))
+            );
+        }
+        assert_eq!(
+            git_util::git(repo, &["log", "-1", "--format=%s", git_ref]).unwrap(),
+            "digestive: redo monthly digest for 2025/01"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redo_monthly_needs_a_month_with_daily_digests() {
+        let dir = crate::git_util::tests::init_bare_repo();
+        let repo = dir.path().to_str().unwrap();
+        let git_ref = "refs/heads/main";
+        seed_files(repo, git_ref, &[("2025/01/05/digest.human.md", "Day.")]);
+        let (server, backend) = recording_backend().await;
+
+        for month in ["2025/13", "2025/01/05", "2025/1"] {
+            let error = redo_monthly(repo, git_ref, month, &backend)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("is not a month"), "{month}");
+        }
+        let error = redo_monthly(repo, git_ref, "2025/03", &backend)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no daily digests"));
+        assert!(user_messages(&server).await.is_empty());
+    }
+
+    /// A thread with one message a day on `count` days from 2025/03/01,
+    /// whose source emails carry their own date-key in the text.
+    fn daily_thread(count: usize) -> (MockBlobs, &'static [&'static str], Vec<String>) {
+        const DAYS: [&str; 12] = [
+            "2025/03/01",
+            "2025/03/02",
+            "2025/03/03",
+            "2025/03/04",
+            "2025/03/05",
+            "2025/03/06",
+            "2025/03/07",
+            "2025/03/08",
+            "2025/03/09",
+            "2025/03/10",
+            "2025/03/11",
+            "2025/03/12",
+        ];
+        let days = &DAYS[..count];
+        let dks: Vec<String> = days.iter().map(|day| format!("{day}/09-00-00")).collect();
+        let thread_md: String = dks
+            .iter()
+            .enumerate()
+            .map(|(depth, dk)| format!("{}- {dk} [topic](x.md) *Alice*\n", "  ".repeat(depth)))
+            .collect();
+        let mut blobs = MockBlobs(Default::default());
+        blobs
+            .0
+            .insert(format!("main:{}.thread.md", dks[0]), thread_md);
+        for dk in &dks {
+            blobs.0.insert(
+                format!("main:{dk}.md"),
+                format!("Subject: topic\nFrom: Alice\n\nSource text of {dk}."),
+            );
+        }
+        (blobs, days, dks)
+    }
+
+    /// A thread that was already running when its ledger started lacks
+    /// its earlier days.  Only those are extracted, each from its own
+    /// day's emails; a day recorded as empty counts as extracted.
+    #[tokio::test]
+    async fn test_history_extraction_fills_only_the_days_a_ledger_lacks() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(4);
+        let mut ledger = ThreadDeltas::default();
+        ledger.record(days[0], vec!["recorded earlier".to_string()]);
+        ledger.record(days[2], Vec::new());
+
+        let history = recent_history(
+            days[3],
+            &dks[0],
+            &mut ledger,
+            usize::MAX,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ledger.day(days[0]),
+            Some(&["recorded earlier".to_string()][..])
+        );
+        assert_eq!(ledger.day(days[2]), Some(&[][..]));
+        assert_eq!(ledger.day(days[3]), None, "the day itself is not history");
+        let extracted = ledger.day(days[1]).expect("the missing day is extracted");
+        let extracted = extracted.join("\n");
+        assert!(extracted.contains(&format!("Source text of {}", dks[1])));
+        for later in [&dks[2], &dks[3]] {
+            assert!(!extracted.contains(&format!("Source text of {later}")));
+        }
+        // Oldest first, and without the day that had nothing noteworthy.
+        let returned: Vec<_> = history.iter().map(|(day, _)| day.as_str()).collect();
+        assert_eq!(returned, [days[0], days[1]]);
+        assert_eq!(history[0].1, ["recorded earlier"]);
+    }
+
+    /// The history a digest item shows is bounded, so the days older than
+    /// what fits are neither returned nor extracted.
+    #[tokio::test]
+    async fn test_history_extraction_stops_once_the_budget_is_filled() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(4);
+        let mut ledger = ThreadDeltas::default();
+
+        let history = recent_history(
+            days[3],
+            &dks[0],
+            &mut ledger,
+            1,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        let returned: Vec<_> = history.iter().map(|(day, _)| day.as_str()).collect();
+        assert_eq!(returned, [days[2]]);
+        assert!(ledger.day(days[2]).is_some());
+        assert_eq!(ledger.day(days[1]), None);
+        assert_eq!(ledger.day(days[0]), None);
+    }
+
+    /// A quiet thread whose days hold nothing noteworthy must not make the
+    /// extraction go back day after day.
+    #[tokio::test]
+    async fn test_history_extraction_looks_at_a_bounded_number_of_days() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(12);
+        let mut ledger = ThreadDeltas::default();
+
+        recent_history(
+            days[11],
+            &dks[0],
+            &mut ledger,
+            usize::MAX,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        // Eleven days precede the last one; only the newest ten are looked at.
+        let extracted = days.iter().filter(|day| ledger.day(day).is_some()).count();
+        assert_eq!(extracted, MAX_HISTORY_DAYS);
+        assert!(ledger.day(days[1]).is_some());
+        assert_eq!(ledger.day(days[0]), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_long_threads_recent_history_is_attached_and_kept_in_its_ledger() {
+        use crate::ai_backend::Backend;
+
+        let (mut blobs, days, dks) = daily_thread(4);
+        let mut packets = selection_packets(4);
+        packets[0].root_dk = dks[0].clone();
+        packets[0].activity = long_activity(30, 1);
+        let mut ledgers = BTreeMap::new();
+
+        attach_history(
+            days[3],
+            &mut packets,
+            &mut ledgers,
+            "main",
+            &mut blobs,
+            &Backend::Mock { nth_word: 1 },
+        )
+        .await
+        .unwrap();
+
+        let history = packets[0].history.join("\n");
+        assert!(history.contains(&format!("Source text of {}", dks[2])));
+        assert!(!history.contains(&format!("Source text of {}", dks[3])));
+        assert!(packets[1..].iter().all(|packet| packet.history.is_empty()));
+        // The days that were backfilled are in the ledger that gets saved.
+        assert_eq!(ledgers.keys().collect::<Vec<_>>(), [&dks[0]]);
+        assert!(ledgers[&dks[0]].day(days[2]).is_some());
+    }
+
+    fn long_activity(replies: usize, messages_today: usize) -> Option<ThreadActivity> {
+        Some(ThreadActivity {
+            replies,
+            participants: 3,
+            messages_today,
+            days: 10,
+        })
+    }
+
+    /// `valid_digest` with a `## Long threads` section ahead of the day
+    /// in brief.
+    fn digest_with_long_threads(ids: &[&str]) -> String {
+        let section: String = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "### [{id}] long discussion {id}\n\n\
+                     Prose about the long discussion {id}.\n\n"
+                )
+            })
+            .collect();
+        valid_digest(&HUMAN_DIGEST_MODE, 0).replace(
+            "## The day in brief",
+            &format!("## Long threads\n\n{section}## The day in brief"),
+        )
+    }
+
+    fn inputs_to(requests: &[wiremock::Request], system: &str) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                (body["messages"][0]["content"].as_str() == Some(system))
+                    .then(|| body["messages"][1]["content"].as_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_the_longest_threads_lead_and_three_topics_stay_for_the_ranking() {
+        let mut packets = selection_packets(12);
+        for (index, activity) in [
+            (1, long_activity(25, 1)),
+            (3, long_activity(40, 2)),
+            (5, long_activity(25, 9)),
+            (7, long_activity(3, 8)),
+            (9, long_activity(19, 7)),
+        ] {
+            packets[index].activity = activity;
+        }
+        // Longest first, then the busier day; T10 is not long.
+        assert_eq!(
+            long_tier(&packets, &HUMAN_DIGEST_MODE),
+            ["T04", "T06", "T02", "T08"],
+        );
+        let capped = DigestMode {
+            long_limit: 2,
+            ..HUMAN_DIGEST_MODE
+        };
+        assert_eq!(long_tier(&packets, &capped), ["T04", "T06"]);
+
+        let mut few = selection_packets(5);
+        for packet in &mut few {
+            packet.activity = long_activity(30, 1);
+        }
+        assert_eq!(long_tier(&few, &HUMAN_DIGEST_MODE), ["T01", "T02"]);
+    }
+
+    #[test]
+    fn test_a_long_threads_section_is_bound_to_the_assigned_ids() {
+        let ids = ["T01", "T02", "T03", "T04", "T05", "T06"];
+        let selection = |long: &[&str]| TopicSelection {
+            long: long.iter().map(|id| id.to_string()).collect(),
+            notable: vec!["T01".into(), "T02".into(), "T03".into()],
+            brief: vec!["T04".into()],
+        };
+        let digest = digest_with_long_threads(&["T06", "T05"]);
+
+        // The section is part of a valid shape, and its headings are not
+        // counted as notable ones.
+        assert!(validate_digest(&digest, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY).is_empty());
+        assert_eq!(selection_issue(&digest, &selection(&["T05", "T06"])), None);
+        let fewer = digest.replace("### [T03] completion for git history", "Prose.");
+        let issues = validate_digest(&fewer, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("there are 2 level-3 headings"))
+        );
+        let numbered = digest.replace("Prose about the long discussion T05.", "1. One.\n2. Two.");
+        let issues = validate_digest(&numbered, &HUMAN_DIGEST_MODE, &ids, DIGEST_DAY);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("2 numbered list item(s)"))
+        );
+
+        // The headings must be exactly the assigned ones, under the section.
+        let issue = selection_issue(&digest, &selection(&["T05"])).unwrap();
+        assert!(issue.contains("these selected IDs: T05"), "{issue}");
+        let omitted = valid_digest(&HUMAN_DIGEST_MODE, 0);
+        let issue = selection_issue(&omitted, &selection(&["T05", "T06"])).unwrap();
+        assert!(issue.contains("long-thread headings"), "{issue}");
+        let issue = selection_issue(&digest, &selection(&[])).unwrap();
+        assert!(
+            issue.contains("no topic is assigned to `## Long threads`"),
+            "{issue}"
+        );
+        let bare = omitted.replace(
+            "## The day in brief",
+            "## Long threads\n\nNothing to report.\n\n## The day in brief",
+        );
+        let issue = selection_issue(&bare, &selection(&[])).unwrap();
+        assert!(issue.contains("no topic is assigned"), "{issue}");
+    }
+
+    #[tokio::test]
+    async fn test_long_threads_lead_the_digest_and_skip_the_ranking() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let draft = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, _) = scripted_digest_backend(vec![draft.clone()], "").await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        assert!(result.contains("## Long threads\n\n### long discussion T06"));
+        // The archive's counts are added by code, after the audit.
+        assert!(result.contains(
+            "### long discussion T06\n\n\
+             *Long thread: 45 replies so far from 3 participants over 10 days; \
+             1 message that day.*\n\n"
+        ));
+        assert!(result.contains(
+            "*Long thread: 30 replies so far from 3 participants over 10 days; \
+             2 messages that day.*"
+        ));
+        let requests = server.received_requests().await.unwrap();
+        let audit = inputs_to(&requests, DAILY_DIGEST_AUDIT_AGENT);
+        assert!(!audit.is_empty() && audit.iter().all(|input| !input.contains("Long thread")));
+        let ranker = inputs_to(&requests, DAILY_SELECT_AGENT);
+        assert_eq!(ranker.len(), 1);
+        assert!(ranker[0].contains("TOPIC T04\n"));
+        assert!(!ranker[0].contains("TOPIC T05\n") && !ranker[0].contains("TOPIC T06\n"));
+        let editor = inputs_to(&requests, DAILY_DIGEST_AGENT);
+        assert_eq!(editor.len(), 1);
+        assert!(editor[0].contains("Use exactly these IDs for long-thread headings: T06, T05."));
+        assert!(editor[0].find("TOPIC T06").unwrap() < editor[0].find("TOPIC T01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_a_digest_that_omits_its_long_threads_is_rejected() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let good = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, writer_calls) =
+            scripted_digest_backend(vec![valid_digest(&HUMAN_DIGEST_MODE, 0), good.clone()], "")
+                .await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        assert!(result.contains("## Long threads\n\n### long discussion T06"));
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let editor = inputs_to(
+            &server.received_requests().await.unwrap(),
+            DAILY_DIGEST_AGENT,
+        );
+        assert!(editor[1].contains(
+            "long-thread headings under `## Long threads` must use exactly these selected IDs: T06, T05"
+        ));
+    }
+
+    #[test]
+    fn test_long_threads_are_marked_with_their_size() {
+        let mut packets = selection_packets(5);
+        packets[1].activity = long_activity(42, 8);
+        packets[2].activity = Some(ThreadActivity {
+            replies: 1,
+            participants: 1,
+            messages_today: 9,
+            days: 1,
+        });
+        packets[3].activity = long_activity(20, 1);
+        let digest = "\
+# Title
+
+## The day in brief
+
+Overview.
+
+## Notable threads
+
+### [T01] Short topic
+
+Prose.
+
+### [T02] Long topic
+
+Prose.
+
+### [T03] Busy day
+Prose right below the heading.
+
+## In brief
+
+- [T04] **Wrapped**: a bullet that
+  wraps onto a second line.
+- [T05] A short one.
+";
+
+        let t02 = "*Long thread: 42 replies so far from 3 participants over 10 days; \
+                   8 messages that day.*";
+        let t03 = "*Long thread: 1 reply so far from 1 participant over 1 day; \
+                   9 messages that day.*";
+        let t04 = "*Long thread: 20 replies so far from 3 participants over 10 days; \
+                   1 message that day.*";
+        let expected = digest
+            .replace(
+                "### [T02] Long topic\n",
+                &format!("### [T02] Long topic\n\n{t02}\n"),
+            )
+            .replace(
+                "### [T03] Busy day\n",
+                &format!("### [T03] Busy day\n\n{t03}\n\n"),
+            )
+            .replace(
+                "onto a second line.\n",
+                &format!("onto a second line. {t04}\n"),
+            );
+        assert_eq!(
+            mark_long_threads(digest, &packets, &HUMAN_DIGEST_MODE),
+            expected
+        );
+
+        // The AI digest also says where to find the thread.
+        assert!(
+            mark_long_threads(digest, &packets, &AI_DIGEST_MODE).contains(
+                "*Long thread (root 2026/10/01/00-00-02): 42 replies so far from 3 \
+                 participants over 10 days; 8 messages that day.*"
+            )
+        );
+
+        // Nothing changes for a digest without long threads.
+        let none = selection_packets(5);
+        assert_eq!(mark_long_threads(digest, &none, &HUMAN_DIGEST_MODE), digest);
+    }
+
+    #[tokio::test]
+    async fn test_long_thread_notes_count_toward_the_word_window() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        let notes: usize = packets
+            .iter()
+            .filter_map(|packet| long_thread_note(packet, &HUMAN_DIGEST_MODE))
+            .map(|note| digest_word_count(&note))
+            .sum();
+        let padded = |words: usize| {
+            let digest = digest_with_long_threads(&["T06", "T05"]);
+            let have = digest_word_count(&digest);
+            digest.replace(
+                "\n\n## In brief",
+                &format!(" {}\n\n## In brief", vec!["alpha"; words - have].join(" ")),
+            )
+        };
+        let max = HUMAN_DIGEST_MODE.max_words;
+        let (_server, backend, writer_calls) =
+            scripted_digest_backend(vec![padded(max - notes + 1), padded(max - notes)], "").await;
+
+        let result = generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        // The first draft fits the window on its own, but not with the notes.
+        assert_eq!(writer_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(digest_word_count(&result), max);
+    }
+
+    #[tokio::test]
+    async fn test_a_long_threads_history_reaches_the_editor_and_the_audit() {
+        let mut packets = selection_packets(6);
+        packets[4].activity = long_activity(30, 2);
+        packets[5].activity = long_activity(45, 1);
+        packets[5].history = vec!["[2026/09/30/08-00-00 by Alice] Alice posted v1.".to_string()];
+        let draft = digest_with_long_threads(&["T06", "T05"]);
+        let (server, backend, _) = scripted_digest_backend(vec![draft], "").await;
+
+        generate_digest_mode(DIGEST_DAY, &HUMAN_DIGEST_MODE, &packets, &backend)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let editor = &inputs_to(&requests, DAILY_DIGEST_AGENT)[0];
+        let history = editor.find("EARLIER DEVELOPMENTS FOR T06").unwrap();
+        let deltas = editor.find("TODAY'S VERIFIED DELTAS FOR T06").unwrap();
+        assert!(history < deltas, "the history comes before today's deltas");
+        assert!(editor.contains("Alice posted v1."));
+        assert!(!editor.contains("EARLIER DEVELOPMENTS FOR T05"));
+        let audits = inputs_to(&requests, DAILY_DIGEST_AUDIT_AGENT);
+        let audit_of = |id: &str| {
+            audits
+                .iter()
+                .find(|input| input.contains(&format!("AUDIT LOCATION: {id}")))
+                .unwrap()
+        };
+        assert!(audit_of("T06").contains("EARLIER DEVELOPMENTS FOR T06"));
+        assert!(!audit_of("T05").contains("EARLIER DEVELOPMENTS"));
     }
 }
