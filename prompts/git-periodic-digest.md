@@ -120,7 +120,15 @@ Refer to Git commands in back-ticks.
 Use contributor names exactly as they appear in the daily digests.
 
 Do not fabricate context. If the daily digests do not explain an outcome,
-say so rather than guessing.
+say so rather than guessing. Every topic, name and figure in the digest
+comes from a daily digest.
+
+Keep each event with the version, day and person that the daily digests
+give it. Do not move an event to another version of a series, do not
+write "earlier" or "by vN" unless a daily digest does, and do not credit
+one person's statement to someone else or to two people. State a status
+("queued", "ready for `next`", "merged") as the last daily digest that
+mentions the topic gives it, never as more final than that.
 
 Do not use bullet lists anywhere in the digest. Every section is prose.
 
