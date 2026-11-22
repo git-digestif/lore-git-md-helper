@@ -85,6 +85,13 @@ impl CliToken {
         Ok(token)
     }
 
+    /// Drop the token on hand, so that the next `get` asks the command for
+    /// a new one.  For a token that the server refused although it should
+    /// still be valid, for example after the machine slept.
+    pub async fn forget(&self) {
+        *self.cached.lock().await = None;
+    }
+
     async fn fetch(&self) -> Result<Cached> {
         let output = tokio::time::timeout(
             COMMAND_TIMEOUT,

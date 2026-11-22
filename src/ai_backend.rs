@@ -151,6 +151,8 @@ pub enum ApiAuth<'a> {
     Bearer(&'a str),
     /// API key in a custom header (e.g. Azure OpenAI uses `api-key`).
     ApiKey(&'a str),
+    /// Bearer token from the Azure CLI, asked for before each attempt.
+    CliToken(&'a CliToken),
     /// No authentication required.
     None,
 }
@@ -411,16 +413,9 @@ impl Backend {
                 auth,
                 options,
             } => {
-                let token;
                 let auth = match auth {
                     AzureAuth::ApiKey(api_key) => ApiAuth::ApiKey(api_key),
-                    AzureAuth::CliToken(tokens) => {
-                        token = tokens
-                            .get()
-                            .await
-                            .context("could not get an Azure access token from the Azure CLI")?;
-                        ApiAuth::Bearer(&token)
-                    }
+                    AzureAuth::CliToken(tokens) => ApiAuth::CliToken(tokens),
                 };
                 let ep = ApiEndpoint {
                     api_url,
@@ -720,6 +715,7 @@ async fn chat_api_with(
 
     let max_retries: u32 = 5;
     let mut attempt = 0;
+    let mut token_renewed = false;
     loop {
         let mut builder = client.post(&url).json(&req);
         match &ep.auth {
@@ -728,6 +724,13 @@ async fn chat_api_with(
             }
             ApiAuth::ApiKey(k) => {
                 builder = builder.header("api-key", *k);
+            }
+            ApiAuth::CliToken(tokens) => {
+                let token = tokens
+                    .get()
+                    .await
+                    .context("could not get an Azure access token from the Azure CLI")?;
+                builder = builder.bearer_auth(token);
             }
             ApiAuth::None => {}
         }
@@ -747,6 +750,17 @@ async fn chat_api_with(
                 continue;
             }
         };
+
+        // The server can refuse a token that looks valid here, for example
+        // after the machine slept; one new token is worth a try.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let ApiAuth::CliToken(tokens) = &ep.auth
+            && !token_renewed
+        {
+            token_renewed = true;
+            tokens.forget().await;
+            continue;
+        }
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             attempt += 1;
@@ -1216,6 +1230,79 @@ mod tests {
             RequestOptions::default(),
         );
         assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+    }
+
+    /// A token command that prints TOKEN-1, then TOKEN-2, and so on.
+    #[cfg(unix)]
+    fn numbered_tokens(runs: &std::path::Path) -> CliToken {
+        CliToken::new(
+            "sh",
+            [
+                "-c",
+                concat!(
+                    r#"n=$(cat "$1" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$1"; "#,
+                    r#"printf '{"accessToken":"TOKEN-%s"}' $n"#,
+                ),
+                "sh",
+                runs.to_str().unwrap(),
+            ],
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn azure_backend_asks_for_a_new_token_after_a_401() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer TOKEN-1"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer TOKEN-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok_chat_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = numbered_tokens(&dir.path().join("runs"));
+        let backend = Backend::azure_openai_with_tokens(
+            server.uri(),
+            None,
+            tokens,
+            RequestOptions::default(),
+        );
+        assert_eq!(backend.chat("sys", "usr").await.unwrap(), "ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn azure_backend_gives_up_when_the_new_token_is_refused_too() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = numbered_tokens(&dir.path().join("runs"));
+        let backend = Backend::azure_openai_with_tokens(
+            server.uri(),
+            None,
+            tokens,
+            RequestOptions::default(),
+        );
+        let err = backend.chat("sys", "usr").await.unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
     }
 
     #[test]

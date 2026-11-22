@@ -80,7 +80,8 @@ server errors, retry-after header support with a cap, and empty
 response detection. API errors are propagated as hard failures rather
 than producing error markers in the output. The Azure backend
 authenticates with an API key or, with `--azure-cli-token`, with an
-access token from the Azure CLI (`azure_cli_token`).
+access token from the Azure CLI (`azure_cli_token`); a token the
+server refuses with a 401 is renewed once and the request repeated.
 
 A `msgid-notes` tool maps Message-IDs to blob OIDs via Git notes
 (stage 3 groundwork).
