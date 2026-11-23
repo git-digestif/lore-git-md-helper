@@ -4,18 +4,21 @@
 # lore-git-md corpus, then summarize them and write the digests, as the
 # retired "Daily digest" GitHub workflow did.
 #
-# The directory named by LORE_GIT_MD_WORK_DIR (default: the current
-# directory) holds the two bare repositories lore-git.git, a mirror of
+# LORE_GIT_MD_WORK_DIR names the work directory (default: the current
+# directory), which is created if missing and which the script changes into.
+# It holds the bare repositories lore-git.git, a mirror of
 # https://lore.kernel.org/git/1, and lore-git-md.git, the corpus, which are
-# cloned if missing.  The helper executables update-lore-git-md and digestive
-# come from the latest release of lore-git-md-helper, and are cached in the
-# subdirectory helper.  AZURE_OPENAI_ENDPOINT must be set, and `az login`
-# must have been run: the Azure access tokens come from the Azure CLI, not
-# from an API key.
+# cloned if missing, and helper/, the executables of the latest release of
+# lore-git-md-helper.  AZURE_OPENAI_ENDPOINT must be set, and `az login` must
+# have been run: the Azure access tokens come from the Azure CLI, not from an
+# API key.
 
 set -eu
 
-work_dir=${LORE_GIT_MD_WORK_DIR:-$PWD}
+work_dir=${LORE_GIT_MD_WORK_DIR:-.}
+mkdir -p "$work_dir"
+cd "$work_dir"
+work_dir=$PWD
 source_repo=$work_dir/lore-git.git
 target_repo=$work_dir/lore-git-md.git
 source_url=https://lore.kernel.org/git/1
