@@ -4,10 +4,11 @@
 # lore-git-md corpus, then summarize them and write the digests, as the
 # retired "Daily digest" GitHub workflow did.
 #
-# Usage: daily-digest.sh [--register-task]
+# Usage: daily-digest.sh [--register-task | --start-in-tmux]
 #
-# --register-task registers a Windows scheduled task that runs the script
-# every hour, instead of running a cycle.
+# Without an option, the script runs one cycle.  --start-in-tmux runs the
+# script in a new window of the tmux session.  --register-task registers a
+# Windows scheduled task that does that every hour.
 #
 # LORE_GIT_MD_WORK_DIR names the work directory (default: the current
 # directory), which is created if missing and which the script changes into.
@@ -33,6 +34,7 @@ target_repo=lore-git-md.git
 source_url=https://lore.kernel.org/git/1
 target_url=https://github.com/git-digestif/lore-git-md.git
 task_name=lore-git-md-daily-digest
+window_name=daily-digest
 
 die () {
 	echo "$*" >&2
@@ -134,9 +136,18 @@ push_corpus () {
 	target_git push --atomic origin refs/heads/main refs/notes/msgid
 }
 
-# Register a Windows scheduled task that runs this script every hour, also
-# after the computer was asleep.  CHERE_INVOKING keeps the login shell in the
-# task's working directory.
+# Run the script in a new window of the tmux session.  Apart from PATH, the
+# window gets the environment of the tmux server, not this script's, so the
+# work directory is passed on explicitly.
+start_in_tmux () {
+	tmux has-session 2>/dev/null || die "There is no tmux session"
+	tmux new-window -d -n "$window_name" -c "$work_dir" "$(printf '%q ' \
+		env "LORE_GIT_MD_WORK_DIR=$work_dir" "$BASH" "$script")"
+}
+
+# Register a Windows scheduled task that runs this script with
+# --start-in-tmux every hour, also after the computer was asleep.
+# CHERE_INVOKING keeps the login shell in the task's working directory.
 register_task () {
 	case "$(uname -s)" in
 	MINGW* | MSYS* | CYGWIN*) ;;
@@ -146,7 +157,7 @@ register_task () {
 	env_exe=$(cygpath -w /usr/bin/env.exe)
 	bash_exe=$(cygpath -w /usr/bin/bash.exe)
 	win_dir=$(cygpath -w "$work_dir")
-	args="CHERE_INVOKING=1 \"$bash_exe\" -l \"$script\""
+	args="CHERE_INVOKING=1 \"$bash_exe\" -l \"$script\" --start-in-tmux"
 
 	ps=$(cat <<-\EOF
 		$ErrorActionPreference = 'Stop'
@@ -172,8 +183,12 @@ case "${1-}" in
 	register_task
 	exit
 	;;
+--start-in-tmux)
+	start_in_tmux
+	exit
+	;;
 *)
-	die "Usage: $0 [--register-task]"
+	die "Usage: $0 [--register-task | --start-in-tmux]"
 	;;
 esac
 
