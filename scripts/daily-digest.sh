@@ -23,6 +23,10 @@ die () {
 	exit 1
 }
 
+target_git () {
+	git --git-dir="$target_repo" "$@"
+}
+
 # Put the executables of the latest release of the helper for this system on
 # the PATH, downloading them first if they are not in the cache yet.
 install_helper () {
@@ -73,7 +77,31 @@ install_helper () {
 	PATH=$cache_dir/$name:$PATH
 }
 
+# Fast-forward both repositories to their origins.  A corpus ref that is
+# ahead of its origin is kept, and one that has diverged from it is an error.
+fetch_repos () {
+	git --git-dir="$source_repo" fetch origin master:master
+
+	target_git fetch origin \
+		+refs/heads/main:refs/remotes/origin/main \
+		+refs/notes/msgid:refs/remotes/origin/notes/msgid
+	for pair in refs/heads/main:refs/remotes/origin/main \
+		refs/notes/msgid:refs/remotes/origin/notes/msgid
+	do
+		ref=${pair%%:*} tracking=${pair#*:}
+		if ! target_git rev-parse -q --verify "$ref" >/dev/null ||
+			target_git merge-base --is-ancestor "$ref" "$tracking"
+		then
+			target_git update-ref "$ref" "$tracking"
+		elif ! target_git merge-base --is-ancestor "$tracking" "$ref"
+		then
+			die "$ref has diverged from $tracking"
+		fi
+	done
+}
+
 install_helper
+fetch_repos
 
 update-lore-git-md "$source_repo" "$target_repo"
 
