@@ -7,7 +7,8 @@
 # The directory named by LORE_GIT_MD_WORK_DIR (default: the current
 # directory) must hold the two bare repositories lore-git.git, a mirror of
 # https://lore.kernel.org/git/1, and lore-git-md.git, the corpus.  The
-# helper executables update-lore-git-md and digestive must be on the PATH,
+# helper executables update-lore-git-md and digestive come from the latest
+# release of lore-git-md-helper, and are cached in the subdirectory helper.
 # AZURE_OPENAI_ENDPOINT must be set, and `az login` must have been run:
 # the Azure access tokens come from the Azure CLI, not from an API key.
 
@@ -16,6 +17,63 @@ set -eu
 work_dir=${LORE_GIT_MD_WORK_DIR:-$PWD}
 source_repo=$work_dir/lore-git.git
 target_repo=$work_dir/lore-git-md.git
+
+die () {
+	echo "$*" >&2
+	exit 1
+}
+
+# Put the executables of the latest release of the helper for this system on
+# the PATH, downloading them first if they are not in the cache yet.
+install_helper () {
+	case "$(uname -s)" in
+	Linux) os=linux ext=tar.gz ;;
+	MINGW* | MSYS* | CYGWIN*) os=windows ext=zip ;;
+	*) die "Unsupported operating system: $(uname -s)" ;;
+	esac
+	arch=$(uname -m)
+	# The bash of the Git SDK for ARM64 is an x64 build that runs
+	# emulated, so uname -m says x86_64 there.  The CPU decides.
+	case $os,${PROCESSOR_IDENTIFIER-} in
+	windows,ARM*) arch=aarch64 ;;
+	esac
+	case $os-$arch in
+	linux-x86_64 | windows-x86_64 | windows-aarch64) ;;
+	*) die "No release of the helper for $os-$arch" ;;
+	esac
+
+	repo=git-digestif/lore-git-md-helper
+	# The redirect of the latest release page names the tag.  The REST API
+	# allows only 60 requests an hour per IP address without a token.
+	tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+		"https://github.com/$repo/releases/latest" || :)
+	case $tag in
+	*/releases/tag/*) tag=${tag##*/} ;;
+	*) die "Could not find the latest release of $repo" ;;
+	esac
+
+	name=lore-git-md-helper-$tag-$os-$arch
+	url=https://github.com/$repo/releases/download/$tag/$name.$ext
+	cache_dir=$work_dir/helper
+	if ! test -d "$cache_dir/$name"
+	then
+		echo "Downloading $name" >&2
+		mkdir -p "$cache_dir"
+		tmp=$(mktemp -d "$cache_dir/tmp.XXXXXX")
+		(
+			trap 'rm -rf "$tmp"' EXIT
+			curl -fsSL -o "$tmp/$name.$ext" "$url"
+			case $ext in
+			zip) unzip -q "$tmp/$name.$ext" -d "$tmp" ;;
+			*) tar xzf "$tmp/$name.$ext" -C "$tmp" ;;
+			esac
+			mv "$tmp/$name" "$cache_dir/$name"
+		)
+	fi
+	PATH=$cache_dir/$name:$PATH
+}
+
+install_helper
 
 update-lore-git-md "$source_repo" "$target_repo"
 
