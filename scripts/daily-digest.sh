@@ -7,8 +7,9 @@
 # Usage: daily-digest.sh [--register-task | --start-in-tmux]
 #
 # Without an option, the script runs one cycle.  --start-in-tmux runs the
-# script in a new window of the tmux session.  --register-task registers a
-# Windows scheduled task that does that every hour.
+# script in a new window of the tmux session, unless it runs in one
+# already.  --register-task registers a Windows scheduled task that does
+# that every hour.
 #
 # LORE_GIT_MD_WORK_DIR names the work directory (default: the current
 # directory), which is created if missing and which the script changes into.
@@ -136,11 +137,17 @@ push_corpus () {
 	target_git push --atomic origin refs/heads/main refs/notes/msgid
 }
 
-# Run the script in a new window of the tmux session.  Apart from PATH, the
-# window gets the environment of the tmux server, not this script's, so the
-# work directory is passed on explicitly.
+# Run the script in a new window of the tmux session, unless a window of that
+# name has a live pane.  The window gets the environment of the tmux server,
+# not this script's (except for PATH), so the work directory is passed on.
 start_in_tmux () {
 	tmux has-session 2>/dev/null || die "There is no tmux session"
+	if tmux list-panes -a -F '#{window_name} #{pane_dead}' |
+		grep -qx "$window_name 0"
+	then
+		echo "Already running in the tmux window $window_name" >&2
+		return
+	fi
 	tmux new-window -d -n "$window_name" -c "$work_dir" "$(printf '%q ' \
 		env "LORE_GIT_MD_WORK_DIR=$work_dir" "$BASH" "$script")"
 }
