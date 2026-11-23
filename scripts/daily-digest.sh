@@ -100,12 +100,23 @@ fetch_repos () {
 	done
 }
 
+# Push both refs at once: update-lore-git-md insists that they carry the same
+# Source-Commit trailer.
+push_corpus () {
+	target_git push --atomic origin refs/heads/main refs/notes/msgid
+}
+
 install_helper
 fetch_repos
 
 update-lore-git-md "$source_repo" "$target_repo"
 
 # Once the time limit is reached, digestive stops summarizing emails and the
-# next cycle resumes from what was committed.
+# next cycle resumes from what was committed, which is pushed even if
+# digestive failed.
+status=0
 digestive --azure-openai --azure-cli-token --since 2025/01/01 \
-	--max-runtime 50m --target-repo "$target_repo"
+	--max-runtime 50m --target-repo "$target_repo" || status=$?
+
+push_corpus
+exit $status
