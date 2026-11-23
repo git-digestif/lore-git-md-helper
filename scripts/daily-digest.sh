@@ -4,12 +4,13 @@
 # lore-git-md corpus, then summarize them and write the digests, as the
 # retired "Daily digest" GitHub workflow did.
 #
-# Usage: daily-digest.sh [--register-task | --start-in-tmux]
+# Usage: daily-digest.sh [--once | --register-task | --start-in-tmux]
 #
-# Without an option, the script runs one cycle.  --start-in-tmux runs the
-# script in a new window of the tmux session, unless it runs in one
-# already.  --register-task registers a Windows scheduled task that does
-# that every hour.
+# Without an option, the script runs one cycle after the other, forever; a
+# cycle starts at least an hour after the previous one did.  --once runs a
+# single cycle.  --start-in-tmux runs the script in a new window of the tmux
+# session, unless it runs in one already.  --register-task registers a
+# Windows scheduled task that does that every hour.
 #
 # LORE_GIT_MD_WORK_DIR names the work directory (default: the current
 # directory), which is created if missing and which the script changes into.
@@ -184,33 +185,48 @@ register_task () {
 	echo "Registered the scheduled task $task_name"
 }
 
+cycle () {
+	clone_repos
+	install_helper
+	fetch_repos
+
+	update-lore-git-md "$source_repo" "$target_repo"
+
+	# Once the time limit is reached, digestive stops summarizing emails and
+	# the next cycle resumes from what was committed, which is pushed even
+	# if digestive failed.
+	status=0
+	digestive --azure-openai --azure-cli-token --since 2025/01/01 \
+		--max-runtime 50m --target-repo "$target_repo" || status=$?
+
+	push_corpus
+	return $status
+}
+
+# Run one cycle after the other.  A cycle that fails is reported, and the
+# next one starts when it is due.  Every cycle is a process of its own:
+# the shell ignores `set -e` in a function that is called like
+# `cycle || ...`.  The work directory is passed on as an absolute path, as
+# a relative one would be taken from inside the work directory itself.
+run_forever () {
+	while :
+	do
+		started=$SECONDS
+		status=0
+		LORE_GIT_MD_WORK_DIR=$work_dir "$BASH" "$script" --once ||
+			status=$?
+		test $status -eq 0 ||
+			echo "$(date): cycle failed with status $status" >&2
+
+		remaining=$((3600 - (SECONDS - started)))
+		test $remaining -le 0 || sleep $remaining
+	done
+}
+
 case "${1-}" in
-'') ;;
---register-task)
-	register_task
-	exit
-	;;
---start-in-tmux)
-	start_in_tmux
-	exit
-	;;
-*)
-	die "Usage: $0 [--register-task | --start-in-tmux]"
-	;;
+'') run_forever ;;
+--once) cycle ;;
+--register-task) register_task ;;
+--start-in-tmux) start_in_tmux ;;
+*) die "Usage: $0 [--once | --register-task | --start-in-tmux]" ;;
 esac
-
-clone_repos
-install_helper
-fetch_repos
-
-update-lore-git-md "$source_repo" "$target_repo"
-
-# Once the time limit is reached, digestive stops summarizing emails and the
-# next cycle resumes from what was committed, which is pushed even if
-# digestive failed.
-status=0
-digestive --azure-openai --azure-cli-token --since 2025/01/01 \
-	--max-runtime 50m --target-repo "$target_repo" || status=$?
-
-push_corpus
-exit $status
