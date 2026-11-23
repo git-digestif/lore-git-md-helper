@@ -132,6 +132,43 @@ leading section is missing or superfluous, or that has more threads than
 the limit, and asks once more; a second failing draft is published
 without the count lines that are not copies.
 
+`scripts/daily-digest.sh` runs the pipeline end to end; it replaces the
+hourly "Daily digest" GitHub workflow of the lore-git-md repository,
+which no longer runs on a schedule.  One cycle clones whichever of the
+two bare repositories is missing, downloads the executables of the
+latest release of this repository, fetches both repositories, runs
+`update-lore-git-md` and `digestive`, and pushes the corpus's `main` and
+`refs/notes/msgid` together.  It needs `git` and `curl` (plus `tar` on
+Linux or `unzip` on Windows), runs on Linux x86-64 and on Windows x86-64
+and ARM64, and expects `AZURE_OPENAI_ENDPOINT` in the environment and a
+completed `az login`: the Azure access tokens come from the Azure CLI.
+It is meant to be run occasionally, for example on Windows in a Git for
+Windows shell inside tmux.
+
+The work directory (`LORE_GIT_MD_WORK_DIR`, by default the current
+directory; created if missing, and the script changes into it) holds
+`lore-git.git`, a mirror of `https://lore.kernel.org/git/1` that is
+never shallow; `lore-git-md.git`, the corpus, cloned with
+`--filter=blob:none`; and `helper/`, with one directory of executables
+per release.  Without an option, the script runs cycles forever, each
+starting at least an hour after the previous one did; a failed cycle is
+reported and the next one still follows.
+
+- `--once` runs a single cycle.  The loop runs each cycle as a process
+  of its own, because the shell ignores `set -e` in a function that is
+  called like `cycle || ...`.
+- `--start-in-tmux` runs the script in a new, detached window named
+  `daily-digest` of the tmux session, unless such a window with a live
+  pane exists, and fails if there is no tmux session.  Variables set in
+  the environment of the tmux server reach the window, so
+  `AZURE_OPENAI_ENDPOINT` belongs there; the script passes on its own
+  work directory.
+- `--register-task` (Git for Windows shells only) registers the
+  scheduled task `lore-git-md-daily-digest`, which runs the script with
+  `--start-in-tmux` every hour.  In Windows PowerShell, it is removed
+  with `Unregister-ScheduledTask -TaskName lore-git-md-daily-digest
+  -Confirm:$false`.
+
 Prompt files in `prompts/` define the AI agent behavior:
 - `git-digest-email.md`: per-email summarization with taxonomy
 - `git-thread-summary.md`: thread-level summary updates
@@ -279,5 +316,8 @@ rewrite that could have changed file contents.
 - `prompts/git-project-context.md` — shared project context
 - `prompts/git-daily-digest.md` — daily digest prompt
 - `prompts/git-periodic-digest.md` — weekly/monthly digest prompt
+- `scripts/daily-digest.sh` — runs cycles of `update-lore-git-md` and
+  `digestive`: clones, downloads the helper, fetches, pushes; options for
+  tmux and a Windows scheduled task
 - `Cargo.toml` — dependencies and project metadata
 - `sample4.md` — example converter output (a real Git mailing list patch)
