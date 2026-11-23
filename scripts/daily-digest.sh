@@ -4,6 +4,11 @@
 # lore-git-md corpus, then summarize them and write the digests, as the
 # retired "Daily digest" GitHub workflow did.
 #
+# Usage: daily-digest.sh [--register-task]
+#
+# --register-task registers a Windows scheduled task that runs the script
+# every hour, instead of running a cycle.
+#
 # LORE_GIT_MD_WORK_DIR names the work directory (default: the current
 # directory), which is created if missing and which the script changes into.
 # It holds the bare repositories lore-git.git, a mirror of
@@ -15,6 +20,8 @@
 
 set -eu
 
+# $0 may be relative, so this has to come before changing the directory.
+script=$(cd "$(dirname "$0")" && pwd)/${0##*/}
 work_dir=${LORE_GIT_MD_WORK_DIR:-.}
 mkdir -p "$work_dir"
 cd "$work_dir"
@@ -25,6 +32,7 @@ source_repo=lore-git.git
 target_repo=lore-git-md.git
 source_url=https://lore.kernel.org/git/1
 target_url=https://github.com/git-digestif/lore-git-md.git
+task_name=lore-git-md-daily-digest
 
 die () {
 	echo "$*" >&2
@@ -125,6 +133,49 @@ fetch_repos () {
 push_corpus () {
 	target_git push --atomic origin refs/heads/main refs/notes/msgid
 }
+
+# Register a Windows scheduled task that runs this script every hour, also
+# after the computer was asleep.  CHERE_INVOKING keeps the login shell in the
+# task's working directory.
+register_task () {
+	case "$(uname -s)" in
+	MINGW* | MSYS* | CYGWIN*) ;;
+	*) die "--register-task works only on Windows" ;;
+	esac
+
+	env_exe=$(cygpath -w /usr/bin/env.exe)
+	bash_exe=$(cygpath -w /usr/bin/bash.exe)
+	win_dir=$(cygpath -w "$work_dir")
+	args="CHERE_INVOKING=1 \"$bash_exe\" -l \"$script\""
+
+	ps=$(cat <<-\EOF
+		$ErrorActionPreference = 'Stop'
+		$action = New-ScheduledTaskAction -Execute $env:TASK_EXE `
+		    -Argument $env:TASK_ARGS -WorkingDirectory $env:TASK_DIR
+		$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+		    -RepetitionInterval (New-TimeSpan -Hours 1)
+		$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+		    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+		$null = Register-ScheduledTask -TaskName $env:TASK_NAME `
+		    -Action $action -Trigger $trigger -Settings $settings -Force
+	EOF
+	)
+	TASK_NAME=$task_name TASK_EXE=$env_exe \
+	TASK_ARGS=$args TASK_DIR=$win_dir \
+	powershell.exe -NoProfile -NonInteractive -Command "$ps"
+	echo "Registered the scheduled task $task_name"
+}
+
+case "${1-}" in
+'') ;;
+--register-task)
+	register_task
+	exit
+	;;
+*)
+	die "Usage: $0 [--register-task]"
+	;;
+esac
 
 clone_repos
 install_helper
