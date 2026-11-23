@@ -5,18 +5,21 @@
 # retired "Daily digest" GitHub workflow did.
 #
 # The directory named by LORE_GIT_MD_WORK_DIR (default: the current
-# directory) must hold the two bare repositories lore-git.git, a mirror of
-# https://lore.kernel.org/git/1, and lore-git-md.git, the corpus.  The
-# helper executables update-lore-git-md and digestive come from the latest
-# release of lore-git-md-helper, and are cached in the subdirectory helper.
-# AZURE_OPENAI_ENDPOINT must be set, and `az login` must have been run:
-# the Azure access tokens come from the Azure CLI, not from an API key.
+# directory) holds the two bare repositories lore-git.git, a mirror of
+# https://lore.kernel.org/git/1, and lore-git-md.git, the corpus, which are
+# cloned if missing.  The helper executables update-lore-git-md and digestive
+# come from the latest release of lore-git-md-helper, and are cached in the
+# subdirectory helper.  AZURE_OPENAI_ENDPOINT must be set, and `az login`
+# must have been run: the Azure access tokens come from the Azure CLI, not
+# from an API key.
 
 set -eu
 
 work_dir=${LORE_GIT_MD_WORK_DIR:-$PWD}
 source_repo=$work_dir/lore-git.git
 target_repo=$work_dir/lore-git-md.git
+source_url=https://lore.kernel.org/git/1
+target_url=https://github.com/git-digestif/lore-git-md.git
 
 die () {
 	echo "$*" >&2
@@ -25,6 +28,18 @@ die () {
 
 target_git () {
 	git --git-dir="$target_repo" "$@"
+}
+
+# Clone the repositories that do not exist yet.  The archive comes with all
+# its contents, because update-lore-git-md reads every new email from it; the
+# corpus comes without the contents of its files, which digestive fetches as
+# it needs them.  Neither clone is shallow.
+clone_repos () {
+	test -d "$source_repo" ||
+		git clone --bare "$source_url" "$source_repo"
+	test -d "$target_repo" ||
+		git clone --bare --filter=blob:none --single-branch \
+			--branch main "$target_url" "$target_repo"
 }
 
 # Put the executables of the latest release of the helper for this system on
@@ -106,6 +121,7 @@ push_corpus () {
 	target_git push --atomic origin refs/heads/main refs/notes/msgid
 }
 
+clone_repos
 install_helper
 fetch_repos
 
