@@ -19,8 +19,10 @@ work_dir=${LORE_GIT_MD_WORK_DIR:-.}
 mkdir -p "$work_dir"
 cd "$work_dir"
 work_dir=$PWD
-source_repo=$work_dir/lore-git.git
-target_repo=$work_dir/lore-git-md.git
+# Relative names: update-lore-git-md puts the name of the archive into the
+# subject of its import commits, and the corpus is public.
+source_repo=lore-git.git
+target_repo=lore-git-md.git
 source_url=https://lore.kernel.org/git/1
 target_url=https://github.com/git-digestif/lore-git-md.git
 
