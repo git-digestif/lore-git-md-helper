@@ -245,6 +245,15 @@ bug fix, a refactor, and a new feature into one commit.
 - Do **not** include a `Co-authored-by: Copilot <…>` trailer — the
   `Assisted-by` trailer already conveys the information.
 
+## Pull Requests
+
+A pull request description says what changes and why, what that means
+for existing setups, and what the change does not cover.  It does not
+list routine verification (that the tests, lints and builds pass, how
+many checks ran): a change that was not verified would not be sent, so
+that goes without saying.  Evidence that is not routine, such as how a
+change was exercised that CI cannot reach, is worth stating.
+
 ## Building and Testing
 
 ```sh
