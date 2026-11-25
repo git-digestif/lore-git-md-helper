@@ -137,13 +137,19 @@ hourly "Daily digest" GitHub workflow of the lore-git-md repository,
 which no longer runs on a schedule.  One cycle clones whichever of the
 two bare repositories is missing, downloads the executables of the
 latest release of this repository, fetches both repositories, runs
-`update-lore-git-md` and `digestive`, and pushes the corpus's `main` and
-`refs/notes/msgid` together.  It needs `git` and `curl` (plus `tar` on
-Linux or `unzip` on Windows), runs on Linux x86-64 and on Windows x86-64
-and ARM64, and expects `AZURE_OPENAI_ENDPOINT` in the environment and a
-completed `az login`: the Azure access tokens come from the Azure CLI.
-It is meant to be run occasionally, for example on Windows in a Git for
-Windows shell inside tmux.
+`update-lore-git-md`, pushes the corpus's `main` and `refs/notes/msgid`
+together (which delivers what an interrupted cycle left behind), runs
+`digestive`, and pushes them together again.  It needs `git` and `curl`
+(plus `tar` on Linux or `unzip` on Windows), runs on Linux x86-64 and on
+Windows x86-64 and ARM64, and expects `AZURE_OPENAI_ENDPOINT` in the
+environment and a completed `az login`: the Azure access tokens come
+from the Azure CLI.  It is meant to be run occasionally, for example on
+Windows in a Git for Windows shell inside tmux.
+
+The two refs go out together because `update-lore-git-md` refuses to run
+unless the newest `Source-Commit` trailer reachable from `main` equals
+the one on `refs/notes/msgid`; commits added to `main` must not change
+it.
 
 The work directory (`LORE_GIT_MD_WORK_DIR`, by default the current
 directory; created if missing, and the script changes into it) holds

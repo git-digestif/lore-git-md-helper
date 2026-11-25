@@ -192,6 +192,11 @@ cycle () {
 
 	update-lore-git-md "$source_repo" "$target_repo"
 
+	# update-lore-git-md has just checked that the two refs agree, so what
+	# an interrupted cycle left behind can go out now, not only after
+	# digestive, which may be interrupted in turn.
+	push_corpus
+
 	# Once the time limit is reached, digestive stops summarizing emails and
 	# the next cycle resumes from what was committed, which is pushed even
 	# if digestive failed.
