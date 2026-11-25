@@ -484,7 +484,7 @@ pub struct BackendArgs {
     pub azure_openai: Option<String>,
 
     /// With --azure-openai: authenticate with an access token from the
-    /// Azure CLI, started through powershell.exe, instead of the API key.
+    /// Azure CLI, started through PowerShell, instead of the API key.
     #[arg(long, requires = "azure_openai")]
     pub azure_cli_token: bool,
 

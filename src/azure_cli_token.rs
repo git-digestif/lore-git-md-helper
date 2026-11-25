@@ -1,7 +1,8 @@
 //! Access tokens for Azure AI Foundry and Azure OpenAI from the Azure CLI,
 //! for deployments that do not accept API keys.
 
-use std::process::Stdio;
+use std::io::ErrorKind;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -24,7 +25,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Runs a command that prints an Azure CLI access token as JSON, and keeps
 /// the token until shortly before it expires.
 pub struct CliToken {
-    program: String,
+    /// The first of these that can be started is the command to run.
+    programs: Vec<String>,
     args: Vec<String>,
     cached: Mutex<Option<Cached>>,
 }
@@ -48,19 +50,36 @@ impl CliToken {
         program: impl Into<String>,
         args: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
+        Self::with_programs([program], args)
+    }
+
+    /// Like `new`, for several programs: the first one that can be started
+    /// is run, and the others are for when it cannot.
+    pub fn with_programs(
+        programs: impl IntoIterator<Item = impl Into<String>>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
-            program: program.into(),
+            programs: programs.into_iter().map(Into::into).collect(),
             args: args.into_iter().map(Into::into).collect(),
             cached: Mutex::new(None),
         }
     }
 
-    /// Ask the Windows Azure CLI, through `powershell.exe`.  On Windows,
-    /// `az` is a batch script that starts Python, which only a shell
-    /// resolves, and from WSL `powershell.exe` is the program to start.
+    /// Ask the Azure CLI through PowerShell, which resolves `az`: on
+    /// Windows, it is a batch script that starts Python.  PowerShell 7
+    /// (`pwsh`) is preferred over Windows PowerShell (`powershell`).  In WSL,
+    /// too, the Windows programs (those with the suffix `.exe`) are started,
+    /// so that the Azure CLI of Windows answers: unlike the one of Linux, it
+    /// encrypts the credentials it stores by default.
     pub fn via_powershell() -> Self {
-        Self::new(
-            "powershell.exe",
+        let exe = if cfg!(windows) || is_wsl() {
+            ".exe"
+        } else {
+            ""
+        };
+        Self::with_programs(
+            [format!("pwsh{exe}"), format!("powershell{exe}")],
             [
                 "-NoProfile",
                 "-NonInteractive",
@@ -93,28 +112,17 @@ impl CliToken {
     }
 
     async fn fetch(&self) -> Result<Cached> {
-        let output = tokio::time::timeout(
-            COMMAND_TIMEOUT,
-            Command::new(&self.program)
-                .args(&self.args)
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .with_context(|| format!("{} did not answer within {COMMAND_TIMEOUT:?}", self.program))?
-        .with_context(|| format!("could not run {}", self.program))?;
+        let (program, output) = self.run().await?;
         // Only standard error goes into an error message: standard output
         // holds the token.
         anyhow::ensure!(
             output.status.success(),
-            "{} {}: {}",
-            self.program,
+            "{program} {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim(),
         );
         let reply: Reply = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("{} did not print an access token as JSON", self.program))?;
+            .with_context(|| format!("{program} did not print an access token as JSON"))?;
 
         let lifetime = match reply.expires_on {
             Some(expires_on) => (UNIX_EPOCH + Duration::from_secs(expires_on))
@@ -128,6 +136,47 @@ impl CliToken {
             valid_until: Instant::now() + lifetime,
         })
     }
+
+    /// Run the first program that can be started, and return it with what
+    /// it printed.  A program that starts but fails is not skipped.
+    async fn run(&self) -> Result<(&str, Output)> {
+        let mut unstartable = std::io::Error::from(ErrorKind::NotFound);
+        for program in &self.programs {
+            let started = tokio::time::timeout(
+                COMMAND_TIMEOUT,
+                Command::new(program)
+                    .args(&self.args)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .with_context(|| format!("{program} did not answer within {COMMAND_TIMEOUT:?}"))?;
+            match started {
+                Ok(output) => return Ok((program, output)),
+                // A directory in the PATH that cannot be searched, such as
+                // that of the Windows Store aliases in WSL, makes a program
+                // that does not exist "permission denied" on Linux.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                    unstartable = e;
+                }
+                Err(e) => return Err(e).with_context(|| format!("could not run {program}")),
+            }
+        }
+        Err(unstartable).with_context(|| format!("could not run {}", self.programs.join(" or ")))
+    }
+}
+
+/// Whether this is a distribution of the Windows Subsystem for Linux.
+fn is_wsl() -> bool {
+    let kernel = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    looks_like_wsl(std::env::var_os("WSL_INTEROP").is_some(), &kernel)
+}
+
+/// The signs that Git Credential Manager looks for: WSL2 sets `WSL_INTEROP`,
+/// and the kernel version of both WSL1 and WSL2 mentions Microsoft.
+fn looks_like_wsl(has_interop_variable: bool, kernel_version: &str) -> bool {
+    has_interop_variable || kernel_version.to_lowercase().contains("microsoft")
 }
 
 #[cfg(all(test, unix))]
@@ -201,6 +250,51 @@ mod tests {
         let err = format!("{:#}", tokens.get().await.unwrap_err());
         assert!(err.contains("Please run az login"), "{err}");
         assert!(err.contains("exit status: 3"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_a_program_that_cannot_be_started_is_skipped() {
+        let tokens = CliToken::with_programs(
+            ["no-such-program", "sh"],
+            ["-c", r#"printf '{"accessToken":"TOKEN-1"}'"#],
+        );
+
+        assert_eq!(tokens.get().await.unwrap(), "TOKEN-1");
+    }
+
+    #[tokio::test]
+    async fn test_a_program_that_fails_is_not_skipped() {
+        let tokens = CliToken::with_programs(
+            ["false", "sh"],
+            ["-c", r#"printf '{"accessToken":"TOKEN-1"}'"#],
+        );
+
+        let err = format!("{:#}", tokens.get().await.unwrap_err());
+        assert!(err.contains("exit status: 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_the_error_names_all_programs_that_cannot_be_started() {
+        let tokens = CliToken::with_programs(["no-such-program", "no-such-either"], ["-c", ""]);
+
+        let err = format!("{:#}", tokens.get().await.unwrap_err());
+        assert!(
+            err.contains("could not run no-such-program or no-such-either"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_wsl_is_recognized_by_its_variable_or_its_kernel() {
+        let wsl2 = "Linux version 6.18.58.1-microsoft-standard-WSL2 (root@builder) #1 SMP";
+        let wsl1 = "Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com) #1-Microsoft";
+        let ubuntu = "Linux version 6.8.0-45-generic (buildd@builder) #45-Ubuntu SMP";
+
+        assert!(looks_like_wsl(false, wsl2));
+        assert!(looks_like_wsl(false, wsl1));
+        assert!(looks_like_wsl(true, ubuntu));
+        assert!(!looks_like_wsl(false, ubuntu));
+        assert!(!looks_like_wsl(false, ""));
     }
 
     #[tokio::test]
