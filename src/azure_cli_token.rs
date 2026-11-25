@@ -1,7 +1,8 @@
 //! Access tokens for Azure AI Foundry and Azure OpenAI from the Azure CLI,
 //! for deployments that do not accept API keys.
 
-use std::process::Stdio;
+use std::io::ErrorKind;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -24,7 +25,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Runs a command that prints an Azure CLI access token as JSON, and keeps
 /// the token until shortly before it expires.
 pub struct CliToken {
-    program: String,
+    /// The first of these that can be started is the command to run.
+    programs: Vec<String>,
     args: Vec<String>,
     cached: Mutex<Option<Cached>>,
 }
@@ -48,8 +50,17 @@ impl CliToken {
         program: impl Into<String>,
         args: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
+        Self::with_programs([program], args)
+    }
+
+    /// Like `new`, for several programs: the first one that can be started
+    /// is run, and the others are for when it cannot.
+    pub fn with_programs(
+        programs: impl IntoIterator<Item = impl Into<String>>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
-            program: program.into(),
+            programs: programs.into_iter().map(Into::into).collect(),
             args: args.into_iter().map(Into::into).collect(),
             cached: Mutex::new(None),
         }
@@ -93,28 +104,17 @@ impl CliToken {
     }
 
     async fn fetch(&self) -> Result<Cached> {
-        let output = tokio::time::timeout(
-            COMMAND_TIMEOUT,
-            Command::new(&self.program)
-                .args(&self.args)
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .with_context(|| format!("{} did not answer within {COMMAND_TIMEOUT:?}", self.program))?
-        .with_context(|| format!("could not run {}", self.program))?;
+        let (program, output) = self.run().await?;
         // Only standard error goes into an error message: standard output
         // holds the token.
         anyhow::ensure!(
             output.status.success(),
-            "{} {}: {}",
-            self.program,
+            "{program} {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim(),
         );
         let reply: Reply = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("{} did not print an access token as JSON", self.program))?;
+            .with_context(|| format!("{program} did not print an access token as JSON"))?;
 
         let lifetime = match reply.expires_on {
             Some(expires_on) => (UNIX_EPOCH + Duration::from_secs(expires_on))
@@ -127,6 +127,35 @@ impl CliToken {
             token: reply.access_token,
             valid_until: Instant::now() + lifetime,
         })
+    }
+
+    /// Run the first program that can be started, and return it with what
+    /// it printed.  A program that starts but fails is not skipped.
+    async fn run(&self) -> Result<(&str, Output)> {
+        let mut unstartable = std::io::Error::from(ErrorKind::NotFound);
+        for program in &self.programs {
+            let started = tokio::time::timeout(
+                COMMAND_TIMEOUT,
+                Command::new(program)
+                    .args(&self.args)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .with_context(|| format!("{program} did not answer within {COMMAND_TIMEOUT:?}"))?;
+            match started {
+                Ok(output) => return Ok((program, output)),
+                // A directory in the PATH that cannot be searched, such as
+                // that of the Windows Store aliases in WSL, makes a program
+                // that does not exist "permission denied" on Linux.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                    unstartable = e;
+                }
+                Err(e) => return Err(e).with_context(|| format!("could not run {program}")),
+            }
+        }
+        Err(unstartable).with_context(|| format!("could not run {}", self.programs.join(" or ")))
     }
 }
 
@@ -201,6 +230,38 @@ mod tests {
         let err = format!("{:#}", tokens.get().await.unwrap_err());
         assert!(err.contains("Please run az login"), "{err}");
         assert!(err.contains("exit status: 3"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_a_program_that_cannot_be_started_is_skipped() {
+        let tokens = CliToken::with_programs(
+            ["no-such-program", "sh"],
+            ["-c", r#"printf '{"accessToken":"TOKEN-1"}'"#],
+        );
+
+        assert_eq!(tokens.get().await.unwrap(), "TOKEN-1");
+    }
+
+    #[tokio::test]
+    async fn test_a_program_that_fails_is_not_skipped() {
+        let tokens = CliToken::with_programs(
+            ["false", "sh"],
+            ["-c", r#"printf '{"accessToken":"TOKEN-1"}'"#],
+        );
+
+        let err = format!("{:#}", tokens.get().await.unwrap_err());
+        assert!(err.contains("exit status: 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_the_error_names_all_programs_that_cannot_be_started() {
+        let tokens = CliToken::with_programs(["no-such-program", "no-such-either"], ["-c", ""]);
+
+        let err = format!("{:#}", tokens.get().await.unwrap_err());
+        assert!(
+            err.contains("could not run no-such-program or no-such-either"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
