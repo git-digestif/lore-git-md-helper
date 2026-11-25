@@ -66,12 +66,20 @@ impl CliToken {
         }
     }
 
-    /// Ask the Windows Azure CLI, through `powershell.exe`.  On Windows,
-    /// `az` is a batch script that starts Python, which only a shell
-    /// resolves, and from WSL `powershell.exe` is the program to start.
+    /// Ask the Azure CLI through PowerShell, which resolves `az`: on
+    /// Windows, it is a batch script that starts Python.  PowerShell 7
+    /// (`pwsh`) is preferred over Windows PowerShell (`powershell`).  In WSL,
+    /// too, the Windows programs (those with the suffix `.exe`) are started,
+    /// so that the Azure CLI of Windows answers: unlike the one of Linux, it
+    /// encrypts the credentials it stores by default.
     pub fn via_powershell() -> Self {
-        Self::new(
-            "powershell.exe",
+        let exe = if cfg!(windows) || is_wsl() {
+            ".exe"
+        } else {
+            ""
+        };
+        Self::with_programs(
+            [format!("pwsh{exe}"), format!("powershell{exe}")],
             [
                 "-NoProfile",
                 "-NonInteractive",
@@ -157,6 +165,18 @@ impl CliToken {
         }
         Err(unstartable).with_context(|| format!("could not run {}", self.programs.join(" or ")))
     }
+}
+
+/// Whether this is a distribution of the Windows Subsystem for Linux.
+fn is_wsl() -> bool {
+    let kernel = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    looks_like_wsl(std::env::var_os("WSL_INTEROP").is_some(), &kernel)
+}
+
+/// The signs that Git Credential Manager looks for: WSL2 sets `WSL_INTEROP`,
+/// and the kernel version of both WSL1 and WSL2 mentions Microsoft.
+fn looks_like_wsl(has_interop_variable: bool, kernel_version: &str) -> bool {
+    has_interop_variable || kernel_version.to_lowercase().contains("microsoft")
 }
 
 #[cfg(all(test, unix))]
@@ -262,6 +282,19 @@ mod tests {
             err.contains("could not run no-such-program or no-such-either"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_wsl_is_recognized_by_its_variable_or_its_kernel() {
+        let wsl2 = "Linux version 6.18.58.1-microsoft-standard-WSL2 (root@builder) #1 SMP";
+        let wsl1 = "Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com) #1-Microsoft";
+        let ubuntu = "Linux version 6.8.0-45-generic (buildd@builder) #45-Ubuntu SMP";
+
+        assert!(looks_like_wsl(false, wsl2));
+        assert!(looks_like_wsl(false, wsl1));
+        assert!(looks_like_wsl(true, ubuntu));
+        assert!(!looks_like_wsl(false, ubuntu));
+        assert!(!looks_like_wsl(false, ""));
     }
 
     #[tokio::test]
