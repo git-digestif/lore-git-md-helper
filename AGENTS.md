@@ -280,4 +280,7 @@ rewrite that could have changed file contents.
 - `prompts/git-daily-digest.md` — daily digest prompt
 - `prompts/git-periodic-digest.md` — weekly/monthly digest prompt
 - `Cargo.toml` — dependencies and project metadata
+- `build.rs` — embeds a manifest that asks for no elevation in the Windows
+  executables; without one, Windows takes `update-lore-git-md.exe` for an
+  installer and refuses to start it
 - `sample4.md` — example converter output (a real Git mailing list patch)
